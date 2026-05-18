@@ -47,14 +47,14 @@ fn load_or_generate_key(path: &str) -> Result<KeyPair> {
 }
 
 pub struct SshServer {
-    db: Arc<Database>,
+    _db: Arc<Database>,
     db_conn: String,
     ssh_password: String,
 }
 
 impl SshServer {
     pub fn new(db: Arc<Database>, db_conn: &str, ssh_password: &str) -> Self {
-        Self { db, db_conn: db_conn.to_string(), ssh_password: ssh_password.to_string() }
+        Self { _db: db, db_conn: db_conn.to_string(), ssh_password: ssh_password.to_string() }
     }
 
     pub async fn run(&mut self, port: u16, key_path: &str) -> Result<()> {
@@ -83,7 +83,6 @@ impl Server for SshServer {
             channel_id: None,
             master_fd: Arc::new(Mutex::new(None)),
             db_conn: self.db_conn.clone(),
-            db: self.db.clone(),
             ws_col: 80,
             ws_row: 24,
             ws_xpixel: 0,
@@ -100,7 +99,6 @@ pub struct SshSession {
     channel_id: Option<ChannelId>,
     master_fd: Arc<Mutex<Option<i32>>>,
     db_conn: String,
-    db: Arc<Database>,
     ws_col: u32,
     ws_row: u32,
     ws_xpixel: u32,

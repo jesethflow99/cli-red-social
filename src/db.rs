@@ -10,20 +10,21 @@ use std::time::Instant;
 
 use crate::models::{Comment, Message, Notification, Post, User};
 
+#[allow(dead_code)]
 pub trait DatabaseOps: Send {
     fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User>;
     fn check_register_rate_limit(&self) -> Result<()>;
     fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>>;
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>>;
-    fn search_users(&self, query: &str) -> Result<Vec<User>>;
+    fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>>;
     fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post>;
-    fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>>;
+    fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()>;
     fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()>;
     fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool>;
     fn get_followers(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_following(&self, user_id: i64) -> Result<Vec<User>>;
-    fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>>;
+    fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment>;
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>>;
     fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()>;
@@ -35,12 +36,13 @@ pub trait DatabaseOps: Send {
     fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>>;
     fn get_unread_count(&self, user_id: i64) -> Result<i64>;
     fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()>;
-    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()>;
+    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()>;
+    fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()>;
     fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()>;
-    fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>>;
+    fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>>;
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64>;
     fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
-    fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>>;
+    fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
 }
@@ -58,14 +60,14 @@ impl DatabaseOps for Database {
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
         Database::get_user_by_id(self, id)
     }
-    fn search_users(&self, query: &str) -> Result<Vec<User>> {
-        Database::search_users(self, query)
+    fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>> {
+        Database::search_users(self, query, offset, limit)
     }
     fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
         Database::create_post(self, user_id, content, image_path)
     }
-    fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
-        Database::get_timeline(self, user_id)
+    fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        Database::get_timeline(self, user_id, offset, limit)
     }
     fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
         Database::follow_user(self, follower_id, following_id)
@@ -82,8 +84,8 @@ impl DatabaseOps for Database {
     fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
         Database::get_following(self, user_id)
     }
-    fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
-        Database::get_posts_by_user(self, user_id)
+    fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        Database::get_posts_by_user(self, user_id, offset, limit)
     }
     fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
         Database::add_comment(self, post_id, user_id, content)
@@ -118,14 +120,17 @@ impl DatabaseOps for Database {
     fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
         Database::mark_messages_read(self, user_id, other_id)
     }
-    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
-        Database::update_profile(self, user_id, display_name, bio)
+    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
+        Database::update_profile(self, user_id, display_name, bio, utc_offset)
+    }
+    fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
+        Database::update_timezone(self, user_id, utc_offset)
     }
     fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
         Database::add_notification(self, user_id, from_user_id, notif_type)
     }
-    fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
-        Database::get_notifications(self, user_id)
+    fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
+        Database::get_notifications(self, user_id, offset, limit)
     }
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
         Database::get_unread_notifications_count(self, user_id)
@@ -133,8 +138,8 @@ impl DatabaseOps for Database {
     fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
         Database::mark_notifications_read(self, user_id)
     }
-    fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
-        Database::search_posts(self, query, time_filter)
+    fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        Database::search_posts(self, query, time_filter, offset, limit)
     }
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
         Database::check_rate_limit(self, user_id, action, max, window_secs)
@@ -158,8 +163,18 @@ impl Database {
             .connection_timeout(Duration::from_secs(3))
             .build(manager)?;
         let db = Self { pool, rate_limiter: Mutex::new(HashMap::new()) };
-        db.init_schema()?;
-        Ok(db)
+        let mut last_err = anyhow::anyhow!("could not connect to database");
+        for i in 0..12 {
+            match db.init_schema() {
+                Ok(()) => return Ok(db),
+                Err(e) => {
+                    last_err = e;
+                    eprintln!("[agora] DB connection attempt {} failed, retrying in {}s...", i + 1, i + 1);
+                    std::thread::sleep(std::time::Duration::from_secs(i as u64 + 1));
+                }
+            }
+        }
+        Err(last_err)
     }
 
     pub fn check_register_rate_limit(&self) -> Result<()> {
@@ -198,6 +213,7 @@ impl Database {
                 password_hash TEXT NOT NULL,
                 display_name TEXT NOT NULL DEFAULT '',
                 bio TEXT NOT NULL DEFAULT '',
+                utc_offset INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS posts (
@@ -261,7 +277,7 @@ impl Database {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
         let now = Utc::now().to_rfc3339();
         let rows = conn.query(
-            "INSERT INTO users (username, password_hash, display_name, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
             &[&username, &hash, &display_name, &now],
         )?;
         let id: i64 = rows[0].get(0);
@@ -270,6 +286,7 @@ impl Database {
             username: username.to_string(),
             display_name: display_name.to_string(),
             bio: String::new(),
+            utc_offset: 0,
             created_at: now.parse().unwrap(),
         })
     }
@@ -277,18 +294,19 @@ impl Database {
     pub fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, created_at, password_hash FROM users WHERE username = $1",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash FROM users WHERE username = $1",
             &[&username],
         )?;
         if let Some(row) = rows.into_iter().next() {
-            let hash: String = row.get(5);
+            let hash: String = row.get(6);
             if bcrypt::verify(password, &hash)? {
                 return Ok(Some(User {
                     id: row.get(0),
                     username: row.get(1),
                     display_name: row.get(2),
                     bio: row.get(3),
-                    created_at: row.get::<_, String>(4).parse().unwrap(),
+                    utc_offset: row.get(4),
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
                 }));
             }
         }
@@ -298,7 +316,7 @@ impl Database {
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, created_at FROM users WHERE id = $1",
+            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE id = $1",
             &[&id],
         )?;
         Ok(rows.into_iter().next().map(|row| User {
@@ -306,23 +324,25 @@ impl Database {
             username: row.get(1),
             display_name: row.get(2),
             bio: row.get(3),
-            created_at: row.get::<_, String>(4).parse().unwrap(),
+            utc_offset: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
         }))
     }
 
-    pub fn search_users(&self, query: &str) -> Result<Vec<User>> {
+    pub fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let pattern = format!("%{}%", query);
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, created_at FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 LIMIT 20",
-            &[&pattern],
+            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY username LIMIT $2 OFFSET $3",
+            &[&pattern, &(limit as i64), &(offset as i64)],
         )?;
         Ok(rows.iter().map(|row| User {
             id: row.get(0),
             username: row.get(1),
             display_name: row.get(2),
             bio: row.get(3),
-            created_at: row.get::<_, String>(4).parse().unwrap(),
+            utc_offset: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
 
@@ -350,7 +370,7 @@ impl Database {
         })
     }
 
-    pub fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
+    pub fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
@@ -359,8 +379,8 @@ impl Database {
              LEFT JOIN follows f ON f.following_id = p.user_id AND f.follower_id = $1
              WHERE p.user_id = $1 OR f.follower_id = $1
              ORDER BY p.created_at DESC
-             LIMIT 50",
-            &[&user_id],
+             LIMIT $2 OFFSET $3",
+            &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
         Ok(rows.iter().map(|row| {
             let img: String = row.get(4);
@@ -406,7 +426,7 @@ impl Database {
     pub fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
              FROM users u
              JOIN follows f ON f.follower_id = u.id
              WHERE f.following_id = $1",
@@ -417,18 +437,19 @@ impl Database {
             username: row.get(1),
             display_name: row.get(2),
             bio: row.get(3),
-            created_at: row.get::<_, String>(4).parse().unwrap(),
+            utc_offset: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
 
-    pub fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
+    pub fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
              WHERE p.user_id = $1
-             ORDER BY p.created_at DESC LIMIT 20",
-            &[&user_id],
+             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
+            &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
         Ok(rows.iter().map(|row| {
             let img: String = row.get(4);
@@ -443,7 +464,7 @@ impl Database {
         }).collect())
     }
 
-    pub fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
+    pub fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
         let mut conn = self.pool.get()?;
         let interval = match time_filter {
             "24h" => Some("24 hours"),
@@ -451,24 +472,25 @@ impl Database {
             "30d" => Some("30 days"),
             _ => None,
         };
-        let sql = if let Some(interval) = interval {
+        let has_interval = interval.is_some();
+        let sql = if has_interval {
             format!(
                 "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
                  FROM posts p JOIN users u ON u.id = p.user_id
                  WHERE p.content ILIKE $1 AND p.created_at::timestamptz > NOW() - $2::interval
-                 ORDER BY p.created_at DESC LIMIT 50"
+                 ORDER BY p.created_at DESC LIMIT $3 OFFSET $4"
             )
         } else {
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
              WHERE p.content ILIKE $1
-             ORDER BY p.created_at DESC LIMIT 50".to_string()
+             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3".to_string()
         };
         let pattern = format!("%{}%", query);
-        let rows = if let Some(interval) = interval {
-            conn.query(&sql, &[&pattern, &interval])?
+        let rows = if let Some(iv) = interval {
+            conn.query(&sql, &[&pattern, &iv, &(limit as i64), &(offset as i64)])?
         } else {
-            conn.query(&sql, &[&pattern])?
+            conn.query(&sql, &[&pattern, &(limit as i64), &(offset as i64)])?
         };
         Ok(rows.iter().map(|row| {
             let img: String = row.get(4);
@@ -580,7 +602,7 @@ impl Database {
     pub fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
              FROM users u
              JOIN follows f ON f.following_id = u.id
              WHERE f.follower_id = $1",
@@ -591,7 +613,8 @@ impl Database {
             username: row.get(1),
             display_name: row.get(2),
             bio: row.get(3),
-            created_at: row.get::<_, String>(4).parse().unwrap(),
+            utc_offset: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
 
@@ -622,7 +645,7 @@ impl Database {
     pub fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
              FROM users u
              WHERE u.id IN (
                  SELECT DISTINCT CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END
@@ -637,7 +660,8 @@ impl Database {
             username: row.get(1),
             display_name: row.get(2),
             bio: row.get(3),
-            created_at: row.get::<_, String>(4).parse().unwrap(),
+            utc_offset: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
 
@@ -680,11 +704,21 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
+    pub fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
         let mut conn = self.pool.get()?;
         conn.execute(
-            "UPDATE users SET display_name = $1, bio = $2 WHERE id = $3",
-            &[&display_name, &bio, &user_id],
+            "UPDATE users SET display_name = $1, bio = $2, utc_offset = $3 WHERE id = $4",
+            &[&display_name, &bio, &utc_offset, &user_id],
+        )?;
+        Ok(())
+    }
+
+    #[allow(dead_code)]
+    pub fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE users SET utc_offset = $1 WHERE id = $2",
+            &[&utc_offset, &user_id],
         )?;
         Ok(())
     }
@@ -699,7 +733,7 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
+    pub fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
             "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read
@@ -707,8 +741,8 @@ impl Database {
              JOIN users u ON u.id = n.from_user_id
              WHERE n.user_id = $1
              ORDER BY n.created_at DESC
-             LIMIT 50",
-            &[&user_id],
+             LIMIT $2 OFFSET $3",
+            &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
         Ok(rows.iter().map(|row| Notification {
             id: row.get(0),
@@ -839,6 +873,7 @@ pub(crate) mod mock_db {
                 username: username.to_string(),
                 display_name: display_name.to_string(),
                 bio: String::new(),
+                utc_offset: 0,
                 created_at: Utc::now(),
             };
             data.users.push((user.clone(), hash));
@@ -860,13 +895,14 @@ pub(crate) mod mock_db {
             Ok(data.users.iter().find(|(u, _)| u.id == id).map(|(u, _)| u.clone()))
         }
 
-        fn search_users(&self, query: &str) -> Result<Vec<User>> {
+        fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
             Ok(data.users.iter()
                 .filter(|(u, _)| u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
                 .map(|(u, _)| u.clone())
-                .take(20)
+                .skip(offset as usize)
+                .take(limit as usize)
                 .collect())
         }
 
@@ -891,7 +927,7 @@ pub(crate) mod mock_db {
             Ok(post)
         }
 
-        fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
+        fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let mut posts: Vec<Post> = data.posts.iter()
                 .filter(|p| {
@@ -901,8 +937,7 @@ pub(crate) mod mock_db {
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            posts.truncate(50);
-            Ok(posts)
+            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
         fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
@@ -941,18 +976,17 @@ pub(crate) mod mock_db {
                 .collect())
         }
 
-        fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
+        fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let mut posts: Vec<Post> = data.posts.iter()
                 .filter(|p| p.user_id == user_id)
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            posts.truncate(20);
-            Ok(posts)
+            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
-        fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
+        fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
             let cutoff = match time_filter {
@@ -974,8 +1008,7 @@ pub(crate) mod mock_db {
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            posts.truncate(50);
-            Ok(posts)
+            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
         fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
@@ -1121,11 +1154,20 @@ pub(crate) mod mock_db {
             Ok(())
         }
 
-        fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
+        fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
             let mut data = self.data.lock().unwrap();
             if let Some((user, _)) = data.users.iter_mut().find(|(u, _)| u.id == user_id) {
                 user.display_name = display_name.to_string();
                 user.bio = bio.to_string();
+                user.utc_offset = utc_offset;
+            }
+            Ok(())
+        }
+
+        fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            if let Some((user, _)) = data.users.iter_mut().find(|(u, _)| u.id == user_id) {
+                user.utc_offset = utc_offset;
             }
             Ok(())
         }
@@ -1150,15 +1192,14 @@ pub(crate) mod mock_db {
             Ok(())
         }
 
-        fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
+        fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
             let data = self.data.lock().unwrap();
             let mut notifs: Vec<Notification> = data.notifications.iter()
                 .filter(|n| n.user_id == user_id)
                 .cloned()
                 .collect();
             notifs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            notifs.truncate(50);
-            Ok(notifs)
+            Ok(notifs.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
         fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
@@ -1347,7 +1388,7 @@ pub(crate) mod mock_db {
             db.delete_user(1).unwrap();
 
             assert!(db.get_user_by_id(1).unwrap().is_none());
-            assert!(db.get_posts_by_user(1).unwrap().is_empty());
+            assert!(db.get_posts_by_user(1, 0, 20).unwrap().is_empty());
             assert!(db.get_following(1).unwrap().is_empty());
         }
 
@@ -1386,7 +1427,7 @@ pub(crate) mod mock_db {
             db.add_notification(1, 2, "follow").unwrap();
             db.add_notification(1, 2, "like").unwrap();
 
-            let notifs = db.get_notifications(1).unwrap();
+            let notifs = db.get_notifications(1, 0, 50).unwrap();
             assert_eq!(notifs.len(), 2);
 
             let unread = db.get_unread_notifications_count(1).unwrap();
@@ -1400,7 +1441,7 @@ pub(crate) mod mock_db {
         #[test]
         fn test_update_profile() {
             let db = setup();
-            db.update_profile(1, "Alice B.", "My new bio").unwrap();
+            db.update_profile(1, "Alice B.", "My new bio", 0).unwrap();
             let user = db.get_user_by_id(1).unwrap().unwrap();
             assert_eq!(user.display_name, "Alice B.");
             assert_eq!(user.bio, "My new bio");
@@ -1441,7 +1482,7 @@ pub(crate) mod mock_db {
             let result = db.delete_post(post.id, 2);
             assert!(result.is_err());
             // Post should still exist
-            assert_eq!(db.get_timeline(1).unwrap().len(), 1);
+            assert_eq!(db.get_timeline(1, 0, 20).unwrap().len(), 1);
         }
 
         #[test]
@@ -1455,7 +1496,7 @@ pub(crate) mod mock_db {
         #[test]
         fn test_empty_timeline() {
             let db = setup();
-            let timeline = db.get_timeline(1).unwrap();
+            let timeline = db.get_timeline(1, 0, 20).unwrap();
             assert!(timeline.is_empty());
         }
 

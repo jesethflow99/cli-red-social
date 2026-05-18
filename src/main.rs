@@ -4,12 +4,13 @@ use std::sync::Arc;
 
 mod app;
 mod db;
+mod i18n;
 mod models;
 mod ssh;
 mod theme;
 
 #[derive(Parser)]
-#[command(name = "cli-red-social")]
+#[command(name = "agora")]
 struct Cli {
     #[arg(long)]
     tui: bool,
@@ -17,7 +18,7 @@ struct Cli {
     #[arg(long, default_value = "2222")]
     port: u16,
 
-    #[arg(long, default_value = "postgres://social:social@localhost/social")]
+    #[arg(long, default_value = "postgres://social:agora@localhost/social")]
     db: String,
 
     #[arg(long, default_value = "host_key")]
@@ -25,13 +26,16 @@ struct Cli {
 }
 
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .init();
     let cli = Cli::parse();
 
+    if !cli.tui {
+        tracing_subscriber::fmt()
+            .with_writer(std::io::stderr)
+            .init();
+    }
+
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
-    let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_default();
+    let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
 
     if cli.tui {
         app::run_tui(&db_url)?;
@@ -40,7 +44,7 @@ fn main() -> Result<()> {
         if !ssh_password.is_empty() {
             println!("Autenticación SSH por contraseña habilitada.");
         } else {
-            println!("⚠  SSH sin contraseña (acepta cualquier password). Configurá SSH_PASSWORD para producción.");
+            println!("⚠  SSH_PASSWORD no configurada. Usando contraseña por defecto: \"agora\". Configurá SSH_PASSWORD para producción.");
         }
         let database = Arc::new(db::Database::new(&db_url)?);
         database.cleanup_old_data(90).ok();

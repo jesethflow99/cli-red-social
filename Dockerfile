@@ -20,11 +20,11 @@ RUN useradd -m -s /bin/bash app
 
 RUN mkdir /data && chown app:app /data
 
-COPY --from=builder /app/target/release/cli-red-social /usr/local/bin/cli-red-social
+COPY --from=builder /app/target/release/agora /usr/local/bin/agora
 
 USER app
 WORKDIR /data
 
 EXPOSE 2222
 
-CMD ["cli-red-social", "--port", "2222", "--db", "postgres://social:social@db/social"]
+CMD ["agora", "--port", "2222", "--db", "postgres://social:social@db/social"]

@@ -7,6 +7,7 @@ pub struct User {
     pub username: String,
     pub display_name: String,
     pub bio: String,
+    pub utc_offset: i32,
     pub created_at: DateTime<Utc>,
 }
 
@@ -85,6 +86,7 @@ mod tests {
             username: "testuser".into(),
             display_name: "Test User".into(),
             bio: "Hello".into(),
+            utc_offset: 0,
             created_at: make_date(),
         };
         assert_eq!(user.id, 1);
