@@ -12,6 +12,7 @@ use crate::models::{Comment, Message, Notification, Post, User};
 
 pub trait DatabaseOps: Send {
     fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User>;
+    fn check_register_rate_limit(&self) -> Result<()>;
     fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>>;
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>>;
     fn search_users(&self, query: &str) -> Result<Vec<User>>;
@@ -39,11 +40,15 @@ pub trait DatabaseOps: Send {
     fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>>;
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64>;
     fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
+    fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>>;
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
 }
 
 impl DatabaseOps for Database {
+    fn check_register_rate_limit(&self) -> Result<()> {
+        Database::check_register_rate_limit(self)
+    }
     fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
         Database::register_user(self, username, password, display_name)
     }
@@ -128,6 +133,9 @@ impl DatabaseOps for Database {
     fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
         Database::mark_notifications_read(self, user_id)
     }
+    fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
+        Database::search_posts(self, query, time_filter)
+    }
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
         Database::check_rate_limit(self, user_id, action, max, window_secs)
     }
@@ -145,13 +153,26 @@ impl Database {
     pub fn new(conn_str: &str) -> Result<Self> {
         let manager = PostgresConnectionManager::new(conn_str.parse()?, NoTls);
         let pool = Pool::builder()
-            .max_size(1)
+            .max_size(10)
             .min_idle(Some(0))
             .connection_timeout(Duration::from_secs(3))
             .build(manager)?;
         let db = Self { pool, rate_limiter: Mutex::new(HashMap::new()) };
         db.init_schema()?;
         Ok(db)
+    }
+
+    pub fn check_register_rate_limit(&self) -> Result<()> {
+        let key = "register:global".to_string();
+        let now = Instant::now();
+        let mut limiter = self.rate_limiter.lock().unwrap();
+        let entries = limiter.entry(key).or_default();
+        entries.retain(|t| now.duration_since(*t).as_secs() < 60);
+        if entries.len() >= 3 {
+            anyhow::bail!("Demasiados registros. Espera un minuto.");
+        }
+        entries.push(now);
+        Ok(())
     }
 
     pub fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
@@ -172,7 +193,7 @@ impl Database {
         conn.batch_execute(
             "SET client_min_messages TO warning;
             CREATE TABLE IF NOT EXISTS users (
-                id SERIAL PRIMARY KEY,
+                id BIGSERIAL PRIMARY KEY,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 display_name TEXT NOT NULL DEFAULT '',
@@ -180,41 +201,58 @@ impl Database {
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS posts (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
                 content TEXT NOT NULL,
                 image_path TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS follows (
-                follower_id INTEGER NOT NULL REFERENCES users(id),
-                following_id INTEGER NOT NULL REFERENCES users(id),
+                follower_id BIGINT NOT NULL REFERENCES users(id),
+                following_id BIGINT NOT NULL REFERENCES users(id),
                 PRIMARY KEY (follower_id, following_id)
             );
             CREATE TABLE IF NOT EXISTS comments (
-                id SERIAL PRIMARY KEY,
-                post_id INTEGER NOT NULL REFERENCES posts(id),
-                user_id INTEGER NOT NULL REFERENCES users(id),
+                id BIGSERIAL PRIMARY KEY,
+                post_id BIGINT NOT NULL REFERENCES posts(id),
+                user_id BIGINT NOT NULL REFERENCES users(id),
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS messages (
-                id SERIAL PRIMARY KEY,
-                sender_id INTEGER NOT NULL REFERENCES users(id),
-                receiver_id INTEGER NOT NULL REFERENCES users(id),
+                id BIGSERIAL PRIMARY KEY,
+                sender_id BIGINT NOT NULL REFERENCES users(id),
+                receiver_id BIGINT NOT NULL REFERENCES users(id),
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS notifications (
-                id SERIAL PRIMARY KEY,
-                user_id INTEGER NOT NULL REFERENCES users(id),
-                from_user_id INTEGER NOT NULL REFERENCES users(id),
+                id BIGSERIAL PRIMARY KEY,
+                user_id BIGINT NOT NULL REFERENCES users(id),
+                from_user_id BIGINT NOT NULL REFERENCES users(id),
                 type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
             );",
         )?;
+        // Migrate existing SERIAL/INTEGER columns to BIGINT if they exist
+        conn.batch_execute(
+            "ALTER TABLE users ALTER COLUMN id TYPE BIGINT;
+             ALTER TABLE posts ALTER COLUMN id TYPE BIGINT;
+             ALTER TABLE posts ALTER COLUMN user_id TYPE BIGINT;
+             ALTER TABLE follows ALTER COLUMN follower_id TYPE BIGINT;
+             ALTER TABLE follows ALTER COLUMN following_id TYPE BIGINT;
+             ALTER TABLE comments ALTER COLUMN id TYPE BIGINT;
+             ALTER TABLE comments ALTER COLUMN post_id TYPE BIGINT;
+             ALTER TABLE comments ALTER COLUMN user_id TYPE BIGINT;
+             ALTER TABLE messages ALTER COLUMN id TYPE BIGINT;
+             ALTER TABLE messages ALTER COLUMN sender_id TYPE BIGINT;
+             ALTER TABLE messages ALTER COLUMN receiver_id TYPE BIGINT;
+             ALTER TABLE notifications ALTER COLUMN id TYPE BIGINT;
+             ALTER TABLE notifications ALTER COLUMN user_id TYPE BIGINT;
+             ALTER TABLE notifications ALTER COLUMN from_user_id TYPE BIGINT;"
+        ).ok();
         Ok(())
     }
 
@@ -392,6 +430,46 @@ impl Database {
              ORDER BY p.created_at DESC LIMIT 20",
             &[&user_id],
         )?;
+        Ok(rows.iter().map(|row| {
+            let img: String = row.get(4);
+            Post {
+                id: row.get(0),
+                user_id: row.get(1),
+                username: row.get(2),
+                content: row.get(3),
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            }
+        }).collect())
+    }
+
+    pub fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
+        let mut conn = self.pool.get()?;
+        let interval = match time_filter {
+            "24h" => Some("24 hours"),
+            "7d" => Some("7 days"),
+            "30d" => Some("30 days"),
+            _ => None,
+        };
+        let sql = if let Some(interval) = interval {
+            format!(
+                "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+                 FROM posts p JOIN users u ON u.id = p.user_id
+                 WHERE p.content ILIKE $1 AND p.created_at::timestamptz > NOW() - $2::interval
+                 ORDER BY p.created_at DESC LIMIT 50"
+            )
+        } else {
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p JOIN users u ON u.id = p.user_id
+             WHERE p.content ILIKE $1
+             ORDER BY p.created_at DESC LIMIT 50".to_string()
+        };
+        let pattern = format!("%{}%", query);
+        let rows = if let Some(interval) = interval {
+            conn.query(&sql, &[&pattern, &interval])?
+        } else {
+            conn.query(&sql, &[&pattern])?
+        };
         Ok(rows.iter().map(|row| {
             let img: String = row.get(4);
             Post {
@@ -744,6 +822,10 @@ pub(crate) mod mock_db {
             Ok(())
         }
 
+        fn check_register_rate_limit(&self) -> Result<()> {
+            Ok(())
+        }
+
         fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
             let mut data = self.data.lock().unwrap();
             if data.users.iter().any(|(u, _)| u.username == username) {
@@ -867,6 +949,32 @@ pub(crate) mod mock_db {
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             posts.truncate(20);
+            Ok(posts)
+        }
+
+        fn search_posts(&self, query: &str, time_filter: &str) -> Result<Vec<Post>> {
+            let data = self.data.lock().unwrap();
+            let q = query.to_lowercase();
+            let cutoff = match time_filter {
+                "24h" => Some(chrono::Duration::hours(24)),
+                "7d" => Some(chrono::Duration::days(7)),
+                "30d" => Some(chrono::Duration::days(30)),
+                _ => None,
+            };
+            let now = Utc::now();
+            let mut posts: Vec<Post> = data.posts.iter()
+                .filter(|p| {
+                    let content_match = p.content.to_lowercase().contains(&q);
+                    let time_match = match cutoff {
+                        Some(d) => now.signed_duration_since(p.created_at) < d,
+                        None => true,
+                    };
+                    content_match && time_match
+                })
+                .cloned()
+                .collect();
+            posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            posts.truncate(50);
             Ok(posts)
         }
 

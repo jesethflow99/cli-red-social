@@ -49,11 +49,12 @@ fn load_or_generate_key(path: &str) -> Result<KeyPair> {
 pub struct SshServer {
     db: Arc<Database>,
     db_conn: String,
+    ssh_password: String,
 }
 
 impl SshServer {
-    pub fn new(db: Arc<Database>, db_conn: &str) -> Self {
-        Self { db, db_conn: db_conn.to_string() }
+    pub fn new(db: Arc<Database>, db_conn: &str, ssh_password: &str) -> Self {
+        Self { db, db_conn: db_conn.to_string(), ssh_password: ssh_password.to_string() }
     }
 
     pub async fn run(&mut self, port: u16, key_path: &str) -> Result<()> {
@@ -83,6 +84,11 @@ impl Server for SshServer {
             master_fd: Arc::new(Mutex::new(None)),
             db_conn: self.db_conn.clone(),
             db: self.db.clone(),
+            ws_col: 80,
+            ws_row: 24,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+            ssh_password: self.ssh_password.clone(),
         }
     }
 }
@@ -95,16 +101,25 @@ pub struct SshSession {
     master_fd: Arc<Mutex<Option<i32>>>,
     db_conn: String,
     db: Arc<Database>,
+    ws_col: u32,
+    ws_row: u32,
+    ws_xpixel: u32,
+    ws_ypixel: u32,
+    ssh_password: String,
 }
 
 #[async_trait]
 impl Handler for SshSession {
     type Error = anyhow::Error;
 
-    async fn auth_password(&mut self, _user: &str, _password: &str) -> Result<Auth, Self::Error> {
-        // SSH auth only gates transport access; app auth/registration happens in the TUI.
-        self.authed = true;
-        Ok(Auth::Accept)
+    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if self.ssh_password.is_empty() || password == self.ssh_password {
+            self.authed = true;
+            Ok(Auth::Accept)
+        } else {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            Ok(Auth::Reject { proceed_with_methods: None })
+        }
     }
 
     async fn auth_publickey(&mut self, _: &str, _: &russh::keys::key::PublicKey) -> Result<Auth, Self::Error> {
@@ -152,6 +167,10 @@ impl Handler for SshSession {
 
         let master_fd = self.master_fd.clone();
         let db_conn = self.db_conn.clone();
+        let ws_col = self.ws_col;
+        let ws_row = self.ws_row;
+        let ws_xpixel = self.ws_xpixel;
+        let ws_ypixel = self.ws_ypixel;
 
         tokio::task::spawn_blocking(move || {
             let fork_result = unsafe { forkpty(None, None) }.unwrap();
@@ -169,6 +188,13 @@ impl Handler for SshSession {
                 ForkptyResult::Parent { master, child } => {
                     let fd = master.as_raw_fd();
                     *master_fd.lock().unwrap() = Some(fd);
+                    let ws = nix::pty::Winsize {
+                        ws_col: ws_col as u16,
+                        ws_row: ws_row as u16,
+                        ws_xpixel: ws_xpixel as u16,
+                        ws_ypixel: ws_ypixel as u16,
+                    };
+                    unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws); }
                     let child_exited = Arc::new(AtomicBool::new(false));
 
                     let h1 = handle.clone();
@@ -233,9 +259,12 @@ impl Handler for SshSession {
         _: &[(russh::Pty, u32)],
         session: &mut Session,
     ) -> Result<(), Self::Error> {
+        self.ws_col = col_width;
+        self.ws_row = row_height;
+        self.ws_xpixel = pix_width;
+        self.ws_ypixel = pix_height;
         session.channel_success(channel);
-        self.window_change_request(channel, col_width, row_height, pix_width, pix_height, session)
-            .await
+        Ok(())
     }
 
     async fn window_change_request(

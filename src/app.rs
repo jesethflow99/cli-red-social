@@ -99,6 +99,8 @@ pub struct App {
     pub profile_display_name: String,
     pub profile_bio: String,
     pub edit_profile_focus: usize,
+    pub post_search_results: Vec<Post>,
+    pub post_search_filter: &'static str,
 }
 
 impl App {
@@ -142,7 +144,17 @@ impl App {
             profile_display_name: String::new(),
             profile_bio: String::new(),
             edit_profile_focus: 0,
+            post_search_results: vec![],
+            post_search_filter: "all",
         }
+    }
+
+    fn draw_safe(
+        terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+        app: &App,
+    ) -> std::result::Result<(), std::io::Error> {
+        terminal.draw(|f| app.render(f))?;
+        Ok(())
     }
 
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
@@ -153,14 +165,14 @@ impl App {
             }
 
             let draw_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                terminal.draw(|f| self.render(f))
+                Self::draw_safe(terminal, self).ok()
             }));
             match draw_result {
-                Ok(Ok(_)) => {
+                Ok(Some(())) => {
                     self.clear_debug();
                 }
-                Ok(Err(err)) => {
-                    let msg = format!("Error de render: {err}");
+                Ok(None) => {
+                    let msg = "Error de render".to_string();
                     tracing::error!("{msg}");
                     self.set_status("Error interno de UI. Reintentando...".into());
                     self.set_debug(msg);
@@ -175,17 +187,32 @@ impl App {
                 }
             }
 
-            if let Event::Key(key) = event::read()? {
-                if key.kind == KeyEventKind::Press {
-                    match self.handle_key(key) {
-                        Ok(false) => break,
-                        Ok(true) => {}
-                        Err(err) => {
-                            tracing::error!("TUI action failed on {:?}: {err}", self.screen);
-                            self.set_status(format!("Error: {err}"));
+            let mut should_break = false;
+            let event_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind == KeyEventKind::Press {
+                        match self.handle_key(key) {
+                            Ok(false) => should_break = true,
+                            Ok(true) => {}
+                            Err(err) => {
+                                tracing::error!("TUI action failed on {:?}: {err}", self.screen);
+                                self.set_status(format!("Error: {err}"));
+                            }
                         }
                     }
                 }
+            }));
+            match event_result {
+                Ok(()) => {}
+                Err(_) => {
+                    let msg = "Panic in TUI event handler".to_string();
+                    tracing::error!("{msg}");
+                    self.set_status("Error interno. Reintentando...".into());
+                    self.screen = Screen::Login;
+                }
+            }
+            if should_break {
+                break;
             }
         }
         Ok(())
@@ -216,6 +243,8 @@ impl App {
             Screen::Chat(_) => self.handle_chat_key(key),
             Screen::EditProfile => self.handle_edit_profile_key(key),
             Screen::Notifications => self.handle_notifications_key(key),
+            Screen::PostSearch => self.handle_post_search_key(key),
+            Screen::PostSearchFilter => self.handle_post_search_filter_key(key),
         }
     }
 
@@ -277,6 +306,8 @@ impl App {
                         self.set_status("La contraseña debe tener al menos 4 caracteres".into());
                     } else if display.is_empty() {
                         self.set_status("El nombre no puede estar vacío".into());
+                    } else if let Err(e) = self.db.check_register_rate_limit() {
+                        self.set_status(format!("{}", e));
                     } else {
                         match self.db.register_user(username, password, display) {
                             Ok(user) => {
@@ -311,6 +342,11 @@ impl App {
         self.status_message = None;
         match key.code {
             KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('/') => {
+                self.input.clear();
+                self.post_search_results.clear();
+                self.screen = Screen::PostSearch;
+            }
             KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
                 self.notifications = self.db.get_notifications(self.current_user.as_ref().unwrap().id)?;
                 self.unread_notifications = 0;
@@ -889,6 +925,95 @@ impl App {
         f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
     }
 
+    fn render_post_search(&self, f: &mut Frame, area: Rect) {
+        let filter_label = match self.post_search_filter {
+            "24h" => "últimas 24h",
+            "7d" => "últimos 7 días",
+            "30d" => "últimos 30 días",
+            _ => "todas",
+        };
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+            .margin(1)
+            .split(area);
+
+        let input = Paragraph::new(self.input.as_str())
+            .style(Style::default().fg(self.theme.text))
+            .block(
+                Block::default()
+                    .title(format!(" Buscar posts [Filtro: {}] ", filter_label))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
+        f.render_widget(input, chunks[0]);
+        f.set_cursor_position((
+            area.x + 2 + self.input.len() as u16,
+            area.y + 2,
+        ));
+
+        let filter_hint = Line::from(vec![
+            Span::styled("Tab: ", Style::default().fg(self.theme.muted)),
+            Span::styled("cambiar filtro  ", Style::default().fg(self.theme.secondary)),
+            Span::styled("Enter: ", Style::default().fg(self.theme.muted)),
+            Span::styled("buscar/seleccionar  ", Style::default().fg(self.theme.secondary)),
+            Span::styled("Esc: ", Style::default().fg(self.theme.muted)),
+            Span::styled("volver", Style::default().fg(self.theme.secondary)),
+        ]);
+        f.render_widget(Paragraph::new(filter_hint), chunks[1]);
+
+        let items: Vec<ListItem> = self
+            .post_search_results
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let time = p.created_at.format("%H:%M %d/%m").to_string();
+                let img = if p.image_path.is_some() { "  [📷]" } else { "" };
+                ListItem::new(Line::from(vec![
+                    Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
+                    Span::raw(": "),
+                    Span::raw(&p.content),
+                    Span::styled(img, Style::default().fg(self.theme.image_indicator)),
+                    Span::styled(format!("  [{}]", time), Style::default().fg(self.theme.muted)),
+                ]))
+                .style(self.theme.list_item_style(i))
+            })
+            .collect();
+
+        let list = List::new(items)
+            .block(self.theme.default_block("Resultados"))
+            .highlight_style(self.theme.highlight())
+            .highlight_symbol("> ");
+        f.render_stateful_widget(list, chunks[2], &mut self.list_state.clone());
+    }
+
+    fn render_post_search_filter(&self, f: &mut Frame, area: Rect) {
+        let current = self.post_search_filter;
+        let items: Vec<ListItem> = [
+            ("all", "Todas las publicaciones"),
+            ("24h", "Últimas 24 horas"),
+            ("7d", "Últimos 7 días"),
+            ("30d", "Últimos 30 días"),
+        ]
+        .iter()
+        .map(|(k, label)| {
+            let prefix = if *k == current { "✓ " } else { "  " };
+            ListItem::new(Line::from(Span::raw(format!("{}{}", prefix, label))))
+        })
+        .collect();
+
+        let list = List::new(items)
+            .block(Block::default().title(" Filtrar por fecha ").borders(Borders::ALL).border_type(BorderType::Rounded))
+            .highlight_style(self.theme.highlight())
+            .highlight_symbol("> ");
+        let area = Layout::default()
+            .horizontal_margin(2)
+            .vertical_margin(5)
+            .constraints([Constraint::Length(6)])
+            .split(area)[0];
+        f.render_widget(list, area);
+    }
+
     fn handle_profile_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         if self.show_follow_list {
             match key.code {
@@ -1095,6 +1220,70 @@ impl App {
                 self.screen = Screen::Timeline;
                 self.input.clear();
             }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_post_search_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc => {
+                self.screen = Screen::Timeline;
+                self.input.clear();
+            }
+            KeyCode::Char(c) => self.input.push(c),
+            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Tab => {
+                self.screen = Screen::PostSearchFilter;
+            }
+            KeyCode::Up => {
+                let len = self.post_search_results.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some(i.saturating_sub(1)));
+                }
+            }
+            KeyCode::Down => {
+                let len = self.post_search_results.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some((i + 1).min(len - 1)));
+                }
+            }
+            KeyCode::Enter => {
+                if self.list_state.selected().is_some() && !self.post_search_results.is_empty() {
+                    if let Some(i) = self.list_state.selected() {
+                        if let Some(post) = self.post_search_results.get(i) {
+                            self.viewed_post = Some(post.clone());
+                            self.post_comments = self.db.get_comments(post.id)?;
+                            self.comment_input.clear();
+                            self.comment_list_state = ListState::default();
+                            self.edit_mode = false;
+                            self.screen = Screen::PostDetail(post.id);
+                        }
+                    }
+                } else {
+                    let query = self.input.trim().to_string();
+                    if !query.is_empty() {
+                        self.post_search_results = self.db.search_posts(&query, self.post_search_filter)?;
+                        self.list_state.select(Some(0));
+                    }
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_post_search_filter_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Tab => {
+                self.screen = Screen::PostSearch;
+            }
+            KeyCode::Char('1') => self.post_search_filter = "all",
+            KeyCode::Char('2') => self.post_search_filter = "24h",
+            KeyCode::Char('3') => self.post_search_filter = "7d",
+            KeyCode::Char('4') => self.post_search_filter = "30d",
             _ => {}
         }
         Ok(true)
@@ -1456,6 +1645,8 @@ impl App {
                 Screen::Chat(_) => self.render_chat(f, content_area),
                 Screen::EditProfile => self.render_edit_profile(f, content_area),
                 Screen::Notifications => self.render_notifications(f, content_area),
+                Screen::PostSearch => self.render_post_search(f, content_area),
+                Screen::PostSearchFilter => self.render_post_search_filter(f, content_area),
             }
         } else {
             match self.screen {
@@ -1467,7 +1658,7 @@ impl App {
     }
 
     fn set_cursor_clamped(f: &mut Frame, x: u16, y: u16) {
-        let area = f.size();
+        let area = f.area();
         let x = x.min(area.x + area.width.saturating_sub(1));
         let y = y.min(area.y + area.height.saturating_sub(1));
         f.set_cursor_position((x, y));

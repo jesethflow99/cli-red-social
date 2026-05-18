@@ -43,6 +43,8 @@ pub enum Screen {
     Chat(i64),
     EditProfile,
     Notifications,
+    PostSearch,
+    PostSearchFilter,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -31,11 +31,17 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
+    let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_default();
 
     if cli.tui {
         app::run_tui(&db_url)?;
     } else {
         println!("Iniciando servidor SSH en puerto {}...", cli.port);
+        if !ssh_password.is_empty() {
+            println!("Autenticación SSH por contraseña habilitada.");
+        } else {
+            println!("⚠  SSH sin contraseña (acepta cualquier password). Configurá SSH_PASSWORD para producción.");
+        }
         let database = Arc::new(db::Database::new(&db_url)?);
         database.cleanup_old_data(90).ok();
         spawn_cleanup_thread(database.clone());
@@ -47,14 +53,15 @@ fn main() -> Result<()> {
             db_url,
             cli.port,
             cli.key,
+            &ssh_password,
         ))?;
     }
 
     Ok(())
 }
 
-async fn run_server(db: Arc<db::Database>, db_url: String, port: u16, key: String) -> Result<()> {
-    let mut server = ssh::SshServer::new(db, &db_url);
+async fn run_server(db: Arc<db::Database>, db_url: String, port: u16, key: String, ssh_password: &str) -> Result<()> {
+    let mut server = ssh::SshServer::new(db, &db_url, ssh_password);
     server.run(port, &key).await?;
     Ok(())
 }
