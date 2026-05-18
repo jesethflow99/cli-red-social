@@ -1,0 +1,1369 @@
+use anyhow::Result;
+use chrono::Utc;
+use postgres::NoTls;
+use r2d2::Pool;
+use r2d2_postgres::PostgresConnectionManager;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Duration;
+use std::time::Instant;
+
+use crate::models::{Comment, Message, Notification, Post, User};
+
+pub trait DatabaseOps: Send {
+    fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User>;
+    fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>>;
+    fn get_user_by_id(&self, id: i64) -> Result<Option<User>>;
+    fn search_users(&self, query: &str) -> Result<Vec<User>>;
+    fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post>;
+    fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>>;
+    fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()>;
+    fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()>;
+    fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool>;
+    fn get_followers(&self, user_id: i64) -> Result<Vec<User>>;
+    fn get_following(&self, user_id: i64) -> Result<Vec<User>>;
+    fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>>;
+    fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment>;
+    fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>>;
+    fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()>;
+    fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()>;
+    fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()>;
+    fn delete_user(&self, user_id: i64) -> Result<()>;
+    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message>;
+    fn get_conversations(&self, user_id: i64) -> Result<Vec<User>>;
+    fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>>;
+    fn get_unread_count(&self, user_id: i64) -> Result<i64>;
+    fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()>;
+    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()>;
+    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()>;
+    fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>>;
+    fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64>;
+    fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
+    fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
+    fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
+}
+
+impl DatabaseOps for Database {
+    fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
+        Database::register_user(self, username, password, display_name)
+    }
+    fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
+        Database::authenticate(self, username, password)
+    }
+    fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
+        Database::get_user_by_id(self, id)
+    }
+    fn search_users(&self, query: &str) -> Result<Vec<User>> {
+        Database::search_users(self, query)
+    }
+    fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+        Database::create_post(self, user_id, content, image_path)
+    }
+    fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
+        Database::get_timeline(self, user_id)
+    }
+    fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+        Database::follow_user(self, follower_id, following_id)
+    }
+    fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+        Database::unfollow_user(self, follower_id, following_id)
+    }
+    fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool> {
+        Database::is_following(self, follower_id, following_id)
+    }
+    fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
+        Database::get_followers(self, user_id)
+    }
+    fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
+        Database::get_following(self, user_id)
+    }
+    fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
+        Database::get_posts_by_user(self, user_id)
+    }
+    fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
+        Database::add_comment(self, post_id, user_id, content)
+    }
+    fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
+        Database::get_comments(self, post_id)
+    }
+    fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
+        Database::update_post(self, post_id, user_id, content)
+    }
+    fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()> {
+        Database::delete_post(self, post_id, user_id)
+    }
+    fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()> {
+        Database::delete_comment(self, comment_id, user_id)
+    }
+    fn delete_user(&self, user_id: i64) -> Result<()> {
+        Database::delete_user(self, user_id)
+    }
+    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
+        Database::send_message(self, sender_id, receiver_id, content)
+    }
+    fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
+        Database::get_conversations(self, user_id)
+    }
+    fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
+        Database::get_messages(self, user_id, other_id)
+    }
+    fn get_unread_count(&self, user_id: i64) -> Result<i64> {
+        Database::get_unread_count(self, user_id)
+    }
+    fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
+        Database::mark_messages_read(self, user_id, other_id)
+    }
+    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
+        Database::update_profile(self, user_id, display_name, bio)
+    }
+    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
+        Database::add_notification(self, user_id, from_user_id, notif_type)
+    }
+    fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
+        Database::get_notifications(self, user_id)
+    }
+    fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
+        Database::get_unread_notifications_count(self, user_id)
+    }
+    fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
+        Database::mark_notifications_read(self, user_id)
+    }
+    fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+        Database::check_rate_limit(self, user_id, action, max, window_secs)
+    }
+    fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
+        Database::cleanup_old_data(self, days)
+    }
+}
+
+pub struct Database {
+    pool: Pool<PostgresConnectionManager<NoTls>>,
+    rate_limiter: Mutex<HashMap<String, Vec<Instant>>>,
+}
+
+impl Database {
+    pub fn new(conn_str: &str) -> Result<Self> {
+        let manager = PostgresConnectionManager::new(conn_str.parse()?, NoTls);
+        let pool = Pool::builder()
+            .max_size(1)
+            .min_idle(Some(0))
+            .connection_timeout(Duration::from_secs(3))
+            .build(manager)?;
+        let db = Self { pool, rate_limiter: Mutex::new(HashMap::new()) };
+        db.init_schema()?;
+        Ok(db)
+    }
+
+    pub fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+        let key = format!("{}:{}", user_id, action);
+        let now = Instant::now();
+        let mut limiter = self.rate_limiter.lock().unwrap();
+        let entries = limiter.entry(key).or_default();
+        entries.retain(|t| now.duration_since(*t).as_secs() < window_secs);
+        if entries.len() >= max {
+            anyhow::bail!("Demasiadas solicitudes. Espera un momento.");
+        }
+        entries.push(now);
+        Ok(())
+    }
+
+    fn init_schema(&self) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.batch_execute(
+            "SET client_min_messages TO warning;
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                bio TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS posts (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                content TEXT NOT NULL,
+                image_path TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS follows (
+                follower_id INTEGER NOT NULL REFERENCES users(id),
+                following_id INTEGER NOT NULL REFERENCES users(id),
+                PRIMARY KEY (follower_id, following_id)
+            );
+            CREATE TABLE IF NOT EXISTS comments (
+                id SERIAL PRIMARY KEY,
+                post_id INTEGER NOT NULL REFERENCES posts(id),
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS messages (
+                id SERIAL PRIMARY KEY,
+                sender_id INTEGER NOT NULL REFERENCES users(id),
+                receiver_id INTEGER NOT NULL REFERENCES users(id),
+                content TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                read INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS notifications (
+                id SERIAL PRIMARY KEY,
+                user_id INTEGER NOT NULL REFERENCES users(id),
+                from_user_id INTEGER NOT NULL REFERENCES users(id),
+                type TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                read INTEGER NOT NULL DEFAULT 0
+            );",
+        )?;
+        Ok(())
+    }
+
+    pub fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
+        let mut conn = self.pool.get()?;
+        let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.query(
+            "INSERT INTO users (username, password_hash, display_name, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            &[&username, &hash, &display_name, &now],
+        )?;
+        let id: i64 = rows[0].get(0);
+        Ok(User {
+            id,
+            username: username.to_string(),
+            display_name: display_name.to_string(),
+            bio: String::new(),
+            created_at: now.parse().unwrap(),
+        })
+    }
+
+    pub fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT id, username, display_name, bio, created_at, password_hash FROM users WHERE username = $1",
+            &[&username],
+        )?;
+        if let Some(row) = rows.into_iter().next() {
+            let hash: String = row.get(5);
+            if bcrypt::verify(password, &hash)? {
+                return Ok(Some(User {
+                    id: row.get(0),
+                    username: row.get(1),
+                    display_name: row.get(2),
+                    bio: row.get(3),
+                    created_at: row.get::<_, String>(4).parse().unwrap(),
+                }));
+            }
+        }
+        Ok(None)
+    }
+
+    pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT id, username, display_name, bio, created_at FROM users WHERE id = $1",
+            &[&id],
+        )?;
+        Ok(rows.into_iter().next().map(|row| User {
+            id: row.get(0),
+            username: row.get(1),
+            display_name: row.get(2),
+            bio: row.get(3),
+            created_at: row.get::<_, String>(4).parse().unwrap(),
+        }))
+    }
+
+    pub fn search_users(&self, query: &str) -> Result<Vec<User>> {
+        let mut conn = self.pool.get()?;
+        let pattern = format!("%{}%", query);
+        let rows = conn.query(
+            "SELECT id, username, display_name, bio, created_at FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 LIMIT 20",
+            &[&pattern],
+        )?;
+        Ok(rows.iter().map(|row| User {
+            id: row.get(0),
+            username: row.get(1),
+            display_name: row.get(2),
+            bio: row.get(3),
+            created_at: row.get::<_, String>(4).parse().unwrap(),
+        }).collect())
+    }
+
+    pub fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+        self.check_rate_limit(user_id, "post", 5, 60)?;
+        let mut conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        let img = image_path.unwrap_or("");
+        let rows = conn.query(
+            "INSERT INTO posts (user_id, content, image_path, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            &[&user_id, &content, &img, &now],
+        )?;
+        let id: i64 = rows[0].get(0);
+        let username: String = conn.query_one(
+            "SELECT username FROM users WHERE id = $1",
+            &[&user_id],
+        )?.get(0);
+        Ok(Post {
+            id,
+            user_id,
+            username,
+            content: content.to_string(),
+            image_path: image_path.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+            created_at: now.parse().unwrap(),
+        })
+    }
+
+    pub fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p
+             JOIN users u ON u.id = p.user_id
+             LEFT JOIN follows f ON f.following_id = p.user_id AND f.follower_id = $1
+             WHERE p.user_id = $1 OR f.follower_id = $1
+             ORDER BY p.created_at DESC
+             LIMIT 50",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| {
+            let img: String = row.get(4);
+            Post {
+                id: row.get(0),
+                user_id: row.get(1),
+                username: row.get(2),
+                content: row.get(3),
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            }
+        }).collect())
+    }
+
+    pub fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+        self.check_rate_limit(follower_id, "follow", 10, 60)?;
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+            &[&follower_id, &following_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "DELETE FROM follows WHERE follower_id = $1 AND following_id = $2",
+            &[&follower_id, &following_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2",
+            &[&follower_id, &following_id],
+        )?;
+        Ok(!rows.is_empty())
+    }
+
+    pub fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+             FROM users u
+             JOIN follows f ON f.follower_id = u.id
+             WHERE f.following_id = $1",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| User {
+            id: row.get(0),
+            username: row.get(1),
+            display_name: row.get(2),
+            bio: row.get(3),
+            created_at: row.get::<_, String>(4).parse().unwrap(),
+        }).collect())
+    }
+
+    pub fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p JOIN users u ON u.id = p.user_id
+             WHERE p.user_id = $1
+             ORDER BY p.created_at DESC LIMIT 20",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| {
+            let img: String = row.get(4);
+            Post {
+                id: row.get(0),
+                user_id: row.get(1),
+                username: row.get(2),
+                content: row.get(3),
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            }
+        }).collect())
+    }
+
+    pub fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
+        self.check_rate_limit(user_id, "comment", 10, 60)?;
+        let mut conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.query(
+            "INSERT INTO comments (post_id, user_id, content, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            &[&post_id, &user_id, &content, &now],
+        )?;
+        let id: i64 = rows[0].get(0);
+        let username: String = conn.query_one(
+            "SELECT username FROM users WHERE id = $1",
+            &[&user_id],
+        )?.get(0);
+        Ok(Comment {
+            id,
+            post_id,
+            user_id,
+            username,
+            content: content.to_string(),
+            created_at: now.parse().unwrap(),
+        })
+    }
+
+    pub fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT c.id, c.post_id, c.user_id, u.username, c.content, c.created_at
+             FROM comments c
+             JOIN users u ON u.id = c.user_id
+             WHERE c.post_id = $1
+             ORDER BY c.created_at ASC",
+            &[&post_id],
+        )?;
+        Ok(rows.iter().map(|row| Comment {
+            id: row.get(0),
+            post_id: row.get(1),
+            user_id: row.get(2),
+            username: row.get(3),
+            content: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
+        }).collect())
+    }
+
+    pub fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.execute(
+            "UPDATE posts SET content = $1 WHERE id = $2 AND user_id = $3",
+            &[&content, &post_id, &user_id],
+        )?;
+        if rows == 0 {
+            anyhow::bail!("No tienes permiso para editar este post o no existe");
+        }
+        Ok(())
+    }
+
+    pub fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute("DELETE FROM comments WHERE post_id = $1", &[&post_id])?;
+        let rows = conn.execute(
+            "DELETE FROM posts WHERE id = $1 AND user_id = $2",
+            &[&post_id, &user_id],
+        )?;
+        if rows == 0 {
+            anyhow::bail!("No tienes permiso para eliminar este post o no existe");
+        }
+        Ok(())
+    }
+
+    pub fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.execute(
+            "DELETE FROM comments WHERE id = $1 AND user_id = $2",
+            &[&comment_id, &user_id],
+        )?;
+        if rows == 0 {
+            anyhow::bail!("No tienes permiso para eliminar este comentario o no existe");
+        }
+        Ok(())
+    }
+
+    pub fn delete_user(&self, user_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute("DELETE FROM follows WHERE follower_id = $1 OR following_id = $1", &[&user_id])?;
+        conn.execute(
+            "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)",
+            &[&user_id],
+        )?;
+        conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
+        conn.execute("DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1", &[&user_id])?;
+        conn.execute("DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1", &[&user_id])?;
+        conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
+        Ok(())
+    }
+
+    pub fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+             FROM users u
+             JOIN follows f ON f.following_id = u.id
+             WHERE f.follower_id = $1",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| User {
+            id: row.get(0),
+            username: row.get(1),
+            display_name: row.get(2),
+            bio: row.get(3),
+            created_at: row.get::<_, String>(4).parse().unwrap(),
+        }).collect())
+    }
+
+    pub fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
+        self.check_rate_limit(sender_id, "message", 10, 60)?;
+        let mut conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        let rows = conn.query(
+            "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
+            &[&sender_id, &receiver_id, &content, &now],
+        )?;
+        let id: i64 = rows[0].get(0);
+        let username: String = conn.query_one(
+            "SELECT username FROM users WHERE id = $1",
+            &[&sender_id],
+        )?.get(0);
+        Ok(Message {
+            id,
+            sender_id,
+            receiver_id,
+            sender_username: username,
+            content: content.to_string(),
+            created_at: now.parse().unwrap(),
+            read: false,
+        })
+    }
+
+    pub fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT u.id, u.username, u.display_name, u.bio, u.created_at
+             FROM users u
+             WHERE u.id IN (
+                 SELECT DISTINCT CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END
+                 FROM messages
+                 WHERE sender_id = $1 OR receiver_id = $1
+             )
+             ORDER BY u.username",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| User {
+            id: row.get(0),
+            username: row.get(1),
+            display_name: row.get(2),
+            bio: row.get(3),
+            created_at: row.get::<_, String>(4).parse().unwrap(),
+        }).collect())
+    }
+
+    pub fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT m.id, m.sender_id, m.receiver_id, u.username, m.content, m.created_at, m.read
+             FROM messages m
+             JOIN users u ON u.id = m.sender_id
+             WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
+             ORDER BY m.created_at ASC",
+            &[&user_id, &other_id],
+        )?;
+        Ok(rows.iter().map(|row| Message {
+            id: row.get(0),
+            sender_id: row.get(1),
+            receiver_id: row.get(2),
+            sender_username: row.get(3),
+            content: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
+            read: row.get::<_, i32>(6) != 0,
+        }).collect())
+    }
+
+    pub fn get_unread_count(&self, user_id: i64) -> Result<i64> {
+        let mut conn = self.pool.get()?;
+        let count: i64 = conn.query_one(
+            "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND read = 0",
+            &[&user_id],
+        )?.get(0);
+        Ok(count)
+    }
+
+    pub fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE messages SET read = 1 WHERE sender_id = $2 AND receiver_id = $1 AND read = 0",
+            &[&user_id, &other_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE users SET display_name = $1, bio = $2 WHERE id = $3",
+            &[&display_name, &bio, &user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        let now = Utc::now().to_rfc3339();
+        conn.execute(
+            "INSERT INTO notifications (user_id, from_user_id, type, created_at) VALUES ($1, $2, $3, $4)",
+            &[&user_id, &from_user_id, &notif_type, &now],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read
+             FROM notifications n
+             JOIN users u ON u.id = n.from_user_id
+             WHERE n.user_id = $1
+             ORDER BY n.created_at DESC
+             LIMIT 50",
+            &[&user_id],
+        )?;
+        Ok(rows.iter().map(|row| Notification {
+            id: row.get(0),
+            user_id: row.get(1),
+            from_user_id: row.get(2),
+            from_username: row.get(3),
+            notif_type: row.get(4),
+            created_at: row.get::<_, String>(5).parse().unwrap(),
+            read: row.get::<_, i32>(6) != 0,
+        }).collect())
+    }
+
+    pub fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
+        let mut conn = self.pool.get()?;
+        let count: i64 = conn.query_one(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = 0",
+            &[&user_id],
+        )?.get(0);
+        Ok(count)
+    }
+
+    pub fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "UPDATE notifications SET read = 1 WHERE user_id = $1 AND read = 0",
+            &[&user_id],
+        )?;
+        Ok(())
+    }
+
+    pub fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
+        let mut conn = self.pool.get()?;
+        let msgs = conn.execute(
+            "DELETE FROM messages WHERE created_at::timestamptz < NOW() - make_interval(days => $1)",
+            &[&days],
+        )?;
+        let notifs = conn.execute(
+            "DELETE FROM notifications WHERE created_at::timestamptz < NOW() - make_interval(days => $1)",
+            &[&days],
+        )?;
+        Ok((msgs, notifs))
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod mock_db {
+    use anyhow::Result;
+    use chrono::Utc;
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+
+    use crate::db::DatabaseOps;
+    use crate::models::{Comment, Message, Notification, Post, User};
+
+    pub(crate) struct MockData {
+        pub users: Vec<(User, String)>,
+        pub posts: Vec<Post>,
+        pub follows: Vec<(i64, i64)>,
+        pub comments: Vec<Comment>,
+        pub messages: Vec<Message>,
+        pub notifications: Vec<Notification>,
+        pub next_id: i64,
+    }
+
+    impl Default for MockData {
+        fn default() -> Self {
+            Self {
+                users: vec![],
+                posts: vec![],
+                follows: vec![],
+                comments: vec![],
+                messages: vec![],
+                notifications: vec![],
+                next_id: 1,
+            }
+        }
+    }
+
+    pub(crate) struct MockDatabase {
+        pub data: Mutex<MockData>,
+        rate_limiter: Mutex<HashMap<String, Vec<Instant>>>,
+    }
+
+    impl Default for MockDatabase {
+        fn default() -> Self {
+            Self {
+                data: Mutex::new(MockData::default()),
+                rate_limiter: Mutex::new(HashMap::new()),
+            }
+        }
+    }
+
+    impl MockDatabase {
+        pub fn new() -> Self {
+            Self::default()
+        }
+    }
+
+    impl DatabaseOps for MockDatabase {
+        fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+            let key = format!("{}:{}", user_id, action);
+            let now = Instant::now();
+            let mut limiter = self.rate_limiter.lock().unwrap();
+            let entries = limiter.entry(key).or_default();
+            entries.retain(|t| now.duration_since(*t).as_secs() < window_secs);
+            if entries.len() >= max {
+                anyhow::bail!("Demasiadas solicitudes. Espera un momento.");
+            }
+            entries.push(now);
+            Ok(())
+        }
+
+        fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
+            let mut data = self.data.lock().unwrap();
+            if data.users.iter().any(|(u, _)| u.username == username) {
+                anyhow::bail!("El usuario ya existe");
+            }
+            let id = data.next_id;
+            data.next_id += 1;
+            let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
+            let user = User {
+                id,
+                username: username.to_string(),
+                display_name: display_name.to_string(),
+                bio: String::new(),
+                created_at: Utc::now(),
+            };
+            data.users.push((user.clone(), hash));
+            Ok(user)
+        }
+
+        fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
+            let data = self.data.lock().unwrap();
+            if let Some((user, hash)) = data.users.iter().find(|(u, _)| u.username == username) {
+                if bcrypt::verify(password, hash)? {
+                    return Ok(Some(user.clone()));
+                }
+            }
+            Ok(None)
+        }
+
+        fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.users.iter().find(|(u, _)| u.id == id).map(|(u, _)| u.clone()))
+        }
+
+        fn search_users(&self, query: &str) -> Result<Vec<User>> {
+            let data = self.data.lock().unwrap();
+            let q = query.to_lowercase();
+            Ok(data.users.iter()
+                .filter(|(u, _)| u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
+                .map(|(u, _)| u.clone())
+                .take(20)
+                .collect())
+        }
+
+        fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+            self.check_rate_limit(user_id, "post", 5, 60)?;
+            let mut data = self.data.lock().unwrap();
+            let username = data.users.iter()
+                .find(|(u, _)| u.id == user_id)
+                .map(|(u, _)| u.username.clone())
+                .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
+            let id = data.next_id;
+            data.next_id += 1;
+            let post = Post {
+                id,
+                user_id,
+                username,
+                content: content.to_string(),
+                image_path: image_path.map(|s| s.to_string()).filter(|s| !s.is_empty()),
+                created_at: Utc::now(),
+            };
+            data.posts.push(post.clone());
+            Ok(post)
+        }
+
+        fn get_timeline(&self, user_id: i64) -> Result<Vec<Post>> {
+            let data = self.data.lock().unwrap();
+            let mut posts: Vec<Post> = data.posts.iter()
+                .filter(|p| {
+                    p.user_id == user_id
+                        || data.follows.iter().any(|(f, fol)| *f == user_id && *fol == p.user_id)
+                })
+                .cloned()
+                .collect();
+            posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            posts.truncate(50);
+            Ok(posts)
+        }
+
+        fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+            self.check_rate_limit(follower_id, "follow", 10, 60)?;
+            let mut data = self.data.lock().unwrap();
+            if !data.follows.iter().any(|(f, fol)| *f == follower_id && *fol == following_id) {
+                data.follows.push((follower_id, following_id));
+            }
+            Ok(())
+        }
+
+        fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            data.follows.retain(|(f, fol)| *f != follower_id || *fol != following_id);
+            Ok(())
+        }
+
+        fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool> {
+            let data = self.data.lock().unwrap();
+            Ok(data.follows.iter().any(|(f, fol)| *f == follower_id && *fol == following_id))
+        }
+
+        fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.follows.iter()
+                .filter(|(_, fol)| *fol == user_id)
+                .filter_map(|(f, _)| data.users.iter().find(|(u, _)| u.id == *f).map(|(u, _)| u.clone()))
+                .collect())
+        }
+
+        fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.follows.iter()
+                .filter(|(f, _)| *f == user_id)
+                .filter_map(|(_, fol)| data.users.iter().find(|(u, _)| u.id == *fol).map(|(u, _)| u.clone()))
+                .collect())
+        }
+
+        fn get_posts_by_user(&self, user_id: i64) -> Result<Vec<Post>> {
+            let data = self.data.lock().unwrap();
+            let mut posts: Vec<Post> = data.posts.iter()
+                .filter(|p| p.user_id == user_id)
+                .cloned()
+                .collect();
+            posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            posts.truncate(20);
+            Ok(posts)
+        }
+
+        fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
+            self.check_rate_limit(user_id, "comment", 10, 60)?;
+            let mut data = self.data.lock().unwrap();
+            let username = data.users.iter()
+                .find(|(u, _)| u.id == user_id)
+                .map(|(u, _)| u.username.clone())
+                .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
+            let id = data.next_id;
+            data.next_id += 1;
+            let comment = Comment {
+                id,
+                post_id,
+                user_id,
+                username,
+                content: content.to_string(),
+                created_at: Utc::now(),
+            };
+            data.comments.push(comment.clone());
+            Ok(comment)
+        }
+
+        fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
+            let data = self.data.lock().unwrap();
+            let mut comments: Vec<Comment> = data.comments.iter()
+                .filter(|c| c.post_id == post_id)
+                .cloned()
+                .collect();
+            comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(comments)
+        }
+
+        fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            let post = data.posts.iter_mut()
+                .find(|p| p.id == post_id)
+                .ok_or_else(|| anyhow::anyhow!("Post no encontrado"))?;
+            if post.user_id != user_id {
+                anyhow::bail!("No tienes permiso para editar este post");
+            }
+            post.content = content.to_string();
+            Ok(())
+        }
+
+        fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            let idx = data.posts.iter().position(|p| p.id == post_id)
+                .ok_or_else(|| anyhow::anyhow!("Post no encontrado"))?;
+            if data.posts[idx].user_id != user_id {
+                anyhow::bail!("No tienes permiso para eliminar este post");
+            }
+            data.comments.retain(|c| c.post_id != post_id);
+            data.posts.remove(idx);
+            Ok(())
+        }
+
+        fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            let idx = data.comments.iter().position(|c| c.id == comment_id)
+                .ok_or_else(|| anyhow::anyhow!("Comentario no encontrado"))?;
+            if data.comments[idx].user_id != user_id {
+                anyhow::bail!("No tienes permiso para eliminar este comentario");
+            }
+            data.comments.remove(idx);
+            Ok(())
+        }
+
+        fn delete_user(&self, user_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            data.users.retain(|(u, _)| u.id != user_id);
+            data.posts.retain(|p| p.user_id != user_id);
+            data.comments.retain(|c| c.user_id != user_id);
+            data.follows.retain(|(f, fol)| *f != user_id && *fol != user_id);
+            data.messages.retain(|m| m.sender_id != user_id && m.receiver_id != user_id);
+            data.notifications.retain(|n| n.user_id != user_id && n.from_user_id != user_id);
+            Ok(())
+        }
+
+        fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
+            self.check_rate_limit(sender_id, "message", 10, 60)?;
+            let mut data = self.data.lock().unwrap();
+            let username = data.users.iter()
+                .find(|(u, _)| u.id == sender_id)
+                .map(|(u, _)| u.username.clone())
+                .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
+            let id = data.next_id;
+            data.next_id += 1;
+            let msg = Message {
+                id,
+                sender_id,
+                receiver_id,
+                sender_username: username,
+                content: content.to_string(),
+                created_at: Utc::now(),
+                read: false,
+            };
+            data.messages.push(msg.clone());
+            Ok(msg)
+        }
+
+        fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
+            let data = self.data.lock().unwrap();
+            let mut other_ids: Vec<i64> = data.messages.iter()
+                .filter(|m| m.sender_id == user_id || m.receiver_id == user_id)
+                .map(|m| if m.sender_id == user_id { m.receiver_id } else { m.sender_id })
+                .collect();
+            other_ids.sort();
+            other_ids.dedup();
+            let users: Vec<User> = other_ids.iter()
+                .filter_map(|id| data.users.iter().find(|(u, _)| u.id == *id).map(|(u, _)| u.clone()))
+                .collect();
+            Ok(users)
+        }
+
+        fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
+            let data = self.data.lock().unwrap();
+            let mut msgs: Vec<Message> = data.messages.iter()
+                .filter(|m| {
+                    (m.sender_id == user_id && m.receiver_id == other_id)
+                        || (m.sender_id == other_id && m.receiver_id == user_id)
+                })
+                .cloned()
+                .collect();
+            msgs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            Ok(msgs)
+        }
+
+        fn get_unread_count(&self, user_id: i64) -> Result<i64> {
+            let data = self.data.lock().unwrap();
+            Ok(data.messages.iter()
+                .filter(|m| m.receiver_id == user_id && !m.read)
+                .count() as i64)
+        }
+
+        fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            for m in data.messages.iter_mut() {
+                if m.sender_id == other_id && m.receiver_id == user_id {
+                    m.read = true;
+                }
+            }
+            Ok(())
+        }
+
+        fn update_profile(&self, user_id: i64, display_name: &str, bio: &str) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            if let Some((user, _)) = data.users.iter_mut().find(|(u, _)| u.id == user_id) {
+                user.display_name = display_name.to_string();
+                user.bio = bio.to_string();
+            }
+            Ok(())
+        }
+
+        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            let from_username = data.users.iter()
+                .find(|(u, _)| u.id == from_user_id)
+                .map(|(u, _)| u.username.clone())
+                .unwrap_or_default();
+            let id = data.next_id;
+            data.next_id += 1;
+            data.notifications.push(Notification {
+                id,
+                user_id,
+                from_user_id,
+                from_username,
+                notif_type: notif_type.to_string(),
+                created_at: Utc::now(),
+                read: false,
+            });
+            Ok(())
+        }
+
+        fn get_notifications(&self, user_id: i64) -> Result<Vec<Notification>> {
+            let data = self.data.lock().unwrap();
+            let mut notifs: Vec<Notification> = data.notifications.iter()
+                .filter(|n| n.user_id == user_id)
+                .cloned()
+                .collect();
+            notifs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            notifs.truncate(50);
+            Ok(notifs)
+        }
+
+        fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
+            let data = self.data.lock().unwrap();
+            Ok(data.notifications.iter()
+                .filter(|n| n.user_id == user_id && !n.read)
+                .count() as i64)
+        }
+
+        fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
+            let mut data = self.data.lock().unwrap();
+            for n in data.notifications.iter_mut() {
+                if n.user_id == user_id {
+                    n.read = true;
+                }
+            }
+            Ok(())
+        }
+
+        fn cleanup_old_data(&self, _days: i64) -> Result<(u64, u64)> {
+            Ok((0, 0))
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn setup() -> MockDatabase {
+            let db = MockDatabase::new();
+            db.register_user("alice", "pass123", "Alice A.").unwrap();
+            db.register_user("bob", "pass456", "Bob B.").unwrap();
+            db
+        }
+
+        #[test]
+        fn test_register_and_authenticate() {
+            let db = setup();
+            let user = db.authenticate("alice", "pass123").unwrap();
+            assert!(user.is_some());
+            assert_eq!(user.unwrap().username, "alice");
+
+            let bad = db.authenticate("alice", "wrongpass").unwrap();
+            assert!(bad.is_none());
+
+            let nonexist = db.authenticate("charlie", "pass").unwrap();
+            assert!(nonexist.is_none());
+        }
+
+        #[test]
+        fn test_register_duplicate_username() {
+            let db = setup();
+            let result = db.register_user("alice", "otrapass", "Alice Dup");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_get_user_by_id() {
+            let db = setup();
+            let user = db.get_user_by_id(1).unwrap().unwrap();
+            assert_eq!(user.username, "alice");
+
+            let missing = db.get_user_by_id(999).unwrap();
+            assert!(missing.is_none());
+        }
+
+        #[test]
+        fn test_search_users() {
+            let db = setup();
+            let results = db.search_users("ali").unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].username, "alice");
+
+            let all = db.search_users("").unwrap();
+            assert_eq!(all.len(), 2);
+        }
+
+        #[test]
+        fn test_create_and_get_timeline() {
+            let db = setup();
+            db.create_post(1, "Hello from Alice", None).unwrap();
+            db.create_post(2, "Bob's first post", None).unwrap();
+            db.follow_user(1, 2).unwrap();
+
+            let timeline = db.get_timeline(1).unwrap();
+            assert_eq!(timeline.len(), 2);
+            assert!(timeline.iter().any(|p| p.content == "Hello from Alice"));
+            assert!(timeline.iter().any(|p| p.content == "Bob's first post"));
+        }
+
+        #[test]
+        fn test_follow_unfollow() {
+            let db = setup();
+            assert!(!db.is_following(1, 2).unwrap());
+
+            db.follow_user(1, 2).unwrap();
+            assert!(db.is_following(1, 2).unwrap());
+
+            db.unfollow_user(1, 2).unwrap();
+            assert!(!db.is_following(1, 2).unwrap());
+        }
+
+        #[test]
+        fn test_followers_and_following() {
+            let db = setup();
+            db.follow_user(1, 2).unwrap();
+            db.follow_user(2, 1).unwrap();
+
+            let alice_followers = db.get_followers(1).unwrap();
+            let alice_following = db.get_following(1).unwrap();
+            assert_eq!(alice_followers.len(), 1);
+            assert_eq!(alice_followers[0].username, "bob");
+            assert_eq!(alice_following.len(), 1);
+            assert_eq!(alice_following[0].username, "bob");
+        }
+
+        #[test]
+        fn test_get_posts_by_user() {
+            let db = setup();
+            db.create_post(1, "Post 1", None).unwrap();
+            db.create_post(1, "Post 2", None).unwrap();
+            db.create_post(2, "Bob post", None).unwrap();
+
+            let alice_posts = db.get_posts_by_user(1).unwrap();
+            assert_eq!(alice_posts.len(), 2);
+            assert!(alice_posts.iter().all(|p| p.user_id == 1));
+        }
+
+        #[test]
+        fn test_comments() {
+            let db = setup();
+            let post = db.create_post(1, "Alice's post", None).unwrap();
+            let comment = db.add_comment(post.id, 2, "Nice!").unwrap();
+            assert_eq!(comment.content, "Nice!");
+            assert_eq!(comment.user_id, 2);
+
+            let comments = db.get_comments(post.id).unwrap();
+            assert_eq!(comments.len(), 1);
+        }
+
+        #[test]
+        fn test_update_post() {
+            let db = setup();
+            let post = db.create_post(1, "Original", None).unwrap();
+            db.update_post(post.id, 1, "Updated").unwrap();
+
+            let timeline = db.get_timeline(1).unwrap();
+            assert_eq!(timeline[0].content, "Updated");
+        }
+
+        #[test]
+        fn test_update_post_wrong_user() {
+            let db = setup();
+            let post = db.create_post(1, "Alice's post", None).unwrap();
+            let result = db.update_post(post.id, 2, "hacked");
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_delete_post() {
+            let db = setup();
+            let post = db.create_post(1, "To delete", None).unwrap();
+            db.add_comment(post.id, 2, "comment").unwrap();
+            db.delete_post(post.id, 1).unwrap();
+
+            let timeline = db.get_timeline(1).unwrap();
+            assert!(timeline.is_empty());
+            assert!(db.get_comments(post.id).unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_delete_comment() {
+            let db = setup();
+            let post = db.create_post(1, "Post", None).unwrap();
+            let comment = db.add_comment(post.id, 2, "comment").unwrap();
+            db.delete_comment(comment.id, 2).unwrap();
+            assert!(db.get_comments(post.id).unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_delete_user() {
+            let db = setup();
+            db.create_post(1, "Alice post", None).unwrap();
+            db.follow_user(1, 2).unwrap();
+            db.send_message(1, 2, "Hi").unwrap();
+            db.delete_user(1).unwrap();
+
+            assert!(db.get_user_by_id(1).unwrap().is_none());
+            assert!(db.get_posts_by_user(1).unwrap().is_empty());
+            assert!(db.get_following(1).unwrap().is_empty());
+        }
+
+        #[test]
+        fn test_messages() {
+            let db = setup();
+            let msg = db.send_message(1, 2, "Hey Bob!").unwrap();
+            assert_eq!(msg.content, "Hey Bob!");
+            assert!(!msg.read);
+
+            let msgs = db.get_messages(1, 2).unwrap();
+            assert_eq!(msgs.len(), 1);
+
+            let convos = db.get_conversations(1).unwrap();
+            assert_eq!(convos.len(), 1);
+            assert_eq!(convos[0].username, "bob");
+        }
+
+        #[test]
+        fn test_unread_messages() {
+            let db = setup();
+            db.send_message(1, 2, "Msg1").unwrap();
+            db.send_message(1, 2, "Msg2").unwrap();
+
+            let unread = db.get_unread_count(2).unwrap();
+            assert_eq!(unread, 2);
+
+            db.mark_messages_read(2, 1).unwrap();
+            let unread = db.get_unread_count(2).unwrap();
+            assert_eq!(unread, 0);
+        }
+
+        #[test]
+        fn test_notifications() {
+            let db = setup();
+            db.add_notification(1, 2, "follow").unwrap();
+            db.add_notification(1, 2, "like").unwrap();
+
+            let notifs = db.get_notifications(1).unwrap();
+            assert_eq!(notifs.len(), 2);
+
+            let unread = db.get_unread_notifications_count(1).unwrap();
+            assert_eq!(unread, 2);
+
+            db.mark_notifications_read(1).unwrap();
+            let unread = db.get_unread_notifications_count(1).unwrap();
+            assert_eq!(unread, 0);
+        }
+
+        #[test]
+        fn test_update_profile() {
+            let db = setup();
+            db.update_profile(1, "Alice B.", "My new bio").unwrap();
+            let user = db.get_user_by_id(1).unwrap().unwrap();
+            assert_eq!(user.display_name, "Alice B.");
+            assert_eq!(user.bio, "My new bio");
+        }
+
+        #[test]
+        fn test_create_post_with_image() {
+            let db = setup();
+            let post = db.create_post(1, "With image", Some("https://example.com/img.jpg")).unwrap();
+            assert!(post.image_path.is_some());
+            assert_eq!(post.image_path.unwrap(), "https://example.com/img.jpg");
+        }
+
+        #[test]
+        fn test_rate_limiting() {
+            let db = setup();
+            // Default rate limit: 5 per 60s for posts
+            for i in 0..5 {
+                db.create_post(1, &format!("Post {}", i), None).unwrap();
+            }
+            let result = db.create_post(1, "Too many", None);
+            assert!(result.is_err());
+        }
+
+        #[test]
+        fn test_cleanup_old_data() {
+            let db = setup();
+            let (msgs, notifs) = db.cleanup_old_data(90).unwrap();
+            assert_eq!(msgs, 0);
+            assert_eq!(notifs, 0);
+        }
+
+        #[test]
+        fn test_post_ownership() {
+            let db = setup();
+            let post = db.create_post(1, "Alice post", None).unwrap();
+            // Bob tries to delete Alice's post
+            let result = db.delete_post(post.id, 2);
+            assert!(result.is_err());
+            // Post should still exist
+            assert_eq!(db.get_timeline(1).unwrap().len(), 1);
+        }
+
+        #[test]
+        fn test_follow_self() {
+            let db = setup();
+            db.follow_user(1, 1).unwrap();
+            // Should be allowed by the mock (the real DB may handle this differently)
+            assert!(db.is_following(1, 1).unwrap());
+        }
+
+        #[test]
+        fn test_empty_timeline() {
+            let db = setup();
+            let timeline = db.get_timeline(1).unwrap();
+            assert!(timeline.is_empty());
+        }
+
+        #[test]
+        fn test_multiple_comments() {
+            let db = setup();
+            let post = db.create_post(1, "Post", None).unwrap();
+            db.add_comment(post.id, 2, "First").unwrap();
+            db.add_comment(post.id, 1, "Second").unwrap();
+            db.add_comment(post.id, 2, "Third").unwrap();
+
+            let comments = db.get_comments(post.id).unwrap();
+            assert_eq!(comments.len(), 3);
+            assert_eq!(comments[0].content, "First");
+            assert_eq!(comments[1].content, "Second");
+            assert_eq!(comments[2].content, "Third");
+        }
+    }
+}
