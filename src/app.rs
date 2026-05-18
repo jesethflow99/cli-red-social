@@ -22,6 +22,7 @@ pub fn run_tui(db_conn: &str) -> Result<()> {
     let stdout = std::io::stdout();
     let backend = ratatui::backend::CrosstermBackend::new(stdout);
     let mut terminal = ratatui::Terminal::new(backend)?;
+    terminal.hide_cursor()?;
     terminal.clear()?;
 
     let mut app = App::new(app_db);
@@ -36,7 +37,12 @@ impl TerminalGuard {
     fn enter() -> Result<Self> {
         crossterm::terminal::enable_raw_mode()?;
         let mut stdout = std::io::stdout();
-        crossterm::execute!(stdout, crossterm::terminal::EnterAlternateScreen)?;
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::terminal::EnterAlternateScreen,
+            crossterm::cursor::Hide,
+            crossterm::terminal::Clear(crossterm::terminal::ClearType::All),
+        );
         Ok(Self)
     }
 }
@@ -45,7 +51,11 @@ impl Drop for TerminalGuard {
     fn drop(&mut self) {
         let _ = crossterm::terminal::disable_raw_mode();
         let mut stdout = std::io::stdout();
-        let _ = crossterm::execute!(stdout, crossterm::terminal::LeaveAlternateScreen);
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::cursor::Show,
+            crossterm::terminal::LeaveAlternateScreen,
+        );
     }
 }
 
