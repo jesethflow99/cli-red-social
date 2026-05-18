@@ -759,7 +759,7 @@ impl App {
                     .style(Style::default().fg(self.theme.accent))
                     .block(Block::default().title(" Contraseña ").borders(Borders::ALL).border_type(BorderType::Rounded));
                 f.render_widget(input, chunks[1]);
-                f.set_cursor_position((area.x + 2 + self.input.len() as u16, chunks[1].y + 1));
+                Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, chunks[1].y + 1);
             } else {
                 let items: Vec<ListItem> = self
                 .viewed_user_posts
@@ -1326,7 +1326,7 @@ impl App {
             .block(Block::default().title(" Nombre ").borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(name_input, chunks[1]);
         if self.edit_profile_focus == 0 {
-            f.set_cursor_position((area.x + 2 + self.profile_display_name.len() as u16, chunks[1].y + 1));
+            Self::set_cursor_clamped(f, chunks[1].x + 2 + self.profile_display_name.len() as u16, chunks[1].y + 1);
         }
 
         let bio_style = if self.edit_profile_focus == 1 {
@@ -1339,7 +1339,7 @@ impl App {
             .block(Block::default().title(" Bio ").borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(bio_input, chunks[2]);
         if self.edit_profile_focus == 1 {
-            f.set_cursor_position((area.x + 2 + self.profile_bio.len() as u16, chunks[2].y + 1));
+            Self::set_cursor_clamped(f, chunks[2].x + 2 + self.profile_bio.len() as u16, chunks[2].y + 1);
         }
 
         let help = Paragraph::new(Line::from(vec![
@@ -1393,7 +1393,7 @@ impl App {
             .style(Style::default().fg(self.theme.text))
             .block(Block::default().title(" Mensaje (Enter: enviar) ").borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(input, chunks[2]);
-        f.set_cursor_position((area.x + 2 + self.input.len() as u16, chunks[2].y + 1));
+        Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, chunks[2].y + 1);
     }
 
     fn render(&self, f: &mut Frame) {
@@ -1425,6 +1425,13 @@ impl App {
                 _ => self.render_login(f, area),
             }
         }
+    }
+
+    fn set_cursor_clamped(f: &mut Frame, x: u16, y: u16) {
+        let area = f.size();
+        let x = x.min(area.x + area.width.saturating_sub(1));
+        let y = y.min(area.y + area.height.saturating_sub(1));
+        f.set_cursor_position((x, y));
     }
 
     fn render_status_bar(&self, f: &mut Frame, area: Rect) {
@@ -1479,7 +1486,7 @@ impl App {
             .style(Style::default().fg(self.theme.text))
             .block(Block::default().title(" Login (usuario:contraseña) ").borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(input, chunks[0]);
-        f.set_cursor_position((area.x + 2 + self.input.len() as u16, area.y + 3));
+        Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, area.y + 3);
 
         if let Some(ref msg) = self.status_message {
             let status = Paragraph::new(msg.as_str())
@@ -1507,7 +1514,7 @@ impl App {
             .style(Style::default().fg(self.theme.text))
             .block(Block::default().title(" Registro (usuario:contraseña:nombre) ").borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(input, chunks[0]);
-        f.set_cursor_position((area.x + 2 + self.input.len() as u16, area.y + 3));
+        Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, area.y + 3);
 
         if let Some(ref msg) = self.status_message {
             let status = Paragraph::new(msg.as_str())
@@ -1630,7 +1637,7 @@ impl App {
             .style(Style::default().fg(self.theme.text))
             .block(Block::default().title(title).borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(input, chunks[0]);
-        f.set_cursor_position((area.x + 2 + self.input.len() as u16, area.y + 4));
+        Self::set_cursor_clamped(f, chunks[0].x + 2 + self.input.len() as u16, chunks[0].y + 1);
 
         if !img_text.is_empty() {
             let img_para = Paragraph::new(img_text.as_str())
