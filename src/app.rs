@@ -9,6 +9,7 @@ use ratatui::{
     Frame, Terminal,
 };
 use std::io::{Read, Stdout, Write};
+use std::panic;
 
 use crate::db::DatabaseOps;
 use crate::models::{Comment, Message, Notification, Post, Screen, User};
@@ -67,6 +68,7 @@ pub struct App {
     pub timeline: Vec<Post>,
     pub input: String,
     pub status_message: Option<String>,
+    pub debug_message: Option<String>,
     pub list_state: ListState,
     pub search_results: Vec<User>,
     pub viewed_user: Option<User>,
@@ -109,6 +111,7 @@ impl App {
             timeline: vec![],
             input: String::new(),
             status_message: None,
+            debug_message: None,
             list_state: ListState::default(),
             search_results: vec![],
             viewed_user: None,
@@ -148,7 +151,29 @@ impl App {
                 terminal.clear()?;
                 self.needs_clear = false;
             }
-            terminal.draw(|f| self.render(f))?;
+
+            let draw_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
+                terminal.draw(|f| self.render(f))
+            }));
+            match draw_result {
+                Ok(Ok(_)) => {
+                    self.clear_debug();
+                }
+                Ok(Err(err)) => {
+                    let msg = format!("Error de render: {err}");
+                    tracing::error!("{msg}");
+                    self.set_status("Error interno de UI. Reintentando...".into());
+                    self.set_debug(msg);
+                    self.screen = Screen::Login;
+                }
+                Err(_) => {
+                    let msg = "Panic during TUI render".to_string();
+                    tracing::error!("{msg}");
+                    self.set_status("Error interno en la UI. Reintentando...".into());
+                    self.set_debug(msg);
+                    self.screen = Screen::Login;
+                }
+            }
 
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
@@ -168,6 +193,14 @@ impl App {
 
     fn set_status(&mut self, msg: String) {
         self.status_message = Some(msg);
+    }
+
+    fn set_debug(&mut self, msg: String) {
+        self.debug_message = Some(msg);
+    }
+
+    fn clear_debug(&mut self) {
+        self.debug_message = None;
     }
 
     fn handle_key(&mut self, key: event::KeyEvent) -> Result<bool> {
@@ -206,7 +239,10 @@ impl App {
                             self.current_user = Some(user);
                             self.screen = Screen::Timeline;
                             self.input.clear();
-                            self.refresh_timeline()?;
+                            if let Err(err) = self.refresh_timeline() {
+                                tracing::error!("refresh_timeline failed: {err}");
+                                self.set_status(format!("Error al cargar timeline: {err}"));
+                            }
                         }
                         None => self.set_status("Credenciales inválidas".into()),
                     }
@@ -247,7 +283,10 @@ impl App {
                                 self.current_user = Some(user);
                                 self.screen = Screen::Timeline;
                                 self.input.clear();
-                                self.refresh_timeline()?;
+                                if let Err(err) = self.refresh_timeline() {
+                                    tracing::error!("refresh_timeline failed: {err}");
+                                    self.set_status(format!("Error al cargar timeline: {err}"));
+                                }
                             }
                             Err(e) => {
                                 let msg = if e.to_string().contains("UNIQUE") || e.to_string().contains("unique") {
@@ -1478,7 +1517,7 @@ impl App {
     fn render_login(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
             .margin(2)
             .split(area);
 
@@ -1494,19 +1533,25 @@ impl App {
             f.render_widget(status, chunks[1]);
         }
 
+        if let Some(ref debug) = self.debug_message {
+            let debug_par = Paragraph::new(debug.as_str())
+                .style(Style::default().fg(self.theme.muted));
+            f.render_widget(debug_par, chunks[2]);
+        }
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled("Tab: ", Style::default().fg(self.theme.muted)),
             Span::styled("registrarse   ", Style::default().fg(self.theme.secondary)),
             Span::styled("Esc/Ctrl+q: ", Style::default().fg(self.theme.muted)),
             Span::styled("salir", Style::default().fg(self.theme.secondary)),
         ]));
-        f.render_widget(help, chunks[2]);
+        f.render_widget(help, chunks[3]);
     }
 
     fn render_register(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
             .margin(2)
             .split(area);
 
@@ -1522,13 +1567,19 @@ impl App {
             f.render_widget(status, chunks[1]);
         }
 
+        if let Some(ref debug) = self.debug_message {
+            let debug_par = Paragraph::new(debug.as_str())
+                .style(Style::default().fg(self.theme.muted));
+            f.render_widget(debug_par, chunks[2]);
+        }
+
         let help = Paragraph::new(Line::from(vec![
             Span::styled("Tab: ", Style::default().fg(self.theme.muted)),
             Span::styled("volver al login   ", Style::default().fg(self.theme.secondary)),
             Span::styled("Esc/Ctrl+q: ", Style::default().fg(self.theme.muted)),
             Span::styled("salir", Style::default().fg(self.theme.secondary)),
         ]));
-        f.render_widget(help, chunks[2]);
+        f.render_widget(help, chunks[3]);
     }
 
     fn render_timeline(&self, f: &mut Frame, area: Rect) {
