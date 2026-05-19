@@ -161,9 +161,9 @@ impl russh_sftp::server::Handler for SftpSession {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
-
         let _ = std::fs::create_dir_all(UPLOAD_DIR);
+
+        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
 
         let write = pflags.contains(OpenFlags::WRITE);
         let read = pflags.contains(OpenFlags::READ);
