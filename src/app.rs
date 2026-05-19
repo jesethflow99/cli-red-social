@@ -111,7 +111,7 @@ pub struct App {
     pub profile_bio: String,
     pub edit_profile_focus: usize,
     pub post_search_results: Vec<Post>,
-    pub post_search_filter: &'static str,
+    pub post_search_filter_idx: usize,
     pub page: usize,
     pub page_size: usize,
     pub frame_count: u64,
@@ -228,7 +228,7 @@ impl App {
             profile_bio: String::new(),
             edit_profile_focus: 0,
             post_search_results: vec![],
-            post_search_filter: "all",
+            post_search_filter_idx: 0,
             page: 0,
             page_size: 20,
             frame_count: 0,
@@ -337,7 +337,6 @@ impl App {
             Screen::EditProfile => self.handle_edit_profile_key(key),
             Screen::Notifications => self.handle_notifications_key(key),
             Screen::PostSearch => self.handle_post_search_key(key),
-            Screen::PostSearchFilter => self.handle_post_search_filter_key(key),
             Screen::HashtagView => self.handle_hashtag_key(key),
             Screen::HashtagTrending => self.handle_hashtag_trending_key(key),
         }
@@ -1444,12 +1443,8 @@ impl App {
     }
 
     fn render_post_search(&self, f: &mut Frame, area: Rect) {
-        let filter_label = match self.post_search_filter {
-            "24h" => t!(self, post_search_filter_24h),
-            "7d" => t!(self, post_search_filter_7d),
-            "30d" => t!(self, post_search_filter_30d),
-            _ => t!(self, post_search_filter_all),
-        };
+        const FILTERS: [&str; 5] = ["@usuario", "tema", "24h", "7d", "30d"];
+        let filter_label = FILTERS[self.post_search_filter_idx];
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
@@ -1471,7 +1466,8 @@ impl App {
             area.y + 2,
         ));
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, post_search_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let filter_text = format!("{} [{}]", t!(self, post_search_help), filter_label);
+        let help = Paragraph::new(Line::from(Span::styled(filter_text, Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[1]);
 
         let selected = self.list_state.selected().unwrap_or(0);
@@ -1502,33 +1498,6 @@ impl App {
             .highlight_style(self.theme.highlight())
             .highlight_symbol("  ");
         f.render_stateful_widget(list, chunks[2], &mut self.list_state.clone());
-    }
-
-    fn render_post_search_filter(&self, f: &mut Frame, area: Rect) {
-        let current = self.post_search_filter;
-        let items: Vec<ListItem> = [
-            ("all", t!(self, post_search_filter_all)),
-            ("24h", t!(self, post_search_filter_24h)),
-            ("7d", t!(self, post_search_filter_7d)),
-            ("30d", t!(self, post_search_filter_30d)),
-        ]
-        .iter()
-        .map(|(k, label)| {
-            let prefix = if *k == current { "✓ " } else { "  " };
-            ListItem::new(Line::from(Span::raw(format!("{}{}", prefix, label))))
-        })
-        .collect();
-
-        let list = List::new(items)
-            .block(Block::default().title(t!(self, post_search_filter_title)).borders(Borders::ALL).border_type(BorderType::Rounded))
-            .highlight_style(self.theme.highlight())
-            .highlight_symbol("> ");
-        let area = Layout::default()
-            .horizontal_margin(2)
-            .vertical_margin(5)
-            .constraints([Constraint::Length(6)])
-            .split(area)[0];
-        f.render_widget(list, area);
     }
 
     fn render_hashtag_view(&self, f: &mut Frame, area: Rect) {
@@ -1847,50 +1816,46 @@ impl App {
     }
 
     fn handle_post_search_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        const FILTERS: [&str; 5] = ["@usuario", "tema", "24h", "7d", "30d"];
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Timeline;
                 self.input.clear();
+                self.page = 0;
+                self.post_search_filter_idx = 0;
+                self.post_search_results.clear();
             }
-            KeyCode::Char(c) => {
-                if key.modifiers == KeyModifiers::CONTROL && c == 'f' {
-                    self.page += 1;
-                    let query = self.input.trim().to_string();
-                    if !query.is_empty() {
-                        let offset = self.page as u64 * self.page_size as u64;
-                        self.post_search_results = self.db.search_posts(&query, self.post_search_filter, offset, self.page_size as u64)?;
-                        self.list_state.select(Some(0));
-                    }
-                } else if key.modifiers == KeyModifiers::CONTROL && c == 'b' {
-                    self.page = self.page.saturating_sub(1);
-                    let query = self.input.trim().to_string();
-                    if !query.is_empty() {
-                        let offset = self.page as u64 * self.page_size as u64;
-                        self.post_search_results = self.db.search_posts(&query, self.post_search_filter, offset, self.page_size as u64)?;
-                        self.list_state.select(Some(0));
-                    }
-                } else {
-                    self.input.push(c);
-                }
-            }
-            KeyCode::Backspace => { self.input.pop(); }
             KeyCode::Tab => {
-                self.screen = Screen::PostSearchFilter;
+                self.post_search_filter_idx = (self.post_search_filter_idx + 1) % 5;
+                self.post_search_results.clear();
+                self.set_status(format!("Filtro: {}", FILTERS[self.post_search_filter_idx]));
             }
-            KeyCode::Up => {
+            KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.post_search_results.len();
                 if len > 0 {
                     let i = self.list_state.selected().unwrap_or(0);
                     self.list_state.select(Some(i.saturating_sub(1)));
                 }
             }
-            KeyCode::Down => {
+            KeyCode::Down | KeyCode::Char('j') => {
                 let len = self.post_search_results.len();
                 if len > 0 {
                     let i = self.list_state.selected().unwrap_or(0);
                     self.list_state.select(Some((i + 1).min(len - 1)));
                 }
             }
+            KeyCode::Char(c) => {
+                if key.modifiers == KeyModifiers::CONTROL && c == 'f' {
+                    self.page += 1;
+                    self.do_post_search()?;
+                } else if key.modifiers == KeyModifiers::CONTROL && c == 'b' {
+                    self.page = self.page.saturating_sub(1);
+                    self.do_post_search()?;
+                } else {
+                    self.input.push(c);
+                }
+            }
+            KeyCode::Backspace => { self.input.pop(); }
             KeyCode::Enter => {
                 if self.list_state.selected().is_some() && !self.post_search_results.is_empty() {
                     if let Some(i) = self.list_state.selected() {
@@ -1905,13 +1870,8 @@ impl App {
                         }
                     }
                 } else {
-                    let query = self.input.trim().to_string();
-                    if !query.is_empty() {
-                        self.page = 0;
-                        let offset = self.page as u64 * self.page_size as u64;
-                        self.post_search_results = self.db.search_posts(&query, self.post_search_filter, offset, self.page_size as u64)?;
-                        self.list_state.select(Some(0));
-                    }
+                    self.page = 0;
+                    self.do_post_search()?;
                 }
             }
             _ => {}
@@ -1919,18 +1879,22 @@ impl App {
         Ok(true)
     }
 
-    fn handle_post_search_filter_key(&mut self, key: event::KeyEvent) -> Result<bool> {
-        match key.code {
-            KeyCode::Esc | KeyCode::Tab => {
-                self.screen = Screen::PostSearch;
+    fn do_post_search(&mut self) -> Result<()> {
+        let query = self.input.trim().to_string();
+        if query.is_empty() { return Ok(()); }
+        let offset = self.page as u64 * self.page_size as u64;
+        let limit = self.page_size as u64;
+        let time_filters = ["all", "24h", "7d", "30d"];
+        self.post_search_results = match self.post_search_filter_idx {
+            0 => self.db.search_posts_by_user(&query, offset, limit)?,
+            1 => self.db.search_posts(&query, "all", offset, limit)?,
+            _ => {
+                let tf = time_filters[self.post_search_filter_idx - 1];
+                self.db.search_posts(&query, tf, offset, limit)?
             }
-            KeyCode::Char('1') => self.post_search_filter = "all",
-            KeyCode::Char('2') => self.post_search_filter = "24h",
-            KeyCode::Char('3') => self.post_search_filter = "7d",
-            KeyCode::Char('4') => self.post_search_filter = "30d",
-            _ => {}
-        }
-        Ok(true)
+        };
+        self.list_state.select(Some(0));
+        Ok(())
     }
 
     fn handle_hashtag_key(&mut self, key: event::KeyEvent) -> Result<bool> {
@@ -2454,7 +2418,6 @@ impl App {
                 Screen::EditProfile => self.render_edit_profile(f, content_area),
                 Screen::Notifications => self.render_notifications(f, content_area),
                 Screen::PostSearch => self.render_post_search(f, content_area),
-                Screen::PostSearchFilter => self.render_post_search_filter(f, content_area),
                 Screen::HashtagView => self.render_hashtag_view(f, content_area),
                 Screen::HashtagTrending => self.render_hashtag_trending(f, content_area),
             }
@@ -2499,7 +2462,7 @@ impl App {
             Screen::Chat(_) => t!(self, status_bar_chat),
             Screen::EditProfile => t!(self, status_bar_edit),
             Screen::Notifications => t!(self, status_bar_notifications),
-            Screen::PostSearch |             Screen::PostSearchFilter => t!(self, status_bar_post_search),
+            Screen::PostSearch => t!(self, status_bar_post_search),
             Screen::HashtagView | Screen::HashtagTrending => t!(self, hashtag_trending),
             Screen::Login | Screen::Register => "",
         };

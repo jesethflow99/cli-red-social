@@ -46,7 +46,6 @@ pub enum Screen {
     EditProfile,
     Notifications,
     PostSearch,
-    PostSearchFilter,
     HashtagView,
     HashtagTrending,
 }
