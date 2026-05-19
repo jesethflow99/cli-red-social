@@ -552,7 +552,8 @@ impl App {
                 KeyCode::Enter => {
                     if let Some(i) = self.list_state.selected() {
                         if let Some((name, _)) = self.uploaded_images.get(i) {
-                            let upload_path = format!("/data/uploads/{}", name);
+                            let username = &self.current_user.as_ref().unwrap().username;
+                            let upload_path = format!("/data/uploads/{}/{}", username, name);
                             self.attached_image = Some(upload_path);
                             self.set_status(format!("Imagen adjuntada: {}", name));
                         }
@@ -623,10 +624,11 @@ impl App {
                 self.saved_post_input = self.input.clone();
                 self.input.clear();
                 self.upload_mode = true;
-                self.uploaded_images = crate::ssh::list_uploaded_images();
+                let username = &self.current_user.as_ref().unwrap().username;
+                self.uploaded_images = crate::ssh::list_uploaded_images(username);
                 self.list_state.select(Some(0));
                 if self.uploaded_images.is_empty() {
-                    self.set_status("No hay imágenes. scp -P 2222 archivo.jpg localhost:archivo.jpg (solo el nombre, sin ruta)".to_string());
+                    self.set_status(format!("Sin imágenes. scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username));
                 }
             }
             KeyCode::Char(c) => self.input.push(c),
@@ -2514,7 +2516,9 @@ impl App {
             f.render_widget(header, chunks[0]);
 
             if self.uploaded_images.is_empty() {
-                let empty = Paragraph::new("No hay imágenes. Subí una con:\n  scp -P 2222 imagen.jpg localhost:/data/uploads/")
+                let hint = format!("Sin imágenes. scp -P 2222 archivo.jpg localhost:{}/archivo.jpg",
+                    self.current_user.as_ref().map(|u| u.username.as_str()).unwrap_or("usuario"));
+                let empty = Paragraph::new(hint)
                     .style(Style::default().fg(self.theme.muted));
                 f.render_widget(empty, chunks[1]);
             } else {

@@ -114,10 +114,11 @@ fn process_image(path: &std::path::Path) {
     }
 }
 
-pub fn list_uploaded_images() -> Vec<(String, String)> {
-    let _ = std::fs::create_dir_all(UPLOAD_DIR);
+pub fn list_uploaded_images(username: &str) -> Vec<(String, String)> {
+    let user_dir = format!("{}/{}", UPLOAD_DIR, username);
+    let _ = std::fs::create_dir_all(&user_dir);
     let mut images = Vec::new();
-    if let Ok(entries) = std::fs::read_dir(UPLOAD_DIR) {
+    if let Ok(entries) = std::fs::read_dir(&user_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
