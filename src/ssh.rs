@@ -62,12 +62,17 @@ fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(UPLOAD_DIR));
     }
     let full = std::path::PathBuf::from(UPLOAD_DIR).join(path);
-    let canonical = full.canonicalize().ok()?;
-    if canonical.starts_with(UPLOAD_DIR) {
-        Some(canonical)
-    } else {
-        None
+    if full.exists() {
+        let canonical = full.canonicalize().ok()?;
+        return if canonical.starts_with(UPLOAD_DIR) { Some(canonical) } else { None };
     }
+    if let Some(parent) = full.parent() {
+        if parent.exists() {
+            let parent_canon = parent.canonicalize().ok()?;
+            return if parent_canon.starts_with(UPLOAD_DIR) { Some(full) } else { None };
+        }
+    }
+    None
 }
 
 fn process_image(path: &std::path::Path) {

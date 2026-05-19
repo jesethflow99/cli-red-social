@@ -629,7 +629,7 @@ impl App {
                 self.uploaded_images = crate::ssh::list_uploaded_images();
                 self.list_state.select(Some(0));
                 if self.uploaded_images.is_empty() {
-                    self.set_status("No hay imágenes subidas. Usá SCP: scp -P 2222 imagen.jpg localhost:/data/uploads/".to_string());
+                    self.set_status("No hay imágenes. scp -P 2222 archivo.jpg localhost:archivo.jpg (solo el nombre, sin ruta)".to_string());
                 }
             }
             KeyCode::Char(c) => self.input.push(c),
@@ -947,12 +947,16 @@ impl App {
 
         let viewers: [(&str, &[&str]); 4] = [
             ("kitten", &["icat", "--place", &place, path]),
-            ("fim", &["-a", "-q", "-W", &img_w_s, "-H", &img_h_s, path]),
             ("chafa", &["--symbols", "block", "--size", &chafa_size, path]),
+            ("fim", &["-a", "-q", "-W", &img_w_s, "-H", &img_h_s, path]),
             ("viu", &["-w", &img_w_s, "-h", &img_h_s, path]),
         ];
         for (cmd, args) in &viewers {
-            if let Ok(status) = std::process::Command::new(cmd).args(*args).status() {
+            if let Ok(status) = std::process::Command::new(cmd)
+                .args(*args)
+                .stderr(std::process::Stdio::null())
+                .stdout(std::process::Stdio::inherit())
+                .status() {
                 if status.success() {
                     return true;
                 }
@@ -1073,17 +1077,30 @@ impl App {
             }
         };
         let ext = path.rsplit('.').next().unwrap_or("jpg");
-        let b64 = Self::base64_encode(&data);
         let filename = format!("imagen.{}", ext);
+        let fname = path.rsplit('/').next().unwrap_or("imagen.jpg");
 
-        println!("  {}", t!(app, image_download_cmd));
-        println!("  \x1b[32mecho '{}' | base64 -d > {}\x1b[0m", b64, filename);
-        println!();
-        println!("  {}", t!(app, image_download_scp));
-        println!("  \x1b[32mscp -P 2222 localhost:/tmp/{} .\x1b[0m", path.rsplit('/').next().unwrap_or(""));
-        println!();
         println!("  {}", t!(app, image_download_info));
         println!("  {} — {}", filename, Self::format_size(data.len() as u64));
+
+        // Copy to uploads dir so user can SCP download it
+        let copied;
+        let scp_path = if path.starts_with("/data/uploads/") {
+            fname
+        } else {
+            copied = format!("/data/uploads/{}", fname);
+            let _ = std::fs::create_dir_all("/data/uploads");
+            if std::fs::write(&copied, &data).is_ok() {
+                fname
+            } else {
+                fname
+            }
+        };
+
+        println!("  {}", t!(app, image_download_scp));
+        println!("  \x1b[32mscp -P 2222 localhost:{} .\x1b[0m", scp_path);
+        println!();
+        println!("{}", t!(app, image_press_q));
     }
 
     fn wait_for_exit_key() {
@@ -2082,7 +2099,7 @@ impl App {
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = Screen::Timeline;
             }
-            KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             _ => {}
         }
         Ok(true)
