@@ -803,14 +803,33 @@ impl App {
     fn view_image_with_chafa(path: &str, app: &mut App) {
         app.needs_clear = true;
 
-        // Download if URL (without clearing screen yet)
+        // Download if URL (async-style via thread, don't block TUI)
         let temp_path;
         let actual_path = if Self::is_url(path) {
             app.set_status("Descargando imagen...".to_string());
-            match Self::sync_download(path) {
+            let url = path.to_string();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let _ = tx.send(Self::sync_download(&url));
+            });
+            // Poll with timeout via event system
+            let start = std::time::Instant::now();
+            let result = loop {
+                if start.elapsed() > std::time::Duration::from_secs(15) {
+                    break None;
+                }
+                if let Ok(result) = rx.try_recv() {
+                    break result;
+                }
+                if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
+                    // Drain events so TUI stays responsive
+                    let _ = event::read();
+                }
+            };
+            match result {
                 Some(p) => { temp_path = p; &temp_path }
                 None => {
-                    app.set_status(t!(app, image_download_error).to_string());
+                    app.set_status("Descarga cancelada (timeout)".to_string());
                     return;
                 }
             }
@@ -833,7 +852,6 @@ impl App {
         println!("\n{}", t!(app, image_download_prompt));
         let _ = std::io::stdout().flush();
 
-        // Event loop with auto-timeout after 30s
         let start = std::time::Instant::now();
         loop {
             if start.elapsed() > std::time::Duration::from_secs(30) {
@@ -856,7 +874,7 @@ impl App {
                     }
                 }
                 Ok(false) => {}
-                Err(_) => break, // PTY closed
+                Err(_) => break,
             }
         }
 
@@ -885,6 +903,7 @@ impl App {
         }
 
         let client = match reqwest::blocking::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(15))
             .build() {
             Ok(c) => c,
