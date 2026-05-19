@@ -802,19 +802,15 @@ impl App {
 
     fn view_image_with_chafa(path: &str, app: &mut App) {
         app.needs_clear = true;
-        app.set_status("Cargando imagen...".to_string());
-        print!("\x1b[2J\x1b[H");
-        let _ = std::io::stdout().flush();
 
+        // Download if URL (without clearing screen yet)
         let temp_path;
         let actual_path = if Self::is_url(path) {
+            app.set_status("Descargando imagen...".to_string());
             match Self::sync_download(path) {
                 Some(p) => { temp_path = p; &temp_path }
                 None => {
-                    println!("\n{}\n", t!(app, image_download_error));
-                    println!("{}", t!(app, image_press_q));
-                    let _ = std::io::stdout().flush();
-                    Self::wait_for_exit_key();
+                    app.set_status(t!(app, image_download_error).to_string());
                     return;
                 }
             }
@@ -822,6 +818,7 @@ impl App {
             path
         };
 
+        // Now clear and show
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
 
@@ -836,21 +833,30 @@ impl App {
         println!("\n{}", t!(app, image_download_prompt));
         let _ = std::io::stdout().flush();
 
+        // Event loop with auto-timeout after 30s
+        let start = std::time::Instant::now();
         loop {
-            if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        match key.code {
-                            KeyCode::Char('d') => {
-                                Self::print_download_instructions(actual_path, app);
-                                println!("\n{}", t!(app, image_press_q));
-                                let _ = std::io::stdout().flush();
+            if start.elapsed() > std::time::Duration::from_secs(30) {
+                break;
+            }
+            match event::poll(std::time::Duration::from_millis(200)) {
+                Ok(true) => {
+                    if let Ok(Event::Key(key)) = event::read() {
+                        if key.kind == KeyEventKind::Press {
+                            match key.code {
+                                KeyCode::Char('d') => {
+                                    Self::print_download_instructions(actual_path, app);
+                                    println!("\n{}", t!(app, image_press_q));
+                                    let _ = std::io::stdout().flush();
+                                }
+                                KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
+                                _ => {}
                             }
-                            KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
-                            _ => {}
                         }
                     }
                 }
+                Ok(false) => {}
+                Err(_) => break, // PTY closed
             }
         }
 
