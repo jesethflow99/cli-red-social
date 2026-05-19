@@ -1908,7 +1908,6 @@ impl App {
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = Screen::Timeline;
             }
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             _ => {}
         }
         Ok(true)
@@ -1920,7 +1919,6 @@ impl App {
         self.chat_messages = self.db.get_messages(user_id, partner_id)?;
         self.unread_count = self.db.get_unread_count(user_id)?;
         match key.code {
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => { self.input.pop(); }
             KeyCode::Enter => {
@@ -2047,7 +2045,6 @@ impl App {
                 self.unread_notifications = 0;
                 self.screen = Screen::Timeline;
             }
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             _ => {}
         }
         Ok(true)
