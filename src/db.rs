@@ -1318,7 +1318,7 @@ use chrono::{DateTime, Utc};
             Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
-        fn add_comment(&self, post_id: i64, user_id: i64, content: &str, _parent_id: Option<i64>) -> Result<Comment> {
+        fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
             self.check_rate_limit(user_id, "comment", 10, 60)?;
             let mut data = self.data.lock().unwrap();
             let username = data.users.iter()
@@ -1334,6 +1334,7 @@ use chrono::{DateTime, Utc};
                 username,
                 content: content.to_string(),
                 created_at: Utc::now(),
+                parent_comment_id: parent_id,
             };
             data.comments.push(comment.clone());
             Ok(comment)
@@ -1479,7 +1480,7 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, _related_id: Option<i64>) -> Result<()> {
+        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
             let mut data = self.data.lock().unwrap();
             let from_username = data.users.iter()
                 .find(|(u, _)| u.id == from_user_id)
@@ -1495,6 +1496,7 @@ use chrono::{DateTime, Utc};
                 notif_type: notif_type.to_string(),
                 created_at: Utc::now(),
                 read: false,
+                related_id,
             });
             Ok(())
         }
