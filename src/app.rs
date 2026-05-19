@@ -10,8 +10,6 @@ use ratatui::{
 };
 use std::io::{Stdout, Write};
 use std::panic;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
 
 use crate::db::{AuthResult, DatabaseOps};
 use crate::i18n::{self, Lang};
@@ -709,214 +707,11 @@ impl App {
         s.starts_with("http://") || s.starts_with("https://")
     }
 
-    fn download_to_temp(url: &str) -> Option<String> {
-        use std::io::Write;
-        use std::collections::hash_map::DefaultHasher;
-        use std::hash::{Hash, Hasher};
 
-        const MAX_SIZE: u64 = 10 * 1024 * 1024;
-        let cache_dir = "/tmp/agora_cache";
-        let _ = std::fs::create_dir_all(cache_dir);
 
-        let mut hasher = DefaultHasher::new();
-        url.hash(&mut hasher);
-        let url_hash = format!("{:x}", hasher.finish());
 
-        let ext = url.rsplit_once('.').map(|(_, e)| {
-            e.split('?').next().unwrap_or("jpg").split('#').next().unwrap_or("jpg")
-        }).unwrap_or("jpg").to_string();
 
-        let cached_path = format!("{}/{}.{}", cache_dir, url_hash, ext);
-        if std::path::Path::new(&cached_path).exists() {
-            print!("\r\x1b[K  \x1b[32m✓ Imagen en cache\x1b[0m\n");
-            let _ = std::io::stdout().flush();
-            return Some(cached_path);
-        }
 
-        let is_onion = url.to_lowercase().contains(".onion");
-        let url_owned = url.to_string();
-
-        let downloaded = Arc::new(AtomicU64::new(0));
-        let total = Arc::new(AtomicU64::new(0));
-        let done = Arc::new(AtomicBool::new(false));
-        let cancelled = Arc::new(AtomicBool::new(false));
-        let error = Arc::new(Mutex::new(None));
-
-        let tmp_path = format!("{}/.dl_{}", cache_dir, url_hash);
-        let tmp_path_clone = tmp_path.clone();
-
-        let dl_downloaded = downloaded.clone();
-        let dl_total = total.clone();
-        let dl_done = done.clone();
-        let dl_cancelled = cancelled.clone();
-        let dl_error = error.clone();
-        let dl_url = url_owned;
-
-        std::thread::spawn(move || {
-            let result = if is_onion {
-                Self::download_with_curl(&dl_url, &dl_downloaded, &dl_total)
-            } else {
-                Self::download_with_reqwest(&dl_url, &dl_downloaded, &dl_total)
-            };
-            match result {
-                Ok(data) => {
-                    if dl_cancelled.load(Ordering::SeqCst) {
-                        return;
-                    }
-                    if data.len() as u64 > MAX_SIZE {
-                        *dl_error.lock().unwrap() = Some("Imagen demasiado grande (máximo 10MB)".to_string());
-                    } else if std::fs::write(&tmp_path_clone, &data).is_err() {
-                        *dl_error.lock().unwrap() = Some("Error al guardar archivo".to_string());
-                    }
-                }
-                Err(e) => {
-                    *dl_error.lock().unwrap() = Some(e);
-                }
-            }
-            dl_done.store(true, Ordering::SeqCst);
-        });
-
-        let bar_width = 30usize;
-        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
-        let mut frame = 0usize;
-
-        loop {
-            let cur = downloaded.load(Ordering::SeqCst);
-            let tot = total.load(Ordering::SeqCst);
-            let finished = done.load(Ordering::SeqCst);
-            let err = error.lock().unwrap().clone();
-
-            if let Some(msg) = err {
-                print!("\r\x1b[K  \x1b[31m✗ {}\x1b[0m\n", msg);
-                let _ = std::io::stdout().flush();
-                return None;
-            }
-
-            if finished {
-                let final_size = downloaded.load(Ordering::SeqCst);
-                print!("\r\x1b[K  \x1b[32m✓ Descarga completa ({})\x1b[0m\n", Self::format_size(final_size));
-                let _ = std::io::stdout().flush();
-                break;
-            }
-
-            if tot > 0 && tot > MAX_SIZE {
-                print!("\r\x1b[K  \x1b[31m✗ Imagen demasiado grande ({}) — máximo 10MB\x1b[0m\n", Self::format_size(tot));
-                let _ = std::io::stdout().flush();
-                return None;
-            }
-
-            if tot > 0 {
-                let pct = (cur as f64 / tot as f64 * 100.0).min(100.0) as u64;
-                let filled = (pct as f64 / 100.0 * bar_width as f64).round() as usize;
-                let empty = bar_width - filled;
-                let dl = Self::format_size(cur);
-                let t = Self::format_size(tot);
-                print!("\r\x1b[K  \x1b[36m⬇ Descargando... (q: cancelar)\x1b[0m\n  \x1b[36m");
-                for _ in 0..filled { print!("█"); }
-                for _ in 0..empty { print!("░"); }
-                print!("\x1b[0m  {:>3}%  [{:>8} / {}]", pct, dl, t);
-                print!("\x1b[3A\r");
-            } else {
-                let s = spinner[frame % spinner.len()];
-                let dl = Self::format_size(cur);
-                print!("\r\x1b[K  \x1b[36m⬇ Descargando {} [{:>8}] (q: cancelar)\x1b[0m", s, dl);
-            }
-            let _ = std::io::stdout().flush();
-
-            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
-                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
-                            cancelled.store(true, Ordering::SeqCst);
-                            print!("\r\x1b[K  \x1b[33m✗ Descarga cancelada\x1b[0m\n");
-                            let _ = std::io::stdout().flush();
-                            std::thread::sleep(std::time::Duration::from_millis(200));
-                            return None;
-                        }
-                    }
-                }
-            } else {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-            }
-
-            frame = frame.wrapping_add(1);
-        }
-
-        let path = format!("/tmp/opencode_img_{}.{}", url_hash, ext);
-        std::fs::rename(&tmp_path, &path).ok()?;
-        Some(path)
-    }
-
-    fn download_with_reqwest(url: &str, downloaded: &AtomicU64, total: &AtomicU64) -> Result<Vec<u8>, String> {
-        use std::io::Read;
-        const MAX_SIZE: u64 = 10 * 1024 * 1024;
-
-        let client = reqwest::blocking::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .map_err(|e| e.to_string())?;
-        let mut response = client.get(url).send()
-            .map_err(|e| e.to_string())?;
-
-        if let Some(len) = response.content_length() {
-            total.store(len, Ordering::SeqCst);
-            if len > MAX_SIZE {
-                return Err(format!("Imagen demasiado grande ({})", Self::format_size(len)));
-            }
-        }
-
-        let mut buf = Vec::with_capacity(total.load(Ordering::SeqCst).min(MAX_SIZE) as usize);
-        loop {
-            let mut chunk = vec![0u8; 16384];
-            let n = response.read(&mut chunk).map_err(|e| e.to_string())?;
-            if n == 0 { break; }
-            if buf.len() + n > MAX_SIZE as usize {
-                return Err("Imagen excede el límite de 10MB".to_string());
-            }
-            buf.extend_from_slice(&chunk[..n]);
-            downloaded.fetch_add(n as u64, Ordering::SeqCst);
-        }
-        Ok(buf)
-    }
-
-    fn download_with_curl(url: &str, downloaded: &AtomicU64, total: &AtomicU64) -> Result<Vec<u8>, String> {
-        const MAX_SIZE: u64 = 10 * 1024 * 1024;
-        let tor_proxy = std::env::var("TOR_PROXY").unwrap_or_else(|_| "127.0.0.1:9050".to_string());
-        let proxy_url = format!("socks5h://{}", tor_proxy);
-
-        let mut data = Vec::new();
-        let mut handle = curl::easy::Easy::new();
-        handle.url(url).map_err(|e| e.to_string())?;
-        handle.proxy(&proxy_url).map_err(|e| e.to_string())?;
-        handle.timeout(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
-        handle.follow_location(true).map_err(|e| e.to_string())?;
-
-        {
-            let mut transfer = handle.transfer();
-            transfer.write_function(|chunk| {
-                downloaded.fetch_add(chunk.len() as u64, Ordering::SeqCst);
-                data.extend_from_slice(chunk);
-                if data.len() as u64 > MAX_SIZE {
-                    return Ok(0);
-                }
-                Ok(chunk.len())
-            }).map_err(|e| e.to_string())?;
-            transfer.progress_function(|dl_total, _dl_now, _, _| {
-                if dl_total > 0.0 {
-                    total.store(dl_total as u64, Ordering::SeqCst);
-                }
-                true
-            }).map_err(|e| e.to_string())?;
-
-            transfer.perform().map_err(|e| e.to_string())?;
-        }
-
-        if data.len() as u64 > MAX_SIZE {
-            return Err("Imagen excede el límite de 10MB".to_string());
-        }
-
-        Ok(data)
-    }
 
     fn format_size(bytes: u64) -> String {
         if bytes < 1024 {
@@ -928,10 +723,6 @@ impl App {
         }
     }
 
-    fn base64_encode(data: &[u8]) -> String {
-        use base64::{Engine as _, engine::general_purpose::STANDARD};
-        STANDARD.encode(data)
-    }
 
     fn view_image(path: &str) -> bool {
         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 40));
@@ -1011,15 +802,17 @@ impl App {
 
     fn view_image_with_chafa(path: &str, app: &mut App) {
         app.needs_clear = true;
+        app.set_status("Cargando imagen...".to_string());
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
 
         let temp_path;
         let actual_path = if Self::is_url(path) {
-            match Self::download_to_temp(path) {
+            match Self::sync_download(path) {
                 Some(p) => { temp_path = p; &temp_path }
                 None => {
-                    println!("\n{}", t!(app, image_press_q));
+                    println!("\n{}\n", t!(app, image_download_error));
+                    println!("{}", t!(app, image_press_q));
                     let _ = std::io::stdout().flush();
                     Self::wait_for_exit_key();
                     return;
@@ -1036,14 +829,15 @@ impl App {
 
         if !shown {
             println!("{}", t!(app, image_no_viewer));
-            println!("URL: {}", path);
+            if Self::is_url(path) { println!("URL: {}", path); }
+            else { println!("Archivo: {}", actual_path); }
         }
 
         println!("\n{}", t!(app, image_download_prompt));
         let _ = std::io::stdout().flush();
 
         loop {
-            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
                 if let Ok(Event::Key(key)) = event::read() {
                     if key.kind == KeyEventKind::Press {
                         match key.code {
@@ -1063,6 +857,62 @@ impl App {
         if Self::is_url(path) {
             let _ = std::fs::remove_file(actual_path);
         }
+    }
+
+    fn sync_download(url: &str) -> Option<String> {
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        let cache_dir = "/tmp/agora_cache";
+        let _ = std::fs::create_dir_all(cache_dir);
+
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        url.hash(&mut h);
+        let url_hash = format!("{:x}", h.finish());
+
+        let ext = url.rsplit_once('.').map(|(_, e)| {
+            e.split('?').next().unwrap_or("jpg").split('#').next().unwrap_or("jpg")
+        }).unwrap_or("jpg").to_string();
+
+        let cached_path = format!("{}/{}.{}", cache_dir, url_hash, ext);
+        if std::path::Path::new(&cached_path).exists() {
+            return Some(cached_path);
+        }
+
+        let client = match reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build() {
+            Ok(c) => c,
+            Err(_) => return None,
+        };
+
+        let mut response = match client.get(url).send() {
+            Ok(r) => r,
+            Err(_) => return None,
+        };
+
+        if let Some(len) = response.content_length() {
+            if len > MAX_SIZE { return None; }
+        }
+
+        let mut buf = Vec::new();
+        use std::io::Read;
+        loop {
+            let mut chunk = vec![0u8; 8192];
+            match response.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    buf.extend_from_slice(&chunk[..n]);
+                    if buf.len() > MAX_SIZE as usize { return None; }
+                }
+                Err(_) => return None,
+            }
+        }
+
+        if buf.is_empty() { return None; }
+
+        let path = format!("/tmp/opencode_img_{}.{}", url_hash, ext);
+        std::fs::write(&path, &buf).ok()?;
+        Some(path)
     }
 
     fn print_download_instructions(path: &str, app: &mut App) {
