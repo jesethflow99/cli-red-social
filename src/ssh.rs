@@ -62,16 +62,21 @@ fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
         return Some(std::path::PathBuf::from(UPLOAD_DIR));
     }
     let full = std::path::PathBuf::from(UPLOAD_DIR).join(path);
+    tracing::debug!("sanitize_path: path={}, full={}", path, full.display());
     if full.exists() {
         let canonical = full.canonicalize().ok()?;
         return if canonical.starts_with(UPLOAD_DIR) { Some(canonical) } else { None };
     }
     if let Some(parent) = full.parent() {
+        tracing::debug!("sanitize_path: parent={}, exists={}", parent.display(), parent.exists());
+        let _ = std::fs::create_dir_all(parent);
         if parent.exists() {
             let parent_canon = parent.canonicalize().ok()?;
+            tracing::debug!("sanitize_path: parent_canon={}", parent_canon.display());
             return if parent_canon.starts_with(UPLOAD_DIR) { Some(full) } else { None };
         }
     }
+    tracing::warn!("sanitize_path: returning None for {}", path);
     None
 }
 

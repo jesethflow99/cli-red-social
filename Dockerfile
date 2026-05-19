@@ -32,9 +32,7 @@ RUN mkdir /data && chown app:app /data
 
 COPY --from=builder /app/target/release/agora /usr/local/bin/agora
 
-USER app
 WORKDIR /data
-
 EXPOSE 2222
 
 CMD ["agora", "--port", "2222", "--db", "postgres://social:agora@db/social"]
