@@ -13,15 +13,17 @@ Red social en la terminal, accesible vía SSH.
 # Clonar
 git clone <repo> && cd cli-red-social
 
-# Opcional: configurar contraseñas
+# Opcional: configurar contraseñas y puerto
 export DB_PASSWORD=clave_segura
 export SSH_PASSWORD=otra_clave
+export SSH_PORT=2222  # Usá 22 en producción para ssh directo
 
 # Levantar
 docker compose up -d
 
 # Conectarse
 ssh localhost -p 2222 -t
+# O si usaste puerto 22: ssh localhost -t
 ```
 
 ## Ejecución local
@@ -30,6 +32,7 @@ ssh localhost -p 2222 -t
 # Asegurate de tener PostgreSQL corriendo
 cargo run -- --tui          # Modo local (sin SSH)
 cargo run                   # Servidor SSH en puerto 2222
+cargo run -- --port 22      # Servidor SSH en puerto 22
 ```
 
 ## Variables de entorno
@@ -37,9 +40,12 @@ cargo run                   # Servidor SSH en puerto 2222
 | Variable | Default | Descripción |
 |---|---|---|
 | `DATABASE_URL` | `postgres://social:social@localhost/social` | Conexión a PostgreSQL |
-| `SSH_PASSWORD` | (vacío) | Contraseña SSH. Vacío = acepta cualquier password |
-| `DB_PASSWORD` | `social` | Contraseña de PostgreSQL (solo Docker) |
+| `SSH_PASSWORD` | `agora` | Contraseña SSH |
+| `SSH_PORT` | `2222` | Puerto del servidor SSH |
+| `DB_PASSWORD` | `agora` | Contraseña de PostgreSQL (solo Docker) |
 | `RUST_LOG` | — | Nivel de logging (`info`, `debug`, etc.) |
+| `TOR_PROXY` | `127.0.0.1:9050` | Proxy SOCKS5 para URLs .onion |
+| `LANG` | `es` | Idioma (`es` o `en`) |
 
 ## Uso
 
@@ -67,21 +73,25 @@ cargo run                   # Servidor SSH en puerto 2222
 | `Tab` | Cambiar entre login y registro / cambiar filtro |
 | `Esc` o `q` | Volver / salir |
 
-## Seguridad para producción
+## Producción en VPS
 
 ```bash
-# Contraseña SSH obligatoria
+# Puerto 22 para ssh directo (sin -p)
+export SSH_PORT=22
 export SSH_PASSWORD=muylarga_y_segura
-
-# Contraseña de base de datos
 export DB_PASSWORD=otra_muy_segura
 
 # Firewall
 sudo ./firewall.sh
 
 # Iniciar
-SSH_PASSWORD=... DB_PASSWORD=... docker compose up -d
+SSH_PORT=22 SSH_PASSWORD=muylarga_y_segura DB_PASSWORD=otra_muy_segura docker compose up -d
+
+# Conectarse directo (el username de SSH no importa)
+ssh tu-servidor.com -t
 ```
+
+> **Nota:** Si tu VPS ya usa el puerto 22 para OpenSSH, usá otro puerto (2222, 8022, etc.) o pará el sshd existente primero.
 
 ## Licencia
 

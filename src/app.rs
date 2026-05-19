@@ -5,13 +5,15 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
     Frame, Terminal,
 };
-use std::io::{Read, Stdout, Write};
+use std::io::{Stdout, Write};
 use std::panic;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
-use crate::db::DatabaseOps;
+use crate::db::{AuthResult, DatabaseOps};
 use crate::i18n::{self, Lang};
 use crate::t;
 use crate::models::{Comment, Message, Notification, Post, Screen, User};
@@ -80,18 +82,24 @@ pub struct App {
     pub attached_image: Option<String>,
     pub viewed_post: Option<Post>,
     pub post_comments: Vec<Comment>,
+    pub flat_comment_ids: Vec<i64>,
     pub comment_input: String,
     pub needs_clear: bool,
     pub comment_mode: bool,
+    pub reply_to_comment_id: Option<i64>,
     pub edit_mode: bool,
     pub edit_buffer: String,
     pub comment_list_state: ListState,
+    pub notif_list_state: ListState,
     pub url_mode: bool,
+    pub upload_mode: bool,
+    pub uploaded_images: Vec<(String, String)>,
     pub profile_followers: Vec<User>,
     pub profile_following: Vec<User>,
     pub show_follow_list: bool,
     pub show_followers: bool,
     pub confirming_delete: bool,
+    pub confirming_delete_post: bool,
     pub saved_post_input: String,
     pub conversations: Vec<User>,
     pub chat_messages: Vec<Message>,
@@ -107,6 +115,62 @@ pub struct App {
     pub page: usize,
     pub page_size: usize,
     pub frame_count: u64,
+    pub hashtag_posts: Vec<Post>,
+    pub hashtag_current: String,
+    pub trending_hashtags: Vec<(String, i64)>,
+}
+
+#[derive(Clone)]
+struct CommentNode {
+    comment: Comment,
+    children: Vec<CommentNode>,
+    depth: usize,
+}
+
+fn build_comment_tree(comments: &[Comment]) -> Vec<CommentNode> {
+    let mut roots = Vec::new();
+    let mut comment_map: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+
+    for (i, c) in comments.iter().enumerate() {
+        match c.parent_comment_id {
+            Some(pid) => comment_map.entry(pid).or_default().push(i),
+            None => roots.push(CommentNode {
+                comment: c.clone(),
+                children: Vec::new(),
+                depth: 0,
+            }),
+        }
+    }
+
+    for node in &mut roots {
+        build_children(node, &comments, &comment_map, 0);
+    }
+
+    roots
+}
+
+fn build_children(node: &mut CommentNode, comments: &[Comment], map: &std::collections::HashMap<i64, Vec<usize>>, _depth: usize) {
+    if let Some(indices) = map.get(&node.comment.id) {
+        for &idx in indices {
+            let child = &comments[idx];
+            let mut child_node = CommentNode {
+                comment: child.clone(),
+                children: Vec::new(),
+                depth: node.depth + 1,
+            };
+            build_children(&mut child_node, comments, map, _depth);
+            node.children.push(child_node);
+        }
+    }
+}
+
+fn flatten_tree(nodes: &[CommentNode]) -> Vec<&CommentNode> {
+    let mut result = Vec::new();
+    for node in nodes {
+        result.push(node);
+        result.extend(flatten_tree(&node.children));
+    }
+    result
 }
 
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -135,18 +199,24 @@ impl App {
             attached_image: None,
             viewed_post: None,
             post_comments: vec![],
+            flat_comment_ids: vec![],
             comment_input: String::new(),
             needs_clear: false,
             comment_mode: false,
+            reply_to_comment_id: None,
             edit_mode: false,
             edit_buffer: String::new(),
             comment_list_state: ListState::default(),
+            notif_list_state: ListState::default(),
             url_mode: false,
+            upload_mode: false,
+            uploaded_images: vec![],
             profile_followers: vec![],
             profile_following: vec![],
             show_follow_list: false,
             show_followers: false,
             confirming_delete: false,
+            confirming_delete_post: false,
             saved_post_input: String::new(),
             conversations: vec![],
             chat_messages: vec![],
@@ -162,6 +232,9 @@ impl App {
             page: 0,
             page_size: 20,
             frame_count: 0,
+            hashtag_posts: vec![],
+            hashtag_current: String::new(),
+            trending_hashtags: vec![],
         }
     }
 
@@ -265,6 +338,8 @@ impl App {
             Screen::Notifications => self.handle_notifications_key(key),
             Screen::PostSearch => self.handle_post_search_key(key),
             Screen::PostSearchFilter => self.handle_post_search_filter_key(key),
+            Screen::HashtagView => self.handle_hashtag_key(key),
+            Screen::HashtagTrending => self.handle_hashtag_trending_key(key),
         }
     }
 
@@ -283,18 +358,25 @@ impl App {
                 if parts.len() == 2 {
                     let username = parts[0].trim();
                     let password = parts[1].trim();
-                    match self.db.authenticate(username, password)? {
-                        Some(user) => {
-                            self.current_user = Some(user);
-                            self.screen = Screen::Timeline;
-                            self.page = 0;
-                            self.input.clear();
-                            if let Err(err) = self.refresh_timeline() {
-                                tracing::error!("refresh_timeline failed: {err}");
-                                self.set_status(format!("Error al cargar timeline: {err}"));
+                    match self.db.authenticate(username, password) {
+                        Ok(result) => match result {
+                            AuthResult::Success(user) => {
+                                self.current_user = Some(user);
+                                self.screen = Screen::Timeline;
+                                self.page = 0;
+                                self.input.clear();
+                                if let Err(err) = self.refresh_timeline() {
+                                    tracing::error!("refresh_timeline failed: {err}");
+                                    self.set_status(format!("Error al cargar timeline: {err}"));
+                                }
                             }
+                            AuthResult::UserNotFound => self.set_status(t!(self, login_error_user_not_found).to_string()),
+                            AuthResult::WrongPassword => self.set_status(t!(self, login_error_wrong_password).to_string()),
+                        },
+                        Err(e) => {
+                            tracing::error!("Login authenticate failed: {e}");
+                            self.set_status(format!("DB error: {e}"));
                         }
-                        None => self.set_status(t!(self, login_error_invalid).to_string()),
                     }
                 } else {
                     self.set_status(t!(self, login_error_format).to_string());
@@ -342,7 +424,8 @@ impl App {
                                 }
                             }
                             Err(e) => {
-                                let msg = if e.to_string().contains("UNIQUE") || e.to_string().contains("unique") {
+                                let err_str = e.to_string().to_lowercase();
+                                let msg = if err_str.contains("unique") || err_str.contains("duplicate") || err_str.contains("ya existe") {
                                     t!(self, register_error_exists).replace("{}", username)
                                 } else {
                                     format!("{}: {}", t!(self, error), e)
@@ -394,6 +477,11 @@ impl App {
                 self.screen = Screen::Profile(id);
                 self.load_profile(id)?;
             }
+            KeyCode::Char('#') => {
+                self.trending_hashtags = self.db.get_trending_hashtags(20)?;
+                self.screen = Screen::HashtagTrending;
+                self.list_state.select(Some(0));
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.timeline.len();
                 if len > 0 {
@@ -422,12 +510,13 @@ impl App {
                 if let Some(i) = self.list_state.selected() {
                     if i < self.timeline.len() {
                         let post = &self.timeline[i];
+                        let pid = post.id;
                         self.viewed_post = Some(post.clone());
-                        self.post_comments = self.db.get_comments(post.id)?;
+                        self.refresh_comments(pid)?;
                         self.comment_input.clear();
                         self.comment_list_state = ListState::default();
                         self.edit_mode = false;
-                        self.screen = Screen::PostDetail(post.id);
+                        self.screen = Screen::PostDetail(pid);
                     }
                 }
             }
@@ -455,6 +544,46 @@ impl App {
     }
 
     fn handle_create_post_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        if self.upload_mode {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => {
+                    self.upload_mode = false;
+                    self.input.clear();
+                    self.input.push_str(&self.saved_post_input);
+                    self.saved_post_input.clear();
+                }
+                KeyCode::Enter => {
+                    if let Some(i) = self.list_state.selected() {
+                        if let Some((name, _)) = self.uploaded_images.get(i) {
+                            let upload_path = format!("/data/uploads/{}", name);
+                            self.attached_image = Some(upload_path);
+                            self.set_status(format!("Imagen adjuntada: {}", name));
+                        }
+                    }
+                    self.upload_mode = false;
+                    self.input.clear();
+                    self.input.push_str(&self.saved_post_input);
+                    self.saved_post_input.clear();
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let len = self.uploaded_images.len();
+                    if len > 0 {
+                        let i = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some(i.saturating_sub(1)));
+                    }
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let len = self.uploaded_images.len();
+                    if len > 0 {
+                        let i = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some((i + 1).min(len - 1)));
+                    }
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
         if self.url_mode {
             match key.code {
                 KeyCode::Char(c) => self.input.push(c),
@@ -492,6 +621,16 @@ impl App {
                 self.input.clear();
                 self.url_mode = true;
                 self.set_status(t!(self, create_post_attach_prompt).to_string());
+            }
+            KeyCode::Char('u') => {
+                self.saved_post_input = self.input.clone();
+                self.input.clear();
+                self.upload_mode = true;
+                self.uploaded_images = crate::ssh::list_uploaded_images();
+                self.list_state.select(Some(0));
+                if self.uploaded_images.is_empty() {
+                    self.set_status("No hay imágenes subidas. Usá SCP: scp -P 2222 imagen.jpg localhost:/data/uploads/".to_string());
+                }
             }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => { self.input.pop(); }
@@ -572,17 +711,227 @@ impl App {
     }
 
     fn download_to_temp(url: &str) -> Option<String> {
-        let url = url.to_string();
+        use std::io::Write;
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        let cache_dir = "/tmp/agora_cache";
+        let _ = std::fs::create_dir_all(cache_dir);
+
+        let mut hasher = DefaultHasher::new();
+        url.hash(&mut hasher);
+        let url_hash = format!("{:x}", hasher.finish());
+
         let ext = url.rsplit_once('.').map(|(_, e)| {
             e.split('?').next().unwrap_or("jpg").split('#').next().unwrap_or("jpg")
         }).unwrap_or("jpg").to_string();
-        let bytes = std::thread::spawn(move || {
-            reqwest::blocking::get(&url).ok()?.bytes().ok()
-        }).join().ok()??;
-        let ts = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).ok()?.as_nanos();
-        let path = format!("/tmp/opencode_img_{}.{}", ts, ext);
-        std::fs::write(&path, &bytes).ok()?;
+
+        let cached_path = format!("{}/{}.{}", cache_dir, url_hash, ext);
+        if std::path::Path::new(&cached_path).exists() {
+            print!("\r\x1b[K  \x1b[32m✓ Imagen en cache\x1b[0m\n");
+            let _ = std::io::stdout().flush();
+            return Some(cached_path);
+        }
+
+        let is_onion = url.to_lowercase().contains(".onion");
+        let url_owned = url.to_string();
+
+        let downloaded = Arc::new(AtomicU64::new(0));
+        let total = Arc::new(AtomicU64::new(0));
+        let done = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let error = Arc::new(Mutex::new(None));
+
+        let tmp_path = format!("{}/.dl_{}", cache_dir, url_hash);
+        let tmp_path_clone = tmp_path.clone();
+
+        let dl_downloaded = downloaded.clone();
+        let dl_total = total.clone();
+        let dl_done = done.clone();
+        let dl_cancelled = cancelled.clone();
+        let dl_error = error.clone();
+        let dl_url = url_owned;
+
+        std::thread::spawn(move || {
+            let result = if is_onion {
+                Self::download_with_curl(&dl_url, &dl_downloaded, &dl_total)
+            } else {
+                Self::download_with_reqwest(&dl_url, &dl_downloaded, &dl_total)
+            };
+            match result {
+                Ok(data) => {
+                    if dl_cancelled.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    if data.len() as u64 > MAX_SIZE {
+                        *dl_error.lock().unwrap() = Some("Imagen demasiado grande (máximo 10MB)".to_string());
+                    } else if std::fs::write(&tmp_path_clone, &data).is_err() {
+                        *dl_error.lock().unwrap() = Some("Error al guardar archivo".to_string());
+                    }
+                }
+                Err(e) => {
+                    *dl_error.lock().unwrap() = Some(e);
+                }
+            }
+            dl_done.store(true, Ordering::SeqCst);
+        });
+
+        let bar_width = 30usize;
+        let spinner = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+        let mut frame = 0usize;
+
+        loop {
+            let cur = downloaded.load(Ordering::SeqCst);
+            let tot = total.load(Ordering::SeqCst);
+            let finished = done.load(Ordering::SeqCst);
+            let err = error.lock().unwrap().clone();
+
+            if let Some(msg) = err {
+                print!("\r\x1b[K  \x1b[31m✗ {}\x1b[0m\n", msg);
+                let _ = std::io::stdout().flush();
+                return None;
+            }
+
+            if finished {
+                let final_size = downloaded.load(Ordering::SeqCst);
+                print!("\r\x1b[K  \x1b[32m✓ Descarga completa ({})\x1b[0m\n", Self::format_size(final_size));
+                let _ = std::io::stdout().flush();
+                break;
+            }
+
+            if tot > 0 && tot > MAX_SIZE {
+                print!("\r\x1b[K  \x1b[31m✗ Imagen demasiado grande ({}) — máximo 10MB\x1b[0m\n", Self::format_size(tot));
+                let _ = std::io::stdout().flush();
+                return None;
+            }
+
+            if tot > 0 {
+                let pct = (cur as f64 / tot as f64 * 100.0).min(100.0) as u64;
+                let filled = (pct as f64 / 100.0 * bar_width as f64).round() as usize;
+                let empty = bar_width - filled;
+                let dl = Self::format_size(cur);
+                let t = Self::format_size(tot);
+                print!("\r\x1b[K  \x1b[36m⬇ Descargando... (q: cancelar)\x1b[0m\n  \x1b[36m");
+                for _ in 0..filled { print!("█"); }
+                for _ in 0..empty { print!("░"); }
+                print!("\x1b[0m  {:>3}%  [{:>8} / {}]", pct, dl, t);
+                print!("\x1b[3A\r");
+            } else {
+                let s = spinner[frame % spinner.len()];
+                let dl = Self::format_size(cur);
+                print!("\r\x1b[K  \x1b[36m⬇ Descargando {} [{:>8}] (q: cancelar)\x1b[0m", s, dl);
+            }
+            let _ = std::io::stdout().flush();
+
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind == KeyEventKind::Press {
+                        if key.code == KeyCode::Char('q') || key.code == KeyCode::Esc {
+                            cancelled.store(true, Ordering::SeqCst);
+                            print!("\r\x1b[K  \x1b[33m✗ Descarga cancelada\x1b[0m\n");
+                            let _ = std::io::stdout().flush();
+                            std::thread::sleep(std::time::Duration::from_millis(200));
+                            return None;
+                        }
+                    }
+                }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+
+            frame = frame.wrapping_add(1);
+        }
+
+        let path = format!("/tmp/opencode_img_{}.{}", url_hash, ext);
+        std::fs::rename(&tmp_path, &path).ok()?;
         Some(path)
+    }
+
+    fn download_with_reqwest(url: &str, downloaded: &AtomicU64, total: &AtomicU64) -> Result<Vec<u8>, String> {
+        use std::io::Read;
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+
+        let client = reqwest::blocking::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| e.to_string())?;
+        let mut response = client.get(url).send()
+            .map_err(|e| e.to_string())?;
+
+        if let Some(len) = response.content_length() {
+            total.store(len, Ordering::SeqCst);
+            if len > MAX_SIZE {
+                return Err(format!("Imagen demasiado grande ({})", Self::format_size(len)));
+            }
+        }
+
+        let mut buf = Vec::with_capacity(total.load(Ordering::SeqCst).min(MAX_SIZE) as usize);
+        loop {
+            let mut chunk = vec![0u8; 16384];
+            let n = response.read(&mut chunk).map_err(|e| e.to_string())?;
+            if n == 0 { break; }
+            if buf.len() + n > MAX_SIZE as usize {
+                return Err("Imagen excede el límite de 10MB".to_string());
+            }
+            buf.extend_from_slice(&chunk[..n]);
+            downloaded.fetch_add(n as u64, Ordering::SeqCst);
+        }
+        Ok(buf)
+    }
+
+    fn download_with_curl(url: &str, downloaded: &AtomicU64, total: &AtomicU64) -> Result<Vec<u8>, String> {
+        const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        let tor_proxy = std::env::var("TOR_PROXY").unwrap_or_else(|_| "127.0.0.1:9050".to_string());
+        let proxy_url = format!("socks5h://{}", tor_proxy);
+
+        let mut data = Vec::new();
+        let mut handle = curl::easy::Easy::new();
+        handle.url(url).map_err(|e| e.to_string())?;
+        handle.proxy(&proxy_url).map_err(|e| e.to_string())?;
+        handle.timeout(std::time::Duration::from_secs(60)).map_err(|e| e.to_string())?;
+        handle.follow_location(true).map_err(|e| e.to_string())?;
+
+        {
+            let mut transfer = handle.transfer();
+            transfer.write_function(|chunk| {
+                downloaded.fetch_add(chunk.len() as u64, Ordering::SeqCst);
+                data.extend_from_slice(chunk);
+                if data.len() as u64 > MAX_SIZE {
+                    return Ok(0);
+                }
+                Ok(chunk.len())
+            }).map_err(|e| e.to_string())?;
+            transfer.progress_function(|dl_total, _dl_now, _, _| {
+                if dl_total > 0.0 {
+                    total.store(dl_total as u64, Ordering::SeqCst);
+                }
+                true
+            }).map_err(|e| e.to_string())?;
+
+            transfer.perform().map_err(|e| e.to_string())?;
+        }
+
+        if data.len() as u64 > MAX_SIZE {
+            return Err("Imagen excede el límite de 10MB".to_string());
+        }
+
+        Ok(data)
+    }
+
+    fn format_size(bytes: u64) -> String {
+        if bytes < 1024 {
+            format!("{} B", bytes)
+        } else if bytes < 1024 * 1024 {
+            format!("{:.1} KB", bytes as f64 / 1024.0)
+        } else {
+            format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
+        }
+    }
+
+    fn base64_encode(data: &[u8]) -> String {
+        use base64::{Engine as _, engine::general_purpose::STANDARD};
+        STANDARD.encode(data)
     }
 
     fn view_image(path: &str) -> bool {
@@ -598,9 +947,9 @@ impl App {
 
         let viewers: [(&str, &[&str]); 4] = [
             ("kitten", &["icat", "--place", &place, path]),
-            ("viu", &["-w", &img_w_s, "-h", &img_h_s, path]),
-            ("catimg", &["-w", &img_w_s, "-h", &img_h_s, path]),
+            ("fim", &["-a", "-q", "-W", &img_w_s, "-H", &img_h_s, path]),
             ("chafa", &["--symbols", "block", "--size", &chafa_size, path]),
+            ("viu", &["-w", &img_w_s, "-h", &img_h_s, path]),
         ];
         for (cmd, args) in &viewers {
             if let Ok(status) = std::process::Command::new(cmd).args(*args).status() {
@@ -612,17 +961,67 @@ impl App {
         false
     }
 
+    fn render_content_with_tags(content: &str, hashtag_color: ratatui::style::Color, mention_color: ratatui::style::Color) -> Vec<Span<'static>> {
+        let mut spans = Vec::new();
+        let mut current = String::new();
+        let mut in_tag: Option<char> = None;
+
+        for ch in content.chars() {
+            if (ch == '#' || ch == '@') && in_tag.is_none() {
+                if !current.is_empty() {
+                    spans.push(Span::raw(current.clone()));
+                    current.clear();
+                }
+                in_tag = Some(ch);
+                current.push(ch);
+            } else if in_tag.is_some() {
+                if ch.is_alphanumeric() || ch == '_' {
+                    current.push(ch);
+                } else {
+                    if !current.is_empty() {
+                        let color = if in_tag == Some('#') { hashtag_color } else { mention_color };
+                        spans.push(Span::styled(current.clone(), Style::default().fg(color)));
+                        current.clear();
+                    }
+                    in_tag = None;
+                    current.push(ch);
+                }
+            } else {
+                current.push(ch);
+            }
+        }
+
+        if !current.is_empty() {
+            if let Some(tag_type) = in_tag {
+                let color = if tag_type == '#' { hashtag_color } else { mention_color };
+                spans.push(Span::styled(current, Style::default().fg(color)));
+            } else {
+                spans.push(Span::raw(current));
+            }
+        }
+
+        if spans.is_empty() {
+            spans.push(Span::raw(content.to_string()));
+        }
+
+        spans
+    }
+
     fn view_image_with_chafa(path: &str, app: &mut App) {
         app.needs_clear = true;
         print!("\x1b[2J\x1b[H");
-        println!("{}", t!(app, image_downloading));
         let _ = std::io::stdout().flush();
 
         let temp_path;
         let actual_path = if Self::is_url(path) {
             match Self::download_to_temp(path) {
                 Some(p) => { temp_path = p; &temp_path }
-                None => { println!("Error al descargar la imagen"); return; }
+                None => {
+                    println!("\n{}", t!(app, image_press_q));
+                    let _ = std::io::stdout().flush();
+                    Self::wait_for_exit_key();
+                    return;
+                }
             }
         } else {
             path
@@ -638,22 +1037,67 @@ impl App {
             println!("URL: {}", path);
         }
 
-        println!("\n{}", t!(app, image_press_enter));
+        println!("\n{}", t!(app, image_download_prompt));
         let _ = std::io::stdout().flush();
 
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
         loop {
-            let mut byte = [0u8];
-            match handle.read(&mut byte) {
-                Ok(_) if byte[0] == b'\r' || byte[0] == b'\n' => break,
-                Err(_) => break,
-                _ => continue,
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Char('d') => {
+                                Self::print_download_instructions(actual_path, app);
+                                println!("\n{}", t!(app, image_press_q));
+                                let _ = std::io::stdout().flush();
+                            }
+                            KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
+                            _ => {}
+                        }
+                    }
+                }
             }
         }
 
         if Self::is_url(path) {
             let _ = std::fs::remove_file(actual_path);
+        }
+    }
+
+    fn print_download_instructions(path: &str, app: &mut App) {
+        println!("\n{}", t!(app, image_download_header));
+        let data = match std::fs::read(path) {
+            Ok(d) => d,
+            Err(_) => {
+                println!("  {}", t!(app, image_download_error));
+                return;
+            }
+        };
+        let ext = path.rsplit('.').next().unwrap_or("jpg");
+        let b64 = Self::base64_encode(&data);
+        let filename = format!("imagen.{}", ext);
+
+        println!("  {}", t!(app, image_download_cmd));
+        println!("  \x1b[32mecho '{}' | base64 -d > {}\x1b[0m", b64, filename);
+        println!();
+        println!("  {}", t!(app, image_download_scp));
+        println!("  \x1b[32mscp -P 2222 localhost:/tmp/{} .\x1b[0m", path.rsplit('/').next().unwrap_or(""));
+        println!();
+        println!("  {}", t!(app, image_download_info));
+        println!("  {} — {}", filename, Self::format_size(data.len() as u64));
+    }
+
+    fn wait_for_exit_key() {
+        loop {
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
+                if let Ok(Event::Key(key)) = event::read() {
+                    if key.kind == KeyEventKind::Press {
+                        match key.code {
+                            KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
+                            _ => {}
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -666,19 +1110,10 @@ impl App {
         println!("{}", path);
         println!("\n{}", t!(app, image_open_browser));
 
-        println!("\n{}", t!(app, image_press_enter));
+        println!("\n{}", t!(app, image_press_q));
         let _ = std::io::stdout().flush();
 
-        let stdin = std::io::stdin();
-        let mut handle = stdin.lock();
-        loop {
-            let mut byte = [0u8];
-            match handle.read(&mut byte) {
-                Ok(_) if byte[0] == b'\r' || byte[0] == b'\n' => break,
-                Err(_) => break,
-                _ => continue,
-            }
-        }
+        Self::wait_for_exit_key();
     }
 
     fn post_has_image(post: &Post) -> bool {
@@ -694,9 +1129,16 @@ impl App {
                 KeyCode::Backspace => { self.comment_input.pop(); }
                 KeyCode::Enter => {
                     if !self.comment_input.trim().is_empty() {
+                        let parent_id = self.reply_to_comment_id.take();
                         if let Some(ref post) = self.viewed_post.clone() {
-                            self.db.add_comment(post.id, user_id, self.comment_input.trim())?;
+                            self.db.add_comment(post.id, user_id, self.comment_input.trim(), parent_id)?;
                             self.post_comments = self.db.get_comments(post.id)?;
+                            let tree = build_comment_tree(&self.post_comments);
+                            let flat = flatten_tree(&tree);
+                            self.flat_comment_ids = flat.iter().map(|n| n.comment.id).collect();
+                            if self.flat_comment_ids.is_empty() {
+                                self.comment_list_state.select(None);
+                            }
                             self.comment_input.clear();
                         }
                     }
@@ -705,6 +1147,7 @@ impl App {
                 KeyCode::Esc => {
                     self.comment_input.clear();
                     self.comment_mode = false;
+                    self.reply_to_comment_id = None;
                 }
                 _ => {}
             }
@@ -735,9 +1178,29 @@ impl App {
 
         match key.code {
             KeyCode::Char('b') | KeyCode::Esc => {
+                if self.confirming_delete_post {
+                    self.confirming_delete_post = false;
+                    self.set_status("".to_string());
+                    return Ok(true);
+                }
                 self.screen = Screen::Timeline;
                 self.comment_input.clear();
                 self.refresh_timeline()?;
+            }
+            KeyCode::Char('y') if self.confirming_delete_post => {
+                if let Some(ref post) = self.viewed_post.clone() {
+                    if post.user_id == user_id {
+                        self.db.delete_post(post.id, user_id)?;
+                        self.set_status(t!(self, post_detail_deleted).to_string());
+                        self.screen = Screen::Timeline;
+                        self.refresh_timeline()?;
+                    }
+                }
+                self.confirming_delete_post = false;
+            }
+            KeyCode::Char('n') if self.confirming_delete_post => {
+                self.confirming_delete_post = false;
+                self.set_status("".to_string());
             }
             KeyCode::Char('i') => {
                 let img = self.viewed_post.as_ref()
@@ -758,15 +1221,23 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('r') => {
+                if let Some(i) = self.comment_list_state.selected() {
+                    if let Some(&cid) = self.flat_comment_ids.get(i) {
+                        self.reply_to_comment_id = Some(cid);
+                        self.comment_mode = true;
+                    }
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
-                let len = self.post_comments.len();
+                let len = self.flat_comment_ids.len();
                 if len > 0 {
                     let i = self.comment_list_state.selected().unwrap_or(0);
                     self.comment_list_state.select(Some(i.saturating_sub(1)));
                 }
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                let len = self.post_comments.len();
+                let len = self.flat_comment_ids.len();
                 if len > 0 {
                     let i = self.comment_list_state.selected().unwrap_or(0);
                     self.comment_list_state.select(Some((i + 1).min(len - 1)));
@@ -774,30 +1245,30 @@ impl App {
             }
             KeyCode::Char('d') => {
                 if let Some(i) = self.comment_list_state.selected() {
-                    if let Some(comment) = self.post_comments.get(i) {
-                        if comment.user_id == user_id {
-                            self.db.delete_comment(comment.id, user_id)?;
-                            if let Some(ref post) = self.viewed_post {
-                                self.post_comments = self.db.get_comments(post.id)?;
+                    if let Some(&cid) = self.flat_comment_ids.get(i) {
+                        if let Some(ref comment) = self.post_comments.iter().find(|c| c.id == cid) {
+                            if comment.user_id == user_id {
+                                self.db.delete_comment(cid, user_id)?;
+                                if let Some(ref post) = self.viewed_post {
+                                    self.refresh_comments(post.id)?;
+                                }
+                                let n = self.flat_comment_ids.len();
+                                if n == 0 {
+                                    self.comment_list_state.select(None);
+                                } else {
+                                    self.comment_list_state.select(Some(i.min(n - 1)));
+                                }
+                                self.set_status(t!(self, post_detail_comment_deleted).to_string());
                             }
-                            let n = self.post_comments.len();
-                            if n == 0 {
-                                self.comment_list_state.select(None);
-                            } else {
-                                self.comment_list_state.select(Some(i.min(n - 1)));
-                            }
-                            self.set_status(t!(self, post_detail_comment_deleted).to_string());
                         }
                     }
                 }
             }
             KeyCode::Char('D') => {
-                if let Some(ref post) = self.viewed_post.clone() {
+                if let Some(ref post) = self.viewed_post {
                     if post.user_id == user_id {
-                            self.db.delete_post(post.id, user_id)?;
-                            self.set_status(t!(self, post_detail_deleted).to_string());
-                        self.screen = Screen::Timeline;
-                        self.refresh_timeline()?;
+                        self.confirming_delete_post = true;
+                        self.set_status(t!(self, post_detail_delete_confirm).to_string());
                     }
                 }
             }
@@ -840,7 +1311,7 @@ impl App {
                     .highlight_style(self.theme.highlight())
                     .highlight_symbol("  ");
                 f.render_stateful_widget(list_widget, chunks[1], &mut self.list_state.clone());
-                let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help_follow_list), Style::default().fg(self.theme.secondary))));
+                let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help_follow_list), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
                 f.render_widget(help, chunks[0]);
                 return;
             }
@@ -903,7 +1374,7 @@ impl App {
                 f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
             }
 
-            let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help), Style::default().fg(self.theme.secondary))));
+            let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
             f.render_widget(help, chunks[2]);
         }
     }
@@ -983,7 +1454,7 @@ impl App {
             area.y + 2,
         ));
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, post_search_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, post_search_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[1]);
 
         let selected = self.list_state.selected().unwrap_or(0);
@@ -1043,6 +1514,82 @@ impl App {
         f.render_widget(list, area);
     }
 
+    fn render_hashtag_view(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .margin(1)
+            .split(area);
+
+        let title = t!(self, hashtag_title).replace("{}", &self.hashtag_current);
+        let header = Paragraph::new(Line::from(Span::styled(title, self.theme.header_style)))
+            .block(self.theme.simple_block());
+        f.render_widget(header, chunks[0]);
+
+        let selected = self.list_state.selected().unwrap_or(0);
+        let total = self.hashtag_posts.len();
+        let items: Vec<ListItem> = self.hashtag_posts.iter().enumerate().map(|(i, p)| {
+            let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
+            let img = if Self::post_has_image(p) { "  \u{1f4f7}" } else { "" };
+            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
+            let content_spans = Self::render_content_with_tags(&p.content, self.theme.accent, self.theme.success);
+            let mut line_spans = vec![
+                Span::raw(bullet),
+                Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
+                Span::raw(": "),
+            ];
+            line_spans.extend(content_spans);
+            line_spans.push(Span::styled(img.to_string(), Style::default().fg(self.theme.image_indicator)));
+            line_spans.push(Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)));
+            ListItem::new(Line::from(line_spans))
+            .style(self.theme.list_item_style(i))
+        }).collect();
+
+        let list = List::new(items)
+            .block(self.theme.simple_block())
+            .highlight_style(self.theme.highlight())
+            .highlight_symbol("> ");
+        f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
+
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, hashtag_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        f.render_widget(help, chunks[2]);
+    }
+
+    fn render_hashtag_trending(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .margin(1)
+            .split(area);
+
+        let title = t!(self, hashtag_trending);
+        let header = Paragraph::new(Line::from(Span::styled(title, self.theme.header_style)))
+            .block(self.theme.simple_block());
+        f.render_widget(header, chunks[0]);
+
+        let selected = self.list_state.selected().unwrap_or(0);
+        let total = self.trending_hashtags.len();
+        let items: Vec<ListItem> = self.trending_hashtags.iter().enumerate().map(|(i, (tag, count))| {
+            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
+            ListItem::new(Line::from(vec![
+                Span::raw(bullet),
+                Span::styled(format!("#{}", tag), Style::default().fg(self.theme.accent)),
+                Span::raw("  "),
+                Span::styled(format!("{} posts", count), Style::default().fg(self.theme.muted)),
+            ]))
+            .style(self.theme.list_item_style(i))
+        }).collect();
+
+        let list = List::new(items)
+            .block(self.theme.simple_block())
+            .highlight_style(self.theme.highlight())
+            .highlight_symbol("> ");
+        f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
+
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, hashtag_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        f.render_widget(help, chunks[2]);
+    }
+
     fn handle_profile_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         if self.show_follow_list {
             match key.code {
@@ -1092,7 +1639,7 @@ impl App {
                 KeyCode::Enter => {
                     let username = self.current_user.as_ref().unwrap().username.clone();
                     match self.db.authenticate(&username, &self.input)? {
-                        Some(_) => {
+                        AuthResult::Success(_) => {
                             self.db.delete_user(user_id)?;
                             self.current_user = None;
                             self.screen = Screen::Login;
@@ -1100,7 +1647,7 @@ impl App {
                             self.status_message = None;
                             self.confirming_delete = false;
                         }
-                        None => {
+                        _ => {
                             self.set_status(t!(self, profile_wrong_password).to_string());
                             self.confirming_delete = false;
                             self.input.clear();
@@ -1149,7 +1696,7 @@ impl App {
                             self.is_following_viewed = true;
                             let name = viewed_username.unwrap_or_default();
                             self.set_status(t!(self, profile_followed).replace("{}", &name));
-                            let _ = self.db.add_notification(id, user_id, "follow");
+                            let _ = self.db.add_notification(id, user_id, "follow", Some(user_id));
                         }
                             let offset = self.page as u64 * self.page_size as u64;
                             self.timeline = self.db.get_timeline(user_id, offset, self.page_size as u64 + 1)?;
@@ -1202,12 +1749,13 @@ impl App {
             KeyCode::Enter => {
                 if let Some(i) = self.list_state.selected() {
                     if let Some(post) = self.viewed_user_posts.get(i) {
+                        let pid = post.id;
                         self.viewed_post = Some(post.clone());
-                        self.post_comments = self.db.get_comments(post.id)?;
+                        self.refresh_comments(pid)?;
                         self.comment_input.clear();
                         self.comment_list_state = ListState::default();
                         self.edit_mode = false;
-                        self.screen = Screen::PostDetail(post.id);
+                        self.screen = Screen::PostDetail(pid);
                     }
                 }
             }
@@ -1330,12 +1878,13 @@ impl App {
                 if self.list_state.selected().is_some() && !self.post_search_results.is_empty() {
                     if let Some(i) = self.list_state.selected() {
                         if let Some(post) = self.post_search_results.get(i) {
+                            let pid = post.id;
                             self.viewed_post = Some(post.clone());
-                            self.post_comments = self.db.get_comments(post.id)?;
+                            self.refresh_comments(pid)?;
                             self.comment_input.clear();
                             self.comment_list_state = ListState::default();
                             self.edit_mode = false;
-                            self.screen = Screen::PostDetail(post.id);
+                            self.screen = Screen::PostDetail(pid);
                         }
                     }
                 } else {
@@ -1367,12 +1916,105 @@ impl App {
         Ok(true)
     }
 
+    fn handle_hashtag_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.screen = Screen::Timeline;
+                self.refresh_timeline()?;
+            }
+            KeyCode::Char('#') => {
+                self.trending_hashtags = self.db.get_trending_hashtags(20)?;
+                self.screen = Screen::HashtagTrending;
+                self.list_state.select(Some(0));
+            }
+            KeyCode::Char('/') => {
+                self.input.clear();
+                self.screen = Screen::PostSearch;
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.list_state.selected() {
+                    if let Some(post) = self.hashtag_posts.get(i) {
+                        let pid = post.id;
+                        self.viewed_post = Some(post.clone());
+                        self.refresh_comments(pid)?;
+                        self.comment_input.clear();
+                        self.comment_list_state = ListState::default();
+                        self.edit_mode = false;
+                        self.screen = Screen::PostDetail(pid);
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = self.hashtag_posts.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some(i.saturating_sub(1)));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.hashtag_posts.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some((i + 1).min(len - 1)));
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_hashtag_trending_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('b') => {
+                self.screen = Screen::Timeline;
+                self.refresh_timeline()?;
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.list_state.selected() {
+                    if let Some((tag, _)) = self.trending_hashtags.get(i) {
+                        self.hashtag_current = tag.clone();
+                        self.hashtag_posts = self.db.get_posts_by_hashtag(tag, 0, 50)?;
+                        self.screen = Screen::HashtagView;
+                        self.list_state.select(Some(0));
+                    }
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = self.trending_hashtags.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some(i.saturating_sub(1)));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.trending_hashtags.len();
+                if len > 0 {
+                    let i = self.list_state.selected().unwrap_or(0);
+                    self.list_state.select(Some((i + 1).min(len - 1)));
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
     fn refresh_timeline(&mut self) -> Result<()> {
         let user_id = self.current_user.as_ref().unwrap().id;
         let offset = self.page as u64 * self.page_size as u64;
         self.timeline = self.db.get_timeline(user_id, offset, self.page_size as u64 + 1)?;
         self.unread_count = self.db.get_unread_count(user_id)?;
         self.unread_notifications = self.db.get_unread_notifications_count(user_id)?;
+        Ok(())
+    }
+
+    fn refresh_comments(&mut self, post_id: i64) -> Result<()> {
+        self.post_comments = self.db.get_comments(post_id)?;
+        let tree = build_comment_tree(&self.post_comments);
+        let flat = flatten_tree(&tree);
+        self.flat_comment_ids = flat.iter().map(|n| n.comment.id).collect();
+        if self.flat_comment_ids.is_empty() {
+            self.comment_list_state.select(None);
+        }
         Ok(())
     }
 
@@ -1532,7 +2174,47 @@ impl App {
     }
 
     fn handle_notifications_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        let user_id = self.current_user.as_ref().unwrap().id;
         match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                let len = self.notifications.len();
+                if len > 0 {
+                    let i = self.notif_list_state.selected().unwrap_or(0);
+                    self.notif_list_state.select(Some(i.saturating_sub(1)));
+                }
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                let len = self.notifications.len();
+                if len > 0 {
+                    let i = self.notif_list_state.selected().unwrap_or(0);
+                    self.notif_list_state.select(Some((i + 1).min(len - 1)));
+                }
+            }
+            KeyCode::Enter => {
+                if let Some(i) = self.notif_list_state.selected() {
+                    if let Some(notif) = self.notifications.get(i) {
+                        self.unread_notifications = 0;
+                        let _ = self.db.mark_notifications_read(user_id);
+                        match notif.notif_type.as_str() {
+                            "follow" => {
+                                self.screen = Screen::Profile(notif.from_user_id);
+                                return self.load_profile(notif.from_user_id).map(|_| true);
+                            }
+                            "mention" => {
+                                if let Some(post_id) = notif.related_id {
+                                    self.viewed_post = None;
+                                    self.post_comments.clear();
+                                    self.comment_list_state = ListState::default();
+                                    self.edit_mode = false;
+                                    self.comment_input.clear();
+                                    self.screen = Screen::PostDetail(post_id);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.unread_notifications = 0;
                 self.screen = Screen::Timeline;
@@ -1580,7 +2262,7 @@ impl App {
             .highlight_symbol("  ");
         f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, messages_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, messages_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[2]);
     }
 
@@ -1604,6 +2286,7 @@ impl App {
             let items: Vec<ListItem> = self.notifications.iter().enumerate().map(|(i, n)| {
                 let msg = match n.notif_type.as_str() {
                     "follow" => t!(self, follow_notif).replace("{}", &n.from_username),
+                    "mention" => t!(self, mention_notif).replace("{}", &n.from_username),
                     _ => format!("@{}: {}", n.from_username, n.notif_type),
                 };
                 let ago = i18n::ago(self.lang, &n.created_at, offset);
@@ -1618,8 +2301,10 @@ impl App {
             }).collect();
             let title = format!("{}  [{}]", t!(self, notifications_title), self.notifications.len());
             let list = List::new(items)
-                .block(self.theme.default_block(&title));
-            f.render_widget(list, chunks[1]);
+                .block(self.theme.default_block(&title))
+                .highlight_style(self.theme.highlight())
+                .highlight_symbol("  ");
+            f.render_stateful_widget(list, chunks[1], &mut self.notif_list_state.clone());
         }
     }
 
@@ -1680,7 +2365,7 @@ impl App {
             .block(Block::default().title(tz_title).borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(tz_input, chunks[3]);
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, edit_profile_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, edit_profile_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[4]);
     }
 
@@ -1751,6 +2436,8 @@ impl App {
                 Screen::Notifications => self.render_notifications(f, content_area),
                 Screen::PostSearch => self.render_post_search(f, content_area),
                 Screen::PostSearchFilter => self.render_post_search_filter(f, content_area),
+                Screen::HashtagView => self.render_hashtag_view(f, content_area),
+                Screen::HashtagTrending => self.render_hashtag_trending(f, content_area),
             }
         } else {
             match self.screen {
@@ -1793,7 +2480,8 @@ impl App {
             Screen::Chat(_) => t!(self, status_bar_chat),
             Screen::EditProfile => t!(self, status_bar_edit),
             Screen::Notifications => t!(self, status_bar_notifications),
-            Screen::PostSearch | Screen::PostSearchFilter => t!(self, status_bar_post_search),
+            Screen::PostSearch |             Screen::PostSearchFilter => t!(self, status_bar_post_search),
+            Screen::HashtagView | Screen::HashtagTrending => t!(self, hashtag_trending),
             Screen::Login | Screen::Register => "",
         };
 
@@ -1843,7 +2531,7 @@ impl App {
             f.render_widget(debug_par, chunks[2]);
         }
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, login_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, login_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[3]);
     }
 
@@ -1872,7 +2560,7 @@ impl App {
             f.render_widget(debug_par, chunks[2]);
         }
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, register_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, register_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[3]);
     }
 
@@ -1926,14 +2614,16 @@ impl App {
             let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
             let img = if Self::post_has_image(p) { "  \u{1f4f7}" } else { "" };
             let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-            ListItem::new(Line::from(vec![
+            let content_spans = Self::render_content_with_tags(&p.content, self.theme.accent, self.theme.success);
+            let mut line_spans = vec![
                 Span::raw(bullet),
                 Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
                 Span::raw(": "),
-                Span::raw(&p.content),
-                Span::styled(img, Style::default().fg(self.theme.image_indicator)),
-                Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
-            ]))
+            ];
+            line_spans.extend(content_spans);
+            line_spans.push(Span::styled(img.to_string(), Style::default().fg(self.theme.image_indicator)));
+            line_spans.push(Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)));
+            ListItem::new(Line::from(line_spans))
             .style(self.theme.list_item_style(i))
         }).collect();
 
@@ -1945,7 +2635,7 @@ impl App {
         f.render_stateful_widget(list, chunks[timeline_chunk], &mut self.list_state.clone());
 
         let help_idx = 2;
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, timeline_help), Style::default().fg(self.theme.secondary))));
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, timeline_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[help_idx]);
     }
 
@@ -1962,6 +2652,48 @@ impl App {
         };
 
         let img_height = if img_text.is_empty() { 0 } else { 1 };
+
+        if self.upload_mode {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+                .margin(1)
+                .split(area);
+
+            let header = Paragraph::new(Line::from(Span::styled(" 📷 Imágenes subidas ", self.theme.header_style)))
+                .block(self.theme.simple_block());
+            f.render_widget(header, chunks[0]);
+
+            if self.uploaded_images.is_empty() {
+                let empty = Paragraph::new("No hay imágenes. Subí una con:\n  scp -P 2222 imagen.jpg localhost:/data/uploads/")
+                    .style(Style::default().fg(self.theme.muted));
+                f.render_widget(empty, chunks[1]);
+            } else {
+                let selected = self.list_state.selected().unwrap_or(0);
+                let total = self.uploaded_images.len();
+                let items: Vec<ListItem> = self.uploaded_images.iter().enumerate().map(|(i, (name, size))| {
+                    let bullet = if total > 0 && i == selected { "▶ " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(bullet),
+                        Span::styled(name, Style::default().fg(self.theme.accent)),
+                        Span::raw("  "),
+                        Span::styled(size, Style::default().fg(self.theme.muted)),
+                    ]))
+                    .style(self.theme.list_item_style(i))
+                }).collect();
+
+                let list = List::new(items)
+                    .block(self.theme.simple_block())
+                    .highlight_style(self.theme.highlight())
+                    .highlight_symbol("  ");
+                f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
+            }
+
+            let help = Paragraph::new(Line::from(Span::styled("j/k: navegar  Enter: seleccionar  Esc: cancelar", Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+            f.render_widget(help, chunks[2]);
+            return;
+        }
+
         let title = if self.url_mode { t!(self, create_post_url_title) } else { t!(self, create_post_title) };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1986,9 +2718,9 @@ impl App {
         }
 
         let help = if self.url_mode {
-            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help_url), Style::default().fg(self.theme.secondary))))
+            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help_url), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
         } else {
-            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help), Style::default().fg(self.theme.secondary))))
+            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
         };
         f.render_widget(help, chunks[chunks.len() - 1]);
     }
@@ -2050,9 +2782,15 @@ impl App {
                 idx += 1;
             }
 
-            let comments: Vec<ListItem> = self.post_comments.iter().enumerate().map(|(i, c)| {
+            let tree = build_comment_tree(&self.post_comments);
+            let flat: Vec<&CommentNode> = flatten_tree(&tree);
+            let comments: Vec<ListItem> = flat.iter().enumerate().map(|(i, node)| {
+                let c = &node.comment;
+                let indent = "  ".repeat(node.depth);
                 let ago = i18n::ago(self.lang, &c.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
+                let prefix = if node.depth > 0 { format!("{}└─ ", indent) } else { String::new() };
                 ListItem::new(Line::from(vec![
+                    Span::raw(prefix),
                     Span::styled(format!("@{}", c.username), Style::default().fg(self.theme.accent)),
                     Span::raw(" "),
                     Span::raw(&c.content),
@@ -2084,11 +2822,11 @@ impl App {
             }
 
             let help = if self.edit_mode {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_edit), Style::default().fg(self.theme.secondary))))
+                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_edit), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
             } else if self.comment_mode {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_comment), Style::default().fg(self.theme.secondary))))
+                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_comment), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
             } else {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_view), Style::default().fg(self.theme.secondary))))
+                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_view), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
             };
             f.render_widget(help, chunks[2]);
         }

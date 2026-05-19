@@ -1,10 +1,13 @@
+use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex;
 
 use anyhow::Result;
 use async_trait::async_trait;
+use image::GenericImageView;
 use nix::pty::{forkpty, ForkptyResult};
 use nix::sys::wait::waitpid;
 use nix::unistd::{close, write};
@@ -12,8 +15,362 @@ use russh::keys::key::KeyPair;
 use russh::keys::load_secret_key;
 use russh::server::*;
 use russh::{Channel, ChannelId, CryptoVec};
+use russh_sftp::protocol::{
+    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
+};
 
 use crate::db::Database;
+
+const UPLOAD_DIR: &str = "/data/uploads";
+const MAX_IMAGE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
+const MAX_IMAGE_DIM: u32 = 512;
+
+struct OpenFile {
+    path: std::path::PathBuf,
+    file: Arc<Mutex<std::fs::File>>,
+    is_write: bool,
+}
+
+#[derive(Default)]
+struct SftpSession {
+    version: Option<u32>,
+    open_files: HashMap<String, OpenFile>,
+    open_dirs: HashMap<String, std::path::PathBuf>,
+    handle_counter: AtomicU64,
+    root_dir_read_done: bool,
+}
+
+impl SftpSession {
+    fn next_handle(&self) -> String {
+        let id = self.handle_counter.fetch_add(1, Ordering::SeqCst);
+        format!("handle_{}", id)
+    }
+
+    fn status_ok(id: u32) -> Status {
+        Status {
+            id,
+            status_code: StatusCode::Ok,
+            error_message: "Ok".to_string(),
+            language_tag: "en-US".to_string(),
+        }
+    }
+}
+
+fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
+    let path = path.trim_start_matches('/');
+    if path.is_empty() || path == "." {
+        return Some(std::path::PathBuf::from(UPLOAD_DIR));
+    }
+    let full = std::path::PathBuf::from(UPLOAD_DIR).join(path);
+    let canonical = full.canonicalize().ok()?;
+    if canonical.starts_with(UPLOAD_DIR) {
+        Some(canonical)
+    } else {
+        None
+    }
+}
+
+fn process_image(path: &std::path::Path) {
+    let img = match image::open(path) {
+        Ok(i) => i,
+        Err(_) => {
+            tracing::warn!("Uploaded file is not a valid image, deleting: {}", path.display());
+            let _ = std::fs::remove_file(path);
+            return;
+        }
+    };
+
+    let (w, h) = img.dimensions();
+    if w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM {
+        return;
+    }
+
+    let ratio = (MAX_IMAGE_DIM as f32) / (w.max(h) as f32);
+    let new_w = (w as f32 * ratio).round() as u32;
+    let new_h = (h as f32 * ratio).round() as u32;
+
+    let resized = img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
+
+    let jpeg_path = path.with_extension("jpg");
+    let mut buf = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut buf);
+    if resized.write_to(&mut cursor, image::ImageFormat::Jpeg).is_ok() {
+        let _ = std::fs::write(&jpeg_path, &buf);
+        if jpeg_path != path {
+            let _ = std::fs::remove_file(path);
+        }
+        tracing::info!("Image processed: {} -> {} ({}x{}, {} bytes)",
+            path.display(), jpeg_path.display(), new_w, new_h, buf.len());
+    }
+}
+
+pub fn list_uploaded_images() -> Vec<(String, String)> {
+    let _ = std::fs::create_dir_all(UPLOAD_DIR);
+    let mut images = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(UPLOAD_DIR) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+                if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                        let size = path.metadata().map(|m| m.len()).unwrap_or(0);
+                        images.push((name.to_string(), format!("{:.1} KB", size as f64 / 1024.0)));
+                    }
+                }
+            }
+        }
+    }
+    images.sort_by(|a, b| b.0.cmp(&a.0));
+    images
+}
+
+fn attrs_from_meta(meta: &std::fs::Metadata) -> FileAttributes {
+    FileAttributes::from(meta)
+}
+
+impl russh_sftp::server::Handler for SftpSession {
+    type Error = StatusCode;
+
+    fn unimplemented(&self) -> Self::Error {
+        StatusCode::OpUnsupported
+    }
+
+    async fn init(
+        &mut self,
+        version: u32,
+        extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        if self.version.is_some() {
+            tracing::warn!("duplicate SSH_FXP_VERSION packet");
+            return Err(StatusCode::ConnectionLost);
+        }
+        self.version = Some(version);
+        tracing::info!("SFTP version: {:?}, extensions: {:?}", self.version, extensions);
+        Ok(Version::new())
+    }
+
+    async fn open(
+        &mut self,
+        id: u32,
+        filename: String,
+        pflags: OpenFlags,
+        _attrs: FileAttributes,
+    ) -> Result<Handle, Self::Error> {
+        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+
+        let _ = std::fs::create_dir_all(UPLOAD_DIR);
+
+        let write = pflags.contains(OpenFlags::WRITE);
+        let read = pflags.contains(OpenFlags::READ);
+
+        let file = if write {
+            std::fs::File::create(&p).map_err(|_| StatusCode::Failure)?
+        } else if read {
+            std::fs::File::open(&p).map_err(|_| StatusCode::NoSuchFile)?
+        } else {
+            std::fs::File::open(&p)
+                .or_else(|_| std::fs::File::create(&p))
+                .map_err(|_| StatusCode::Failure)?
+        };
+
+        let handle = self.next_handle();
+        self.open_files.insert(handle.clone(), OpenFile {
+            path: p,
+            file: Arc::new(Mutex::new(file)),
+            is_write: write,
+        });
+
+        Ok(Handle { id, handle })
+    }
+
+    async fn close(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> Result<Status, Self::Error> {
+        if let Some(open_file) = self.open_files.remove(&handle) {
+            if open_file.is_write {
+                let path = open_file.path.clone();
+                tokio::task::spawn_blocking(move || {
+                    process_image(&path);
+                });
+            }
+        }
+        Ok(Self::status_ok(id))
+    }
+
+    async fn read(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        len: u32,
+    ) -> Result<Data, Self::Error> {
+        use std::io::{Read, Seek};
+        let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
+        let mut file = open_file.file.lock().unwrap();
+        file.seek(std::io::SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        let mut buf = vec![0u8; len as usize];
+        let n = file.read(&mut buf).map_err(|_| StatusCode::Failure)?;
+        buf.truncate(n);
+        Ok(Data { id, data: buf })
+    }
+
+    async fn write(
+        &mut self,
+        id: u32,
+        handle: String,
+        offset: u64,
+        data: Vec<u8>,
+    ) -> Result<Status, Self::Error> {
+        use std::io::{Seek, Write};
+        let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
+        let mut file = open_file.file.lock().unwrap();
+        file.seek(std::io::SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+
+        let current_pos = offset + data.len() as u64;
+        if current_pos > MAX_IMAGE_SIZE {
+            return Err(StatusCode::Failure);
+        }
+
+        file.write_all(&data).map_err(|_| StatusCode::Failure)?;
+        Ok(Self::status_ok(id))
+    }
+
+    async fn lstat(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<Attrs, Self::Error> {
+        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
+        Ok(Attrs {
+            id,
+            attrs: attrs_from_meta(&meta),
+        })
+    }
+
+    async fn fstat(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> Result<Attrs, Self::Error> {
+        let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
+        let file = open_file.file.lock().unwrap();
+        let meta = file.metadata().map_err(|_| StatusCode::Failure)?;
+        Ok(Attrs {
+            id,
+            attrs: attrs_from_meta(&meta),
+        })
+    }
+
+    async fn opendir(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<Handle, Self::Error> {
+        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let _ = std::fs::read_dir(&p).map_err(|_| StatusCode::NoSuchFile)?;
+
+        let handle = self.next_handle();
+        self.open_dirs.insert(handle.clone(), p);
+        self.root_dir_read_done = false;
+
+        Ok(Handle { id, handle })
+    }
+
+    async fn readdir(
+        &mut self,
+        id: u32,
+        handle: String,
+    ) -> Result<Name, Self::Error> {
+        let dir_path = self.open_dirs.get(&handle).ok_or(StatusCode::BadMessage)?.clone();
+
+        let entries = std::fs::read_dir(&dir_path).map_err(|_| StatusCode::NoSuchFile)?;
+        let mut files = Vec::new();
+        for entry in entries.flatten() {
+            if let Ok(meta) = entry.metadata() {
+                let name = entry.file_name().to_string_lossy().to_string();
+                let attrs = attrs_from_meta(&meta);
+                files.push(File::new(&name, attrs));
+            }
+        }
+
+        if files.is_empty() {
+            return Err(StatusCode::Eof);
+        }
+
+        Ok(Name { id, files })
+    }
+
+    async fn remove(
+        &mut self,
+        id: u32,
+        filename: String,
+    ) -> Result<Status, Self::Error> {
+        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+        std::fs::remove_file(&p).map_err(|_| StatusCode::Failure)?;
+        Ok(Self::status_ok(id))
+    }
+
+    async fn mkdir(
+        &mut self,
+        id: u32,
+        path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        std::fs::create_dir(&p).map_err(|_| StatusCode::Failure)?;
+        Ok(Self::status_ok(id))
+    }
+
+    async fn rmdir(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<Status, Self::Error> {
+        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        std::fs::remove_dir(&p).map_err(|_| StatusCode::Failure)?;
+        Ok(Self::status_ok(id))
+    }
+
+    async fn realpath(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<Name, Self::Error> {
+        let p = sanitize_path(&path).unwrap_or_else(|| std::path::PathBuf::from(UPLOAD_DIR));
+        Ok(Name {
+            id,
+            files: vec![File::dummy(p.to_string_lossy().to_string())],
+        })
+    }
+
+    async fn stat(
+        &mut self,
+        id: u32,
+        path: String,
+    ) -> Result<Attrs, Self::Error> {
+        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
+        Ok(Attrs {
+            id,
+            attrs: attrs_from_meta(&meta),
+        })
+    }
+
+    async fn rename(
+        &mut self,
+        id: u32,
+        oldpath: String,
+        newpath: String,
+    ) -> Result<Status, Self::Error> {
+        let old_p = sanitize_path(&oldpath).ok_or(StatusCode::PermissionDenied)?;
+        let new_p = sanitize_path(&newpath).ok_or(StatusCode::PermissionDenied)?;
+        std::fs::rename(&old_p, &new_p).map_err(|_| StatusCode::Failure)?;
+        Ok(Self::status_ok(id))
+    }
+}
 
 fn load_or_generate_key(path: &str) -> Result<KeyPair> {
     if std::path::Path::new(path).exists() {
@@ -88,6 +445,7 @@ impl Server for SshServer {
             ws_xpixel: 0,
             ws_ypixel: 0,
             ssh_password: self.ssh_password.clone(),
+            clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }
@@ -104,6 +462,7 @@ pub struct SshSession {
     ws_xpixel: u32,
     ws_ypixel: u32,
     ssh_password: String,
+    clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
 #[async_trait]
@@ -136,6 +495,10 @@ impl Handler for SshSession {
         self.input_tx = Some(tx);
         self.input_rx = Some(rx);
         self.channel_id = Some(channel.id());
+        {
+            let mut clients = self.clients.lock().unwrap();
+            clients.insert(channel.id(), channel);
+        }
         Ok(true)
     }
 
@@ -301,6 +664,26 @@ impl Handler for SshSession {
         _: &mut Session,
     ) -> Result<(), Self::Error> {
         self.input_tx = None;
+        Ok(())
+    }
+
+    async fn subsystem_request(
+        &mut self,
+        channel_id: ChannelId,
+        name: &str,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
+        if name == "sftp" {
+            let channel = {
+                let mut clients = self.clients.lock().unwrap();
+                clients.remove(&channel_id).unwrap()
+            };
+            let sftp = SftpSession::default();
+            session.channel_success(channel_id);
+            russh_sftp::server::run(channel.into_stream(), sftp).await;
+        } else {
+            session.channel_failure(channel_id);
+        }
         Ok(())
     }
 }

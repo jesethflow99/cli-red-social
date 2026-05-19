@@ -87,6 +87,8 @@ pub struct LangStrings {
     pub login_help: &'static str,
     pub login_error_format: &'static str,
     pub login_error_invalid: &'static str,
+    pub login_error_user_not_found: &'static str,
+    pub login_error_wrong_password: &'static str,
 
     pub register_title: &'static str,
     pub register_help: &'static str,
@@ -122,6 +124,7 @@ pub struct LangStrings {
     pub post_detail_comment_title: &'static str,
     pub post_detail_edited: &'static str,
     pub post_detail_deleted: &'static str,
+    pub post_detail_delete_confirm: &'static str,
     pub post_detail_comment_deleted: &'static str,
     pub post_detail_image_hint: &'static str,
 
@@ -160,6 +163,11 @@ pub struct LangStrings {
     pub post_search_help: &'static str,
     pub post_search_results: &'static str,
 
+    pub hashtag_title: &'static str,
+    pub hashtag_no_posts: &'static str,
+    pub hashtag_help: &'static str,
+    pub hashtag_trending: &'static str,
+
     pub messages_title: &'static str,
     pub messages_empty: &'static str,
     pub messages_conversations: &'static str,
@@ -180,6 +188,13 @@ pub struct LangStrings {
     pub image_downloading: &'static str,
     pub image_no_viewer: &'static str,
     pub image_press_enter: &'static str,
+    pub image_press_q: &'static str,
+    pub image_download_prompt: &'static str,
+    pub image_download_header: &'static str,
+    pub image_download_cmd: &'static str,
+    pub image_download_scp: &'static str,
+    pub image_download_info: &'static str,
+    pub image_download_error: &'static str,
     pub image_download_instructions: &'static str,
     pub image_open_browser: &'static str,
     pub image_view: &'static str,
@@ -196,6 +211,7 @@ pub struct LangStrings {
     pub status_bar_post_search: &'static str,
 
     pub follow_notif: &'static str,
+    pub mention_notif: &'static str,
     pub page: &'static str,
     pub error: &'static str,
 }
@@ -207,6 +223,8 @@ pub static ES: LangStrings = LangStrings {
     login_help: "Tab: registrarse   Esc/Ctrl+q: salir",
     login_error_format: "Formato: usuario:contraseña",
     login_error_invalid: "Credenciales inválidas",
+    login_error_user_not_found: "El usuario no existe. Regístrate primero (Tab)",
+    login_error_wrong_password: "Contraseña incorrecta",
 
     register_title: " Registro (usuario:contraseña:nombre) ",
     register_help: "Tab: volver al login   Esc/Ctrl+q: salir",
@@ -218,7 +236,7 @@ pub static ES: LangStrings = LangStrings {
     register_error_exists: "El usuario '@{}' ya existe",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navegar   Enter: ver   /: buscar   n: nuevo post   s: buscar usuarios   p: perfil   m: mensajes   Ctrl+n: notifs   i: imagen   q: salir",
+    timeline_help: "j/k: navegar   Enter: ver   /: buscar   #: trending   n: nuevo post   s: buscar usuarios   p: perfil   m: mensajes   Ctrl+n: notifs   i: imagen   q: salir",
     timeline_no_posts: "No hay posts en tu timeline",
     timeline_page: "Página {} — {} posts",
 
@@ -235,13 +253,14 @@ pub static ES: LangStrings = LangStrings {
 
     post_detail_comments: " Comentarios ",
     post_detail_no_comments: "Sin comentarios",
-    post_detail_help_view: "c: comentar   i: imagen   ↑↓: navegar   d: eliminar comentario   e: editar   D: eliminar post   b: volver",
+    post_detail_help_view: "c: comentar   r: responder   i: imagen   ↑↓: navegar   d: eliminar comentario   e: editar   D: eliminar post   b: volver",
     post_detail_help_edit: "Enter: guardar   Esc: cancelar",
     post_detail_help_comment: "Enter: enviar   Esc: cancelar",
     post_detail_edit_title: " Editando post ",
     post_detail_comment_title: " Escribe un comentario ",
     post_detail_edited: "Post actualizado",
     post_detail_deleted: "Post eliminado",
+    post_detail_delete_confirm: "¿Eliminar este post y todos sus comentarios? (y/n)",
     post_detail_comment_deleted: "Comentario eliminado",
     post_detail_image_hint: "Presiona i para ver la imagen",
 
@@ -280,6 +299,11 @@ pub static ES: LangStrings = LangStrings {
     post_search_help: "Tab: cambiar filtro  Ctrl+f/p: cambiar página  Enter: buscar/seleccionar  Esc: volver",
     post_search_results: " Resultados ",
 
+    hashtag_title: " #{} — Posts",
+    hashtag_no_posts: "No hay posts con este hashtag",
+    hashtag_help: "j/k: navegar   Enter: ver   b: volver   #: trending",
+    hashtag_trending: " 🔥 Trending",
+
     messages_title: "📬 {} — Conversaciones",
     messages_empty: "No tienes conversaciones aún",
     messages_conversations: " Conversaciones ",
@@ -300,6 +324,13 @@ pub static ES: LangStrings = LangStrings {
     image_downloading: "⏳ Descargando imagen...",
     image_no_viewer: "No se encontró un visor de imágenes compatible.",
     image_press_enter: "Presiona Enter para volver...",
+    image_press_q: "Presiona Enter, q o Esc para volver...",
+    image_download_prompt: "d: descargar imagen  |  Enter/q/Esc: volver",
+    image_download_header: "📥 Descargar imagen:",
+    image_download_cmd: "Opción 1 — Copiar y pegar en tu terminal:",
+    image_download_scp: "Opción 2 — Desde otra terminal con scp:",
+    image_download_info: "Archivo:",
+    image_download_error: "Error al descargar la imagen (timeout o URL inválida).",
     image_download_instructions: "📷 Imagen:",
     image_open_browser: "Ábrela en tu navegador para descargarla.",
     image_view: " Imagen ",
@@ -316,6 +347,7 @@ pub static ES: LangStrings = LangStrings {
     status_bar_post_search: "Buscar Posts",
 
     follow_notif: "@{} te ha seguido",
+    mention_notif: "@{} te mencionó",
     page: "Página {}",
     error: "Error",
 };
@@ -325,6 +357,8 @@ pub static EN: LangStrings = LangStrings {
     login_help: "Tab: register   Esc/Ctrl+q: exit",
     login_error_format: "Format: user:password",
     login_error_invalid: "Invalid credentials",
+    login_error_user_not_found: "User does not exist. Register first (Tab)",
+    login_error_wrong_password: "Wrong password",
 
     register_title: " Register (user:password:name) ",
     register_help: "Tab: back to login   Esc/Ctrl+q: exit",
@@ -336,7 +370,7 @@ pub static EN: LangStrings = LangStrings {
     register_error_exists: "User '@{}' already exists",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navigate   Enter: view   /: search posts   n: new post   s: search users   p: profile   m: messages   Ctrl+n: notifs   i: image   q: quit",
+    timeline_help: "j/k: navigate   Enter: view   /: search   #: trending   n: new post   s: search users   p: profile   m: messages   Ctrl+n: notifs   i: image   q: quit",
     timeline_no_posts: "No posts in your timeline",
     timeline_page: "Page {} — {} posts",
 
@@ -353,13 +387,14 @@ pub static EN: LangStrings = LangStrings {
 
     post_detail_comments: " Comments ",
     post_detail_no_comments: "No comments",
-    post_detail_help_view: "c: comment   i: image   ↑↓: navigate   d: delete comment   e: edit   D: delete post   b: back",
+    post_detail_help_view: "c: comment   r: reply   i: image   ↑↓: navigate   d: delete comment   e: edit   D: delete post   b: back",
     post_detail_help_edit: "Enter: save   Esc: cancel",
     post_detail_help_comment: "Enter: send   Esc: cancel",
     post_detail_edit_title: " Editing post ",
     post_detail_comment_title: " Write a comment ",
     post_detail_edited: "Post updated",
     post_detail_deleted: "Post deleted",
+    post_detail_delete_confirm: "Delete this post and all its comments? (y/n)",
     post_detail_comment_deleted: "Comment deleted",
     post_detail_image_hint: "Press i to view the image",
 
@@ -398,6 +433,11 @@ pub static EN: LangStrings = LangStrings {
     post_search_help: "Tab: change filter  Ctrl+f/p: change page  Enter: search/select  Esc: back",
     post_search_results: " Results ",
 
+    hashtag_title: " #{} — Posts",
+    hashtag_no_posts: "No posts with this hashtag",
+    hashtag_help: "j/k: navigate   Enter: view   b: back   #: trending",
+    hashtag_trending: " 🔥 Trending",
+
     messages_title: "📬 {} — Conversations",
     messages_empty: "No conversations yet",
     messages_conversations: " Conversations ",
@@ -418,6 +458,13 @@ pub static EN: LangStrings = LangStrings {
     image_downloading: "⏳ Downloading image...",
     image_no_viewer: "No compatible image viewer found.",
     image_press_enter: "Press Enter to return...",
+    image_press_q: "Press Enter, q or Esc to return...",
+    image_download_prompt: "d: download image  |  Enter/q/Esc: back",
+    image_download_header: "📥 Download image:",
+    image_download_cmd: "Option 1 — Copy and paste in your terminal:",
+    image_download_scp: "Option 2 — From another terminal with scp:",
+    image_download_info: "File:",
+    image_download_error: "Error downloading image (timeout or invalid URL).",
     image_download_instructions: "📷 Image:",
     image_open_browser: "Open in your browser to download.",
     image_view: " Image ",
@@ -434,6 +481,7 @@ pub static EN: LangStrings = LangStrings {
     status_bar_post_search: "Search Posts",
 
     follow_notif: "@{} followed you",
+    mention_notif: "@{} mentioned you",
     page: "Page {}",
     error: "Error",
 };

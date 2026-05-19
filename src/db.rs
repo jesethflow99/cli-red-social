@@ -1,5 +1,5 @@
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use postgres::NoTls;
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
@@ -10,11 +10,17 @@ use std::time::Instant;
 
 use crate::models::{Comment, Message, Notification, Post, User};
 
+pub enum AuthResult {
+    Success(User),
+    UserNotFound,
+    WrongPassword,
+}
+
 #[allow(dead_code)]
 pub trait DatabaseOps: Send {
     fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User>;
     fn check_register_rate_limit(&self) -> Result<()>;
-    fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>>;
+    fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult>;
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>>;
     fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>>;
     fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post>;
@@ -25,7 +31,7 @@ pub trait DatabaseOps: Send {
     fn get_followers(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_following(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>>;
-    fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment>;
+    fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment>;
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>>;
     fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()>;
     fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()>;
@@ -38,13 +44,15 @@ pub trait DatabaseOps: Send {
     fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()>;
     fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()>;
     fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()>;
-    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()>;
+    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()>;
     fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>>;
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64>;
     fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
     fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
+    fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
+    fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>>;
 }
 
 impl DatabaseOps for Database {
@@ -54,7 +62,7 @@ impl DatabaseOps for Database {
     fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
         Database::register_user(self, username, password, display_name)
     }
-    fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
+    fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
         Database::authenticate(self, username, password)
     }
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
@@ -87,8 +95,8 @@ impl DatabaseOps for Database {
     fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
         Database::get_posts_by_user(self, user_id, offset, limit)
     }
-    fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
-        Database::add_comment(self, post_id, user_id, content)
+    fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
+        Database::add_comment(self, post_id, user_id, content, parent_id)
     }
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
         Database::get_comments(self, post_id)
@@ -126,8 +134,8 @@ impl DatabaseOps for Database {
     fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
         Database::update_timezone(self, user_id, utc_offset)
     }
-    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
-        Database::add_notification(self, user_id, from_user_id, notif_type)
+    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
+        Database::add_notification(self, user_id, from_user_id, notif_type, related_id)
     }
     fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
         Database::get_notifications(self, user_id, offset, limit)
@@ -146,6 +154,12 @@ impl DatabaseOps for Database {
     }
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
         Database::cleanup_old_data(self, days)
+    }
+    fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        Database::get_posts_by_hashtag(self, tag, offset, limit)
+    }
+    fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>> {
+        Database::get_trending_hashtags(self, limit)
     }
 }
 
@@ -191,15 +205,66 @@ impl Database {
     }
 
     pub fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
-        let key = format!("{}:{}", user_id, action);
-        let now = Instant::now();
-        let mut limiter = self.rate_limiter.lock().unwrap();
-        let entries = limiter.entry(key).or_default();
-        entries.retain(|t| now.duration_since(*t).as_secs() < window_secs);
-        if entries.len() >= max {
-            anyhow::bail!("Demasiadas solicitudes. Espera un momento.");
+        let mut conn = self.pool.get()?;
+        let now = Utc::now();
+        let window_start = now - chrono::Duration::seconds(window_secs as i64);
+        let window_start_str = window_start.to_rfc3339();
+        let now_str = now.to_rfc3339();
+
+        let rows = conn.query(
+            "SELECT count, banned_until FROM rate_limits WHERE user_id = $1 AND action = $2 AND window_start > $3 ORDER BY window_start DESC LIMIT 1",
+            &[&user_id, &action, &window_start_str],
+        )?;
+
+        if let Some(row) = rows.into_iter().next() {
+            let count: i32 = row.get(0);
+            let banned_until: String = row.get(1);
+
+            if !banned_until.is_empty() {
+                if let Ok(ban_time) = banned_until.parse::<DateTime<Utc>>() {
+                    if now < ban_time {
+                        let remaining = ban_time - now;
+                        anyhow::bail!(
+                            "Cuenta baneada temporalmente. Espera {} segundos.",
+                            remaining.num_seconds()
+                        );
+                    }
+                }
+            }
+
+            if count as usize >= max {
+                let ban_duration = if count as usize >= max * 3 {
+                    window_secs * 4
+                } else if count as usize >= max * 2 {
+                    window_secs * 2
+                } else {
+                    window_secs
+                };
+                let ban_until = now + chrono::Duration::seconds(ban_duration as i64);
+                let ban_until_str = ban_until.to_rfc3339();
+
+                conn.execute(
+                    "UPDATE rate_limits SET banned_until = $1 WHERE user_id = $2 AND action = $3 AND window_start > $4",
+                    &[&ban_until_str, &user_id, &action, &window_start_str],
+                )?;
+
+                anyhow::bail!(
+                    "Demasiadas solicitudes. Espera {} segundos.",
+                    ban_duration
+                );
+            }
+
+            conn.execute(
+                "UPDATE rate_limits SET count = count + 1 WHERE user_id = $1 AND action = $2 AND window_start > $3",
+                &[&user_id, &action, &window_start_str],
+            )?;
+        } else {
+            conn.execute(
+                "INSERT INTO rate_limits (user_id, action, window_start, count) VALUES ($1, $2, $3, 1)",
+                &[&user_id, &action, &now_str],
+            )?;
         }
-        entries.push(now);
+
         Ok(())
     }
 
@@ -214,8 +279,12 @@ impl Database {
                 display_name TEXT NOT NULL DEFAULT '',
                 bio TEXT NOT NULL DEFAULT '',
                 utc_offset INTEGER NOT NULL DEFAULT 0,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                last_login_at TEXT NOT NULL DEFAULT '',
+                login_count INTEGER NOT NULL DEFAULT 0
             );
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TEXT NOT NULL DEFAULT '';
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS posts (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id),
@@ -250,7 +319,21 @@ impl Database {
                 type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
-            );",
+            );
+            CREATE TABLE IF NOT EXISTS rate_limits (
+                user_id BIGINT NOT NULL,
+                action TEXT NOT NULL,
+                window_start TEXT NOT NULL,
+                count INTEGER NOT NULL DEFAULT 1,
+                banned_until TEXT NOT NULL DEFAULT '',
+                PRIMARY KEY (user_id, action, window_start)
+            );
+            CREATE TABLE IF NOT EXISTS post_hashtags (
+                post_id BIGINT NOT NULL REFERENCES posts(id),
+                tag TEXT NOT NULL,
+                PRIMARY KEY (post_id, tag)
+            );
+            CREATE INDEX IF NOT EXISTS idx_post_hashtags_tag ON post_hashtags(tag);",
         )?;
         // Migrate existing SERIAL/INTEGER columns to BIGINT if they exist
         conn.batch_execute(
@@ -267,7 +350,9 @@ impl Database {
              ALTER TABLE messages ALTER COLUMN receiver_id TYPE BIGINT;
              ALTER TABLE notifications ALTER COLUMN id TYPE BIGINT;
              ALTER TABLE notifications ALTER COLUMN user_id TYPE BIGINT;
-             ALTER TABLE notifications ALTER COLUMN from_user_id TYPE BIGINT;"
+             ALTER TABLE notifications ALTER COLUMN from_user_id TYPE BIGINT;
+             ALTER TABLE notifications ADD COLUMN IF NOT EXISTS related_id BIGINT DEFAULT NULL;
+             ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id BIGINT DEFAULT NULL;"
         ).ok();
         Ok(())
     }
@@ -276,14 +361,15 @@ impl Database {
         let mut conn = self.pool.get()?;
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
         let now = Utc::now().to_rfc3339();
+        let username_lower = username.trim().to_lowercase();
         let rows = conn.query(
             "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
-            &[&username, &hash, &display_name, &now],
+            &[&username_lower, &hash, &display_name, &now],
         )?;
         let id: i64 = rows[0].get(0);
         Ok(User {
             id,
-            username: username.to_string(),
+            username: username_lower,
             display_name: display_name.to_string(),
             bio: String::new(),
             utc_offset: 0,
@@ -291,16 +377,23 @@ impl Database {
         })
     }
 
-    pub fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
-        let mut conn = self.pool.get()?;
+    pub fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
+        let conn = self.pool.get().map_err(|e| anyhow::anyhow!("pool.get failed: {e}"))?;
+        let mut conn = conn;
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash FROM users WHERE username = $1",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash FROM users WHERE LOWER(username) = LOWER($1)",
             &[&username],
-        )?;
+        ).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         if let Some(row) = rows.into_iter().next() {
             let hash: String = row.get(6);
-            if bcrypt::verify(password, &hash)? {
-                return Ok(Some(User {
+            if bcrypt::verify(password, &hash).map_err(|e| anyhow::anyhow!("bcrypt failed: {e}"))? {
+                let id: i64 = row.get(0);
+                let now = Utc::now().to_rfc3339();
+                conn.execute(
+                    "UPDATE users SET last_login_at = $1, login_count = login_count + 1 WHERE id = $2",
+                    &[&now, &id],
+                ).map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
+                return Ok(AuthResult::Success(User {
                     id: row.get(0),
                     username: row.get(1),
                     display_name: row.get(2),
@@ -308,9 +401,11 @@ impl Database {
                     utc_offset: row.get(4),
                     created_at: row.get::<_, String>(5).parse().unwrap(),
                 }));
+            } else {
+                return Ok(AuthResult::WrongPassword);
             }
         }
-        Ok(None)
+        Ok(AuthResult::UserNotFound)
     }
 
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
@@ -347,6 +442,12 @@ impl Database {
     }
 
     pub fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+        if content.len() > 5000 {
+            anyhow::bail!("El post es demasiado largo (máximo 5000 caracteres)");
+        }
+        if content.trim().is_empty() {
+            anyhow::bail!("El post no puede estar vacío");
+        }
         self.check_rate_limit(user_id, "post", 5, 60)?;
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
@@ -360,6 +461,32 @@ impl Database {
             "SELECT username FROM users WHERE id = $1",
             &[&user_id],
         )?.get(0);
+
+        let hashtags = Self::extract_hashtags(content);
+        for tag in &hashtags {
+            conn.execute(
+                "INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                &[&id, &tag],
+            )?;
+        }
+
+        let mentioned = Self::extract_mentions(content);
+        for mentioned_username in &mentioned {
+            let rows = conn.query(
+                "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+                &[mentioned_username],
+            )?;
+            if let Some(row) = rows.into_iter().next() {
+                let mentioned_id: i64 = row.get(0);
+                if mentioned_id != user_id {
+                    conn.execute(
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
+                        &[&mentioned_id, &user_id, &now, &id],
+                    ).ok();
+                }
+            }
+        }
+
         Ok(Post {
             id,
             user_id,
@@ -368,6 +495,106 @@ impl Database {
             image_path: image_path.map(|s| s.to_string()).filter(|s| !s.is_empty()),
             created_at: now.parse().unwrap(),
         })
+    }
+
+    pub fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        let mut conn = self.pool.get()?;
+        let tag_lower = tag.to_lowercase().trim_start_matches('#').to_string();
+        let rows = conn.query(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p
+             JOIN users u ON u.id = p.user_id
+             JOIN post_hashtags ph ON ph.post_id = p.id
+             WHERE LOWER(ph.tag) = $1
+             ORDER BY p.created_at DESC
+             LIMIT $2 OFFSET $3",
+            &[&tag_lower, &(limit as i64), &(offset as i64)],
+        )?;
+        Ok(rows.iter().map(|row| {
+            let img: String = row.get(4);
+            Post {
+                id: row.get(0),
+                user_id: row.get(1),
+                username: row.get(2),
+                content: row.get(3),
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            }
+        }).collect())
+    }
+
+    pub fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT tag, COUNT(*) as cnt FROM post_hashtags
+             GROUP BY tag
+             ORDER BY cnt DESC
+             LIMIT $1",
+            &[&(limit as i64)],
+        )?;
+        Ok(rows.iter().map(|row| {
+            (row.get(0), row.get(1))
+        }).collect())
+    }
+
+    fn extract_hashtags(content: &str) -> Vec<String> {
+        let mut tags = Vec::new();
+        let mut in_hashtag = false;
+        let mut current = String::new();
+
+        for ch in content.chars() {
+            if ch == '#' && !in_hashtag {
+                in_hashtag = true;
+                current.clear();
+            } else if in_hashtag {
+                if ch.is_alphanumeric() || ch == '_' {
+                    current.push(ch);
+                } else {
+                    if !current.is_empty() {
+                        tags.push(current.to_lowercase());
+                    }
+                    in_hashtag = false;
+                    current.clear();
+                }
+            }
+        }
+        if in_hashtag && !current.is_empty() {
+            tags.push(current.to_lowercase());
+        }
+
+        tags.sort();
+        tags.dedup();
+        tags
+    }
+
+    fn extract_mentions(content: &str) -> Vec<String> {
+        let mut mentions = Vec::new();
+        let mut in_mention = false;
+        let mut current = String::new();
+
+        for ch in content.chars() {
+            if ch == '@' && !in_mention {
+                in_mention = true;
+                current.clear();
+            } else if in_mention {
+                if ch.is_alphanumeric() || ch == '_' {
+                    current.push(ch);
+                } else {
+                    if !current.is_empty() {
+                        mentions.push(current.to_lowercase());
+                    }
+                    in_mention = false;
+                    current.clear();
+                }
+            }
+        }
+        if in_mention && !current.is_empty() {
+            mentions.push(current.to_lowercase());
+        }
+
+        mentions.sort();
+        mentions.dedup();
+        mentions
     }
 
     pub fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
@@ -505,19 +732,37 @@ impl Database {
         }).collect())
     }
 
-    pub fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
+    pub fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
         self.check_rate_limit(user_id, "comment", 10, 60)?;
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
         let rows = conn.query(
-            "INSERT INTO comments (post_id, user_id, content, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-            &[&post_id, &user_id, &content, &now],
+            "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &[&post_id, &user_id, &content, &now, &parent_id],
         )?;
         let id: i64 = rows[0].get(0);
         let username: String = conn.query_one(
             "SELECT username FROM users WHERE id = $1",
             &[&user_id],
         )?.get(0);
+
+        let mentioned = Self::extract_mentions(content);
+        for mentioned_username in &mentioned {
+            let rows = conn.query(
+                "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
+                &[mentioned_username],
+            )?;
+            if let Some(row) = rows.into_iter().next() {
+                let mentioned_id: i64 = row.get(0);
+                if mentioned_id != user_id {
+                    conn.execute(
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
+                        &[&mentioned_id, &user_id, &now, &post_id],
+                    ).ok();
+                }
+            }
+        }
+
         Ok(Comment {
             id,
             post_id,
@@ -525,13 +770,14 @@ impl Database {
             username,
             content: content.to_string(),
             created_at: now.parse().unwrap(),
+            parent_comment_id: parent_id,
         })
     }
 
     pub fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT c.id, c.post_id, c.user_id, u.username, c.content, c.created_at
+            "SELECT c.id, c.post_id, c.user_id, u.username, c.content, c.created_at, c.parent_comment_id
              FROM comments c
              JOIN users u ON u.id = c.user_id
              WHERE c.post_id = $1
@@ -545,6 +791,7 @@ impl Database {
             username: row.get(3),
             content: row.get(4),
             created_at: row.get::<_, String>(5).parse().unwrap(),
+            parent_comment_id: row.get(6),
         }).collect())
     }
 
@@ -723,12 +970,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
+    pub fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO notifications (user_id, from_user_id, type, created_at) VALUES ($1, $2, $3, $4)",
-            &[&user_id, &from_user_id, &notif_type, &now],
+            "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, $3, $4, $5)",
+            &[&user_id, &from_user_id, &notif_type, &now, &related_id],
         )?;
         Ok(())
     }
@@ -736,7 +983,7 @@ impl Database {
     pub fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read
+            "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read, n.related_id
              FROM notifications n
              JOIN users u ON u.id = n.from_user_id
              WHERE n.user_id = $1
@@ -752,6 +999,7 @@ impl Database {
             notif_type: row.get(4),
             created_at: row.get::<_, String>(5).parse().unwrap(),
             read: row.get::<_, i32>(6) != 0,
+            related_id: row.get(7),
         }).collect())
     }
 
@@ -783,19 +1031,47 @@ impl Database {
             "DELETE FROM notifications WHERE created_at::timestamptz < NOW() - make_interval(days => $1)",
             &[&days],
         )?;
-        Ok((msgs, notifs))
+        let rl = conn.execute(
+            "DELETE FROM rate_limits WHERE window_start::timestamptz < NOW() - make_interval(days => $1)",
+            &[&days],
+        )?;
+        Ok((msgs + rl, notifs))
+    }
+
+    pub fn cleanup_inactive_users(&self, inactive_days: i64) -> Result<u64> {
+        let mut conn = self.pool.get()?;
+        let deleted = conn.execute(
+            "DELETE FROM users WHERE id IN (
+                SELECT id FROM users
+                WHERE login_count = 0 AND created_at::timestamptz < NOW() - make_interval(days => $1)
+                UNION
+                SELECT id FROM users
+                WHERE login_count > 0 AND last_login_at::timestamptz < NOW() - make_interval(days => $1)
+            )",
+            &[&inactive_days],
+        )?;
+        Ok(deleted)
+    }
+
+    pub fn cleanup_rate_limits(&self) -> Result<u64> {
+        let mut conn = self.pool.get()?;
+        let deleted = conn.execute(
+            "DELETE FROM rate_limits WHERE window_start::timestamptz < NOW() - interval '1 hour'",
+            &[],
+        )?;
+        Ok(deleted)
     }
 }
 
 #[cfg(test)]
 pub(crate) mod mock_db {
     use anyhow::Result;
-    use chrono::Utc;
+use chrono::{DateTime, Utc};
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Instant;
 
-    use crate::db::DatabaseOps;
+    use crate::db::{AuthResult, DatabaseOps};
     use crate::models::{Comment, Message, Notification, Post, User};
 
     pub(crate) struct MockData {
@@ -862,7 +1138,8 @@ pub(crate) mod mock_db {
 
         fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
             let mut data = self.data.lock().unwrap();
-            if data.users.iter().any(|(u, _)| u.username == username) {
+            let username_lower = username.trim().to_lowercase();
+            if data.users.iter().any(|(u, _)| u.username == username_lower) {
                 anyhow::bail!("El usuario ya existe");
             }
             let id = data.next_id;
@@ -870,7 +1147,7 @@ pub(crate) mod mock_db {
             let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
             let user = User {
                 id,
-                username: username.to_string(),
+                username: username_lower,
                 display_name: display_name.to_string(),
                 bio: String::new(),
                 utc_offset: 0,
@@ -880,14 +1157,16 @@ pub(crate) mod mock_db {
             Ok(user)
         }
 
-        fn authenticate(&self, username: &str, password: &str) -> Result<Option<User>> {
+        fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
             let data = self.data.lock().unwrap();
-            if let Some((user, hash)) = data.users.iter().find(|(u, _)| u.username == username) {
+            if let Some((user, hash)) = data.users.iter().find(|(u, _)| u.username.to_lowercase() == username.to_lowercase()) {
                 if bcrypt::verify(password, hash)? {
-                    return Ok(Some(user.clone()));
+                    return Ok(AuthResult::Success(user.clone()));
+                } else {
+                    return Ok(AuthResult::WrongPassword);
                 }
             }
-            Ok(None)
+            Ok(AuthResult::UserNotFound)
         }
 
         fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
@@ -1011,7 +1290,7 @@ pub(crate) mod mock_db {
             Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
         }
 
-        fn add_comment(&self, post_id: i64, user_id: i64, content: &str) -> Result<Comment> {
+        fn add_comment(&self, post_id: i64, user_id: i64, content: &str, _parent_id: Option<i64>) -> Result<Comment> {
             self.check_rate_limit(user_id, "comment", 10, 60)?;
             let mut data = self.data.lock().unwrap();
             let username = data.users.iter()
@@ -1172,7 +1451,7 @@ pub(crate) mod mock_db {
             Ok(())
         }
 
-        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str) -> Result<()> {
+        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, _related_id: Option<i64>) -> Result<()> {
             let mut data = self.data.lock().unwrap();
             let from_username = data.users.iter()
                 .find(|(u, _)| u.id == from_user_id)
@@ -1222,6 +1501,38 @@ pub(crate) mod mock_db {
         fn cleanup_old_data(&self, _days: i64) -> Result<(u64, u64)> {
             Ok((0, 0))
         }
+
+        fn get_posts_by_hashtag(&self, tag: &str, _offset: u64, _limit: u64) -> Result<Vec<Post>> {
+            let data = self.data.lock().unwrap();
+            let tag_binding = tag.to_lowercase();
+            let tag_lower = tag_binding.trim_start_matches('#');
+            Ok(data.posts.iter()
+                .filter(|p| {
+                    p.content.split_whitespace()
+                        .any(|w| {
+                            let w_clean = w.to_lowercase();
+                            w_clean.trim_start_matches('#') == tag_lower
+                        })
+                })
+                .cloned()
+                .collect())
+        }
+
+        fn get_trending_hashtags(&self, _limit: u64) -> Result<Vec<(String, i64)>> {
+            let data = self.data.lock().unwrap();
+            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            for post in &data.posts {
+                for word in post.content.split_whitespace() {
+                    if word.starts_with('#') && word.len() > 1 {
+                        let tag = word[1..].to_lowercase();
+                        *counts.entry(tag).or_insert(0) += 1;
+                    }
+                }
+            }
+            let mut result: Vec<(String, i64)> = counts.into_iter().collect();
+            result.sort_by(|a, b| b.1.cmp(&a.1));
+            Ok(result)
+        }
     }
 
     #[cfg(test)]
@@ -1239,14 +1550,16 @@ pub(crate) mod mock_db {
         fn test_register_and_authenticate() {
             let db = setup();
             let user = db.authenticate("alice", "pass123").unwrap();
-            assert!(user.is_some());
-            assert_eq!(user.unwrap().username, "alice");
+            assert!(matches!(user, AuthResult::Success(_)));
+            if let AuthResult::Success(u) = user {
+                assert_eq!(u.username, "alice");
+            }
 
             let bad = db.authenticate("alice", "wrongpass").unwrap();
-            assert!(bad.is_none());
+            assert!(matches!(bad, AuthResult::WrongPassword));
 
             let nonexist = db.authenticate("charlie", "pass").unwrap();
-            assert!(nonexist.is_none());
+            assert!(matches!(nonexist, AuthResult::UserNotFound));
         }
 
         #[test]
@@ -1269,11 +1582,11 @@ pub(crate) mod mock_db {
         #[test]
         fn test_search_users() {
             let db = setup();
-            let results = db.search_users("ali").unwrap();
+            let results = db.search_users("ali", 0, 10).unwrap();
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].username, "alice");
 
-            let all = db.search_users("").unwrap();
+            let all = db.search_users("", 0, 10).unwrap();
             assert_eq!(all.len(), 2);
         }
 
@@ -1284,7 +1597,7 @@ pub(crate) mod mock_db {
             db.create_post(2, "Bob's first post", None).unwrap();
             db.follow_user(1, 2).unwrap();
 
-            let timeline = db.get_timeline(1).unwrap();
+            let timeline = db.get_timeline(1, 0, 20).unwrap();
             assert_eq!(timeline.len(), 2);
             assert!(timeline.iter().any(|p| p.content == "Hello from Alice"));
             assert!(timeline.iter().any(|p| p.content == "Bob's first post"));
@@ -1323,7 +1636,7 @@ pub(crate) mod mock_db {
             db.create_post(1, "Post 2", None).unwrap();
             db.create_post(2, "Bob post", None).unwrap();
 
-            let alice_posts = db.get_posts_by_user(1).unwrap();
+            let alice_posts = db.get_posts_by_user(1, 0, 20).unwrap();
             assert_eq!(alice_posts.len(), 2);
             assert!(alice_posts.iter().all(|p| p.user_id == 1));
         }
@@ -1332,7 +1645,7 @@ pub(crate) mod mock_db {
         fn test_comments() {
             let db = setup();
             let post = db.create_post(1, "Alice's post", None).unwrap();
-            let comment = db.add_comment(post.id, 2, "Nice!").unwrap();
+            let comment = db.add_comment(post.id, 2, "Nice!", None).unwrap();
             assert_eq!(comment.content, "Nice!");
             assert_eq!(comment.user_id, 2);
 
@@ -1346,7 +1659,7 @@ pub(crate) mod mock_db {
             let post = db.create_post(1, "Original", None).unwrap();
             db.update_post(post.id, 1, "Updated").unwrap();
 
-            let timeline = db.get_timeline(1).unwrap();
+            let timeline = db.get_timeline(1, 0, 20).unwrap();
             assert_eq!(timeline[0].content, "Updated");
         }
 
@@ -1362,10 +1675,10 @@ pub(crate) mod mock_db {
         fn test_delete_post() {
             let db = setup();
             let post = db.create_post(1, "To delete", None).unwrap();
-            db.add_comment(post.id, 2, "comment").unwrap();
+            db.add_comment(post.id, 2, "comment", None).unwrap();
             db.delete_post(post.id, 1).unwrap();
 
-            let timeline = db.get_timeline(1).unwrap();
+            let timeline = db.get_timeline(1, 0, 20).unwrap();
             assert!(timeline.is_empty());
             assert!(db.get_comments(post.id).unwrap().is_empty());
         }
@@ -1374,7 +1687,7 @@ pub(crate) mod mock_db {
         fn test_delete_comment() {
             let db = setup();
             let post = db.create_post(1, "Post", None).unwrap();
-            let comment = db.add_comment(post.id, 2, "comment").unwrap();
+            let comment = db.add_comment(post.id, 2, "comment", None).unwrap();
             db.delete_comment(comment.id, 2).unwrap();
             assert!(db.get_comments(post.id).unwrap().is_empty());
         }
@@ -1424,8 +1737,8 @@ pub(crate) mod mock_db {
         #[test]
         fn test_notifications() {
             let db = setup();
-            db.add_notification(1, 2, "follow").unwrap();
-            db.add_notification(1, 2, "like").unwrap();
+            db.add_notification(1, 2, "follow", None).unwrap();
+            db.add_notification(1, 2, "like", None).unwrap();
 
             let notifs = db.get_notifications(1, 0, 50).unwrap();
             assert_eq!(notifs.len(), 2);
@@ -1504,9 +1817,9 @@ pub(crate) mod mock_db {
         fn test_multiple_comments() {
             let db = setup();
             let post = db.create_post(1, "Post", None).unwrap();
-            db.add_comment(post.id, 2, "First").unwrap();
-            db.add_comment(post.id, 1, "Second").unwrap();
-            db.add_comment(post.id, 2, "Third").unwrap();
+            db.add_comment(post.id, 2, "First", None).unwrap();
+            db.add_comment(post.id, 1, "Second", None).unwrap();
+            db.add_comment(post.id, 2, "Third", None).unwrap();
 
             let comments = db.get_comments(post.id).unwrap();
             assert_eq!(comments.len(), 3);

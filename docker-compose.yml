@@ -4,18 +4,21 @@ services:
     container_name: agora
     restart: unless-stopped
     ports:
-      - "2222:2222"
+      - "${SSH_PORT:-2222}:${SSH_PORT:-2222}"
     volumes:
       - ./data:/data
     depends_on:
       db:
         condition: service_healthy
+      tor:
+        condition: service_started
     environment:
       - RUST_LOG=info
       - SSH_PASSWORD=${SSH_PASSWORD:-agora}
       - DATABASE_URL=postgres://social:${DB_PASSWORD:-agora}@db/social
       - LANG=${LANG:-es}
-    command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
+      - TOR_PROXY=tor:9050
+    command: ["agora", "--port", "${SSH_PORT:-2222}", "--key", "/tmp/host_key"]
 
   db:
     image: postgres:17-alpine
@@ -34,6 +37,13 @@ services:
       interval: 5s
       timeout: 5s
       retries: 5
+
+  tor:
+    image: dperson/torproxy:latest
+    container_name: agora-tor
+    restart: unless-stopped
+    ports:
+      - "9050:9050"
 
 volumes:
   pgdata:

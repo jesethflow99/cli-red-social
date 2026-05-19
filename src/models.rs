@@ -29,6 +29,7 @@ pub struct Comment {
     pub username: String,
     pub content: String,
     pub created_at: DateTime<Utc>,
+    pub parent_comment_id: Option<i64>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -46,6 +47,8 @@ pub enum Screen {
     Notifications,
     PostSearch,
     PostSearchFilter,
+    HashtagView,
+    HashtagTrending,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +71,7 @@ pub struct Notification {
     pub notif_type: String,
     pub created_at: DateTime<Utc>,
     pub read: bool,
+    pub related_id: Option<i64>,
 }
 
 #[cfg(test)]
@@ -132,6 +136,7 @@ mod tests {
             username: "commenter".into(),
             content: "Nice post!".into(),
             created_at: make_date(),
+            parent_comment_id: None,
         };
         assert_eq!(comment.content, "Nice post!");
         assert_eq!(comment.post_id, 1);
@@ -162,6 +167,7 @@ mod tests {
             notif_type: "follow".into(),
             created_at: make_date(),
             read: false,
+            related_id: None,
         };
         assert_eq!(notif.notif_type, "follow");
         assert!(!notif.read);

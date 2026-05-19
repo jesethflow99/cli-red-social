@@ -8,6 +8,7 @@ ratatui = { version = "0.29", features = ["crossterm"] }
 crossterm = "0.28"
 russh = "0.46"
 russh-keys = "0.46"
+russh-sftp = "2.1"
 r2d2 = "0.8"
 r2d2_postgres = "0.18"
 postgres = "0.19"
@@ -23,3 +24,6 @@ futures = "0.3"
 nix = { version = "0.29", features = ["fs", "term", "process", "ioctl"] }
 clap = { version = "4", features = ["derive"] }
 reqwest = { version = "0.12", features = ["blocking"] }
+base64 = "0.22"
+curl = { version = "0.4" }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
