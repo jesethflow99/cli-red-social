@@ -242,7 +242,7 @@ pub static ES: LangStrings = LangStrings {
 
     create_post_title: " Nuevo Post ",
     create_post_url_title: " Pegar URL de imagen ",
-    create_post_help: "Enter: publicar   Ctrl+U: imagen desde URL   Esc: cancelar",
+    create_post_help: "Enter: publicar   u: subir imagen   Ctrl+U: desde URL   Esc: cancelar",
     create_post_help_url: "Enter: adjuntar imagen desde URL   Esc: cancelar",
     create_post_published: "Post publicado",
     create_post_published_img: "Post con imagen publicado",
@@ -376,7 +376,7 @@ pub static EN: LangStrings = LangStrings {
 
     create_post_title: " New Post ",
     create_post_url_title: " Paste image URL ",
-    create_post_help: "Enter: publish   Ctrl+U: image from URL   Esc: cancel",
+    create_post_help: "Enter: publish   u: upload image   Ctrl+U: from URL   Esc: cancel",
     create_post_help_url: "Enter: attach image from URL   Esc: cancel",
     create_post_published: "Post published",
     create_post_published_img: "Post with image published",

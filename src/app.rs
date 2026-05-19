@@ -2738,7 +2738,8 @@ impl App {
                 .split(area);
 
             let ago = i18n::ago(self.lang, &post.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-            let header = Paragraph::new(format!("@{}  [{}]", post.username, ago))
+            let img_indicator = if Self::post_has_image(post) { "  \u{1f4f7}" } else { "" };
+            let header = Paragraph::new(format!("@{}  [{}]{}", post.username, ago, img_indicator))
                 .style(self.theme.header_style)
                 .block(self.theme.simple_block());
             f.render_widget(header, chunks[0]);
