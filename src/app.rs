@@ -2202,12 +2202,14 @@ impl App {
                             }
                             "mention" => {
                                 if let Some(post_id) = notif.related_id {
-                                    self.viewed_post = None;
-                                    self.post_comments.clear();
-                                    self.comment_list_state = ListState::default();
-                                    self.edit_mode = false;
-                                    self.comment_input.clear();
-                                    self.screen = Screen::PostDetail(post_id);
+                                    if let Ok(Some(post)) = self.db.get_post_by_id(post_id) {
+                                        self.viewed_post = Some(post);
+                                        let _ = self.refresh_comments(post_id);
+                                        self.comment_list_state = ListState::default();
+                                        self.edit_mode = false;
+                                        self.comment_input.clear();
+                                        self.screen = Screen::PostDetail(post_id);
+                                    }
                                 }
                             }
                             _ => {}

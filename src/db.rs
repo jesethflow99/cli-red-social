@@ -31,6 +31,7 @@ pub trait DatabaseOps: Send {
     fn get_followers(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_following(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>>;
+    fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>>;
     fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment>;
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>>;
     fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()>;
@@ -94,6 +95,9 @@ impl DatabaseOps for Database {
     }
     fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
         Database::get_posts_by_user(self, user_id, offset, limit)
+    }
+    fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
+        Database::get_post_by_id(self, post_id)
     }
     fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
         Database::add_comment(self, post_id, user_id, content, parent_id)
@@ -732,6 +736,25 @@ impl Database {
         }).collect())
     }
 
+    pub fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1",
+            &[&post_id],
+        )?;
+        Ok(rows.iter().next().map(|row| Post {
+            id: row.get(0),
+            user_id: row.get(1),
+            username: row.get(2),
+            content: row.get(3),
+            image_path: if let Some(img) = row.get::<_, Option<String>>(4) {
+                if img.is_empty() { None } else { Some(img) }
+            } else { None },
+            created_at: row.get::<_, String>(5).parse().unwrap(),
+        }))
+    }
+
     pub fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
         self.check_rate_limit(user_id, "comment", 10, 60)?;
         let mut conn = self.pool.get()?;
@@ -1255,7 +1278,12 @@ use chrono::{DateTime, Utc};
                 .collect())
         }
 
-        fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
+    fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.posts.iter().find(|p| p.id == post_id).cloned())
+        }
+
+    fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let mut posts: Vec<Post> = data.posts.iter()
                 .filter(|p| p.user_id == user_id)
