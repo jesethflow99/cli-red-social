@@ -23,6 +23,9 @@ struct Cli {
 
     #[arg(long, default_value = "host_key")]
     key: String,
+
+    #[arg(long)]
+    seed: bool,
 }
 
 fn main() -> Result<()> {
@@ -36,6 +39,13 @@ fn main() -> Result<()> {
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
     let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
+
+    if cli.seed {
+        let database = db::Database::new(&db_url)?;
+        database.seed_data()?;
+        println!("Datos de ejemplo insertados.");
+        return Ok(());
+    }
 
     if cli.tui {
         app::run_tui(&db_url)?;

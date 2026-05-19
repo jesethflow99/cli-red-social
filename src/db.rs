@@ -1138,6 +1138,153 @@ impl Database {
         )?;
         Ok(deleted)
     }
+
+    pub fn seed_data(&self) -> Result<()> {
+        let mut conn = self.pool.get()?;
+        // Only seed if no users exist
+        let count: i64 = conn.query_one("SELECT COUNT(*) FROM users", &[])?.get(0);
+        if count > 0 {
+            println!("DB already has {} users, skipping seed.", count);
+            return Ok(());
+        }
+
+        let now = chrono::Utc::now();
+        let ago = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();
+
+        // Users
+        let users = [
+            ("alice",   "password123", "Alice Rodríguez"),
+            ("bob",     "password123", "Bob Martínez"),
+            ("carol",   "password123", "Carolina López"),
+            ("dave",    "password123", "David Chen"),
+            ("eve",     "password123", "Eva García"),
+        ];
+        for (u, p, d) in &users {
+            let hash = bcrypt::hash(p, bcrypt::DEFAULT_COST)?;
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, created_at) VALUES ($1, $2, $3, $4)",
+                &[&u.to_string(), &hash, &d.to_string(), &ago(60*24*7)],
+            )?;
+        }
+
+        // Follows
+        for (a, b) in [(1,2),(1,3),(1,5),(2,1),(2,3),(3,1),(3,2),(3,4),(4,1),(4,3),(5,1),(5,2),(5,4)] {
+            conn.execute("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2)", &[&a, &b]).ok();
+        }
+
+        // Posts with hashtags and mentions
+        let posts = [
+            (1, "¡Hola #redsocial! Este es mi primer post. ¿Alguien más por aquí?", ago(60*24*3)),
+            (2, "Acabo de terminar un proyecto en #rust. Muy contento con el resultado.", ago(60*24*2)),
+            (3, "Buenos días #gente. ¿Qué están escuchando hoy? #música", ago(60*24*2 + 60)),
+            (1, "@bob @carol ¿han visto la nueva película de #scifi? Es increíble.", ago(60*24)),
+            (4, "Trabajando en una app con #ratatui y #rust. El TUI quedó espectacular.", ago(60*23)),
+            (5, "Hoy aprendí sobre sistemas distribuidos. #tech #aprendizaje", ago(60*12)),
+            (2, "Comparto mi configuración de #neovim. ¿Alguien quiere ver screenshots?", ago(60*8)),
+            (3, "@alice gracias por la recomendación de la peli. #scifi", ago(60*6)),
+            (1, "Reflexión del día: el software libre cambia vidas. #opensource #filosofía", ago(60*4)),
+            (5, "¿Cuál es su lenguaje de programación favorito? El mío está entre #rust y #python.", ago(60*2)),
+            (4, "Terminé el MVP de mi proyecto. Ahora viene lo difícil: conseguir usuarios. #startup", ago(60)),
+            (2, "@dave felicitaciones por el MVP! Conozco gente que podría interesarse. #networking", ago(30)),
+            (3, "Nadie: ...  Yo: recompilando el kernel a las 3am #linux #nightowl", ago(15)),
+            (1, "@eve yo también prefiero #rust. La seguridad de tipos es adictiva.", ago(5)),
+        ];
+
+        let mut post_ids = Vec::new();
+        for (uid, content, created) in &posts {
+            let rows = conn.query(
+                "INSERT INTO posts (user_id, content, created_at) VALUES ($1, $2, $3) RETURNING id",
+                &[&uid, &content.to_string(), &created],
+            )?;
+            let pid: i64 = rows[0].get(0);
+            post_ids.push(pid);
+
+            // Extract hashtags
+            for word in content.split_whitespace() {
+                if word.starts_with('#') {
+                    let tag = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '#' && c != '_');
+                    let tag = tag.trim_start_matches('#').to_lowercase();
+                    if !tag.is_empty() {
+                        conn.execute("INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                            &[&pid, &tag]).ok();
+                    }
+                }
+            }
+
+            // Create mention notifications
+            for word in content.split_whitespace() {
+                if word.starts_with('@') {
+                    let uname = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@' && c != '_');
+                    let uname = uname.trim_start_matches('@').to_lowercase();
+                    if let Ok(row) = conn.query_opt("SELECT id FROM users WHERE LOWER(username) = $1", &[&uname]) {
+                        if let Some(r) = row {
+                            let muid: i64 = r.get(0);
+                            if muid != *uid {
+                                conn.execute(
+                                    "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
+                                    &[&muid, &uid, &created, &pid],
+                                ).ok();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Comments (some nested)
+        let comments = [
+            (post_ids[0], 2, "¡Bienvenida @alice! #redsocial", None),
+            (post_ids[0], 3, "Hola Alice, yo también soy nueva.", None),
+            (post_ids[1], 1, "¡Felicidades @bob! Me encantaría ver el código. #rust", None),
+            (post_ids[1], 3, "¿Usaste algún framework?", None),
+            (post_ids[1], 2, "@carol usé tokio y ratatui. Te paso el repo.", Some(4)), // nested reply
+            (post_ids[3], 2, "Sí, la vi. Los efectos especiales son brutales.", None),
+            (post_ids[3], 5, "A mí no me gustó tanto, prefiero los libros.", None),
+            (post_ids[6], 1, "¡Sí! Pasa los screenshots. #neovim", None),
+            (post_ids[8], 3, "Totalmente de acuerdo. Yo contribuyo a proyectos #opensource.", None),
+            (post_ids[8], 4, "El open source cambió mi carrera.", None),
+            (post_ids[11], 4, "¡Gracias @bob! Te escribo por DM.", None),
+            (post_ids[13], 5, "Jaja, el borrow checker es nuestro amigo.", None),
+        ];
+        for (post_id, user_id, content, parent_id) in &comments {
+            let rows = conn.query(
+                "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+                &[&post_id, &user_id, &content.to_string(), &ago(60*24 - 30), &parent_id],
+            ).ok();
+        }
+
+        // Messages
+        let messages = [
+            (1, 2, "¡Hola Bob! Me encantaron tus posts de Rust.", ago(60*5)),
+            (2, 1, "¡Gracias Alice! Si necesitas ayuda avísame.", ago(60*4)),
+            (1, 2, "¿Me podrías revisar un PR?", ago(60*3)),
+            (2, 1, "Claro, pásame el link.", ago(60*2)),
+            (3, 4, "Dave, ¿cómo va el MVP?", ago(60*2)),
+            (4, 3, "Va bien! Ya casi termino el frontend.", ago(60)),
+            (4, 1, "Alice, tú que sabes de diseño, ¿me ayudas con la UI?", ago(55)),
+            (1, 4, "Sí, mándame mockups y te doy feedback.", ago(50)),
+            (5, 1, "@alice coincido contigo, Rust es el futuro.", ago(40)),
+            (1, 5, "Eve, ¿has probado los traits async? Son una maravilla.", ago(30)),
+        ];
+        for (sender, receiver, content, created) in &messages {
+            conn.execute(
+                "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4)",
+                &[&sender, &receiver, &content.to_string(), &created],
+            ).ok();
+        }
+
+        // Follow notifications
+        for (follower, followed) in [(1,2),(1,3),(2,1),(3,1),(4,1),(5,1)] {
+            conn.execute(
+                "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'follow', $3, $4)",
+                &[&followed, &follower, &ago(60*24*2), &follower],
+            ).ok();
+        }
+
+        println!("Seed completado: {} usuarios, {} posts, {} comentarios, {} mensajes.",
+            users.len(), posts.len(), comments.len(), messages.len());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
