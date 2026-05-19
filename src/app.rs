@@ -942,11 +942,10 @@ impl App {
         let place = format!("{}x{}@{}x{}", img_w, img_h, x, y);
         let img_w_s = img_w.to_string();
         let img_h_s = img_h.to_string();
-        let chafa_size = format!("{}x{}", img_w / 2, img_h);
 
         let viewers: [(&str, &[&str]); 4] = [
             ("kitten", &["icat", "--place", &place, path]),
-            ("chafa", &["--symbols", "block", "--size", &chafa_size, path]),
+            ("chafa", &["--symbols", "block", path]),
             ("fim", &["-a", "-q", "-W", &img_w_s, "-H", &img_h_s, path]),
             ("viu", &["-w", &img_w_s, "-h", &img_h_s, path]),
         ];
