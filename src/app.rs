@@ -1443,7 +1443,7 @@ impl App {
     }
 
     fn render_post_search(&self, f: &mut Frame, area: Rect) {
-        const FILTERS: [&str; 5] = ["@usuario", "tema", "24h", "7d", "30d"];
+        const FILTERS: [&str; 3] = ["@usuario", "tema", "fecha"];
         let filter_label = FILTERS[self.post_search_filter_idx];
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -1816,7 +1816,7 @@ impl App {
     }
 
     fn handle_post_search_key(&mut self, key: event::KeyEvent) -> Result<bool> {
-        const FILTERS: [&str; 5] = ["@usuario", "tema", "24h", "7d", "30d"];
+        const FILTERS: [&str; 3] = ["@usuario", "tema", "fecha"];
         match key.code {
             KeyCode::Esc => {
                 self.screen = Screen::Timeline;
@@ -1826,7 +1826,7 @@ impl App {
                 self.post_search_results.clear();
             }
             KeyCode::Tab => {
-                self.post_search_filter_idx = (self.post_search_filter_idx + 1) % 5;
+                self.post_search_filter_idx = (self.post_search_filter_idx + 1) % 3;
                 self.post_search_results.clear();
                 self.set_status(format!("Filtro: {}", FILTERS[self.post_search_filter_idx]));
             }
@@ -1884,14 +1884,10 @@ impl App {
         if query.is_empty() { return Ok(()); }
         let offset = self.page as u64 * self.page_size as u64;
         let limit = self.page_size as u64;
-        let time_filters = ["all", "24h", "7d", "30d"];
         self.post_search_results = match self.post_search_filter_idx {
             0 => self.db.search_posts_by_user(&query, offset, limit)?,
             1 => self.db.search_posts(&query, "all", offset, limit)?,
-            _ => {
-                let tf = time_filters[self.post_search_filter_idx - 1];
-                self.db.search_posts(&query, tf, offset, limit)?
-            }
+            _ => self.db.search_posts_by_date(&query, offset, limit)?,
         };
         self.list_state.select(Some(0));
         Ok(())

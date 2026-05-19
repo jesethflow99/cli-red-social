@@ -51,6 +51,7 @@ pub trait DatabaseOps: Send {
     fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
     fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
+    fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
     fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
@@ -156,6 +157,9 @@ impl DatabaseOps for Database {
     }
     fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
         Database::search_posts_by_user(self, query, offset, limit)
+    }
+    fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        Database::search_posts_by_date(self, query, offset, limit)
     }
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
         Database::check_rate_limit(self, user_id, action, max, window_secs)
@@ -763,6 +767,29 @@ impl Database {
         }).collect())
     }
 
+    pub fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        let mut conn = self.pool.get()?;
+        let pattern = format!("%{}%", query);
+        let rows = conn.query(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p JOIN users u ON u.id = p.user_id
+             WHERE p.created_at ILIKE $1
+             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
+            &[&pattern, &(limit as i64), &(offset as i64)],
+        )?;
+        Ok(rows.iter().map(|row| {
+            let img: String = row.get(4);
+            Post {
+                id: row.get(0),
+                user_id: row.get(1),
+                username: row.get(2),
+                content: row.get(3),
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            }
+        }).collect())
+    }
+
     pub fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
@@ -1350,6 +1377,16 @@ use chrono::{DateTime, Utc};
             let q = query.to_lowercase();
             let mut posts: Vec<Post> = data.posts.iter()
                 .filter(|p| p.username.to_lowercase().contains(&q))
+                .cloned().collect();
+            posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            Ok(posts)
+        }
+
+        fn search_posts_by_date(&self, query: &str, _offset: u64, _limit: u64) -> Result<Vec<Post>> {
+            let data = self.data.lock().unwrap();
+            let q = query.to_lowercase();
+            let mut posts: Vec<Post> = data.posts.iter()
+                .filter(|p| p.created_at.to_rfc3339().to_lowercase().contains(&q))
                 .cloned().collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             Ok(posts)
