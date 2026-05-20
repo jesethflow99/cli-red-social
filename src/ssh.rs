@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use image::GenericImageView;
 use nix::pty::{forkpty, ForkptyResult};
 use nix::sys::wait::waitpid;
-use nix::unistd::{close, write};
+use nix::unistd::{write};
 use russh::keys::key::KeyPair;
 use russh::keys::load_secret_key;
 use russh::server::*;
@@ -21,9 +21,64 @@ use russh_sftp::protocol::{
 
 use crate::db::Database;
 
-const UPLOAD_DIR: &str = "/data/uploads";
+pub fn upload_dir() -> &'static str {
+    use std::sync::LazyLock;
+    static DIR: LazyLock<String> = LazyLock::new(|| {
+        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR") {
+            if !d.is_empty() { return d; }
+        }
+        if std::path::Path::new("/data").exists() {
+            "/data/uploads".into()
+        } else {
+            "./uploads".into()
+        }
+    });
+    DIR.as_str()
+}
+
 const MAX_IMAGE_SIZE: u64 = 10 * 1024 * 1024; // 10MB
 const MAX_IMAGE_DIM: u32 = 512;
+const SCP_LOCK_DIR: &str = "/tmp/agora_scp";
+
+fn read_scp_user_for_token(token: &str) -> Option<String> {
+    let path = format!("{}/{}", SCP_LOCK_DIR, token);
+    let content = std::fs::read_to_string(&path).ok()?;
+    let (username, ts_str) = content.split_once('\n')?;
+    let ts: u64 = ts_str.trim().parse().ok()?;
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    // Lock expires after 5 minutes of inactivity
+    if now - ts > 300 {
+        let _ = std::fs::remove_file(&path);
+        return None;
+    }
+    Some(username.trim().to_string())
+}
+
+pub fn write_scp_user_for_token(token: &str, username: &str) {
+    let _ = std::fs::create_dir_all(SCP_LOCK_DIR);
+    let path = format!("{}/{}", SCP_LOCK_DIR, token);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let content = format!("{}\n{}", username, now);
+    let _ = std::fs::write(&path, content);
+}
+
+pub fn clear_scp_user_for_token(token: &str) {
+    let path = format!("{}/{}", SCP_LOCK_DIR, token);
+    let _ = std::fs::remove_file(&path);
+}
+
+fn generate_session_token() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let pid = std::process::id();
+    format!("{:x}", ts.wrapping_mul(pid as u128))
+}
 
 struct OpenFile {
     path: std::path::PathBuf,
@@ -38,6 +93,9 @@ struct SftpSession {
     open_dirs: HashMap<String, std::path::PathBuf>,
     handle_counter: AtomicU64,
     root_dir_read_done: bool,
+    allowed_user: String,
+    client_ip: Option<String>,
+    session_token: String,
 }
 
 impl SftpSession {
@@ -54,29 +112,74 @@ impl SftpSession {
             language_tag: "en-US".to_string(),
         }
     }
+
+    fn user_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        // SCP is a separate SSH connection from TUI. Use client IP as lock key
+        // (shared between TUI and SCP connections from same machine)
+        let ip = match &self.client_ip {
+            Some(ip) => ip.clone(),
+            None => {
+                tracing::info!("SCP blocked: no client IP");
+                return None;
+            }
+        };
+        let allowed = read_scp_user_for_token(&ip);
+        let user = match allowed {
+            Some(u) => u,
+            None => {
+                tracing::info!("SCP blocked: no Agora user for IP {}", ip);
+                return None;
+            }
+        };
+        sanitize_path_for_user(path, &user)
+    }
 }
 
 fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
+    sanitize_path_for_user(path, "")
+}
+
+fn sanitize_path_for_user(path: &str, user: &str) -> Option<std::path::PathBuf> {
     let path = path.trim_start_matches('/');
+    let upload_base = std::path::PathBuf::from(upload_dir());
+
     if path.is_empty() || path == "." {
-        return Some(std::path::PathBuf::from(UPLOAD_DIR));
+        let _ = std::fs::create_dir_all(&upload_base);
+        return Some(upload_base);
     }
-    let full = std::path::PathBuf::from(UPLOAD_DIR).join(path);
-    tracing::debug!("sanitize_path: path={}, full={}", path, full.display());
-    if full.exists() {
-        let canonical = full.canonicalize().ok()?;
-        return if canonical.starts_with(UPLOAD_DIR) { Some(canonical) } else { None };
-    }
-    if let Some(parent) = full.parent() {
-        tracing::debug!("sanitize_path: parent={}, exists={}", parent.display(), parent.exists());
-        let _ = std::fs::create_dir_all(parent);
-        if parent.exists() {
-            let parent_canon = parent.canonicalize().ok()?;
-            tracing::debug!("sanitize_path: parent_canon={}", parent_canon.display());
-            return if parent_canon.starts_with(UPLOAD_DIR) { Some(full) } else { None };
+
+    // Extract the first path component as the target user dir
+    // "jeseth/sprite.png" -> user_dir="jeseth", relative="sprite.png"
+    let (user_dir, relative) = if let Some((first, rest)) = path.split_once('/') {
+        // If a specific user is required, reject mismatch
+        if !user.is_empty() && first != user {
+            tracing::info!("SCP rejected: path user '{}' != session user '{}'", first, user);
+            return None;
         }
+        (first, rest)
+    } else {
+        // Single filename - use session user, else "anonymous"
+        (if user.is_empty() { "anonymous" } else { user }, path)
+    };
+
+    let base = upload_base.join(user_dir);
+    let full = base.join(relative);
+
+    let _ = std::fs::create_dir_all(full.parent()?);
+
+    let base_resolved = base.canonicalize().ok()?;
+    let full_resolved = full.canonicalize().unwrap_or_else(|_| {
+        full.parent()
+            .and_then(|p| p.canonicalize().ok())
+            .map(|p| p.join(full.file_name().unwrap_or_default()))
+            .unwrap_or_else(|| full.clone())
+    });
+
+    if full_resolved.starts_with(&base_resolved) {
+        return Some(full);
     }
-    tracing::warn!("sanitize_path: returning None for {}", path);
+
+    tracing::warn!("path escape attempt: {} not in {}", full.display(), base.display());
     None
 }
 
@@ -91,16 +194,18 @@ fn process_image(path: &std::path::Path) {
     };
 
     let (w, h) = img.dimensions();
-    if w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM {
-        return;
-    }
-
-    let ratio = (MAX_IMAGE_DIM as f32) / (w.max(h) as f32);
-    let new_w = (w as f32 * ratio).round() as u32;
-    let new_h = (h as f32 * ratio).round() as u32;
+    let (new_w, new_h) = if w <= MAX_IMAGE_DIM && h <= MAX_IMAGE_DIM {
+        (w, h)
+    } else {
+        let ratio = (MAX_IMAGE_DIM as f32) / (w.max(h) as f32);
+        let nw = (w as f32 * ratio).round() as u32;
+        let nh = (h as f32 * ratio).round() as u32;
+        (nw, nh)
+    };
 
     let resized = img.resize(new_w, new_h, image::imageops::FilterType::Lanczos3);
 
+    // Always save as JPEG (strips metadata, smallest size, chafa compatible)
     let jpeg_path = path.with_extension("jpg");
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
@@ -115,7 +220,7 @@ fn process_image(path: &std::path::Path) {
 }
 
 pub fn list_uploaded_images(username: &str) -> Vec<(String, String)> {
-    let user_dir = format!("{}/{}", UPLOAD_DIR, username);
+    let user_dir = format!("{}/{}", upload_dir(), username);
     let _ = std::fs::create_dir_all(&user_dir);
     let mut images = Vec::new();
     if let Ok(entries) = std::fs::read_dir(&user_dir) {
@@ -167,9 +272,10 @@ impl russh_sftp::server::Handler for SftpSession {
         pflags: OpenFlags,
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
-        let _ = std::fs::create_dir_all(UPLOAD_DIR);
+        let _ = std::fs::create_dir_all(upload_dir());
 
-        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+        let write = pflags.contains(OpenFlags::WRITE);
 
         let write = pflags.contains(OpenFlags::WRITE);
         let read = pflags.contains(OpenFlags::READ);
@@ -253,7 +359,7 @@ impl russh_sftp::server::Handler for SftpSession {
         id: u32,
         path: String,
     ) -> Result<Attrs, Self::Error> {
-        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
         Ok(Attrs {
             id,
@@ -275,12 +381,30 @@ impl russh_sftp::server::Handler for SftpSession {
         })
     }
 
+    async fn setstat(
+        &mut self,
+        id: u32,
+        _path: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        Ok(Self::status_ok(id))
+    }
+
+    async fn fsetstat(
+        &mut self,
+        id: u32,
+        _handle: String,
+        _attrs: FileAttributes,
+    ) -> Result<Status, Self::Error> {
+        Ok(Self::status_ok(id))
+    }
+
     async fn opendir(
         &mut self,
         id: u32,
         path: String,
     ) -> Result<Handle, Self::Error> {
-        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let _ = std::fs::read_dir(&p).map_err(|_| StatusCode::NoSuchFile)?;
 
         let handle = self.next_handle();
@@ -319,7 +443,7 @@ impl russh_sftp::server::Handler for SftpSession {
         id: u32,
         filename: String,
     ) -> Result<Status, Self::Error> {
-        let p = sanitize_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?;
         std::fs::remove_file(&p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -330,7 +454,7 @@ impl russh_sftp::server::Handler for SftpSession {
         path: String,
         _attrs: FileAttributes,
     ) -> Result<Status, Self::Error> {
-        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         std::fs::create_dir(&p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -340,7 +464,7 @@ impl russh_sftp::server::Handler for SftpSession {
         id: u32,
         path: String,
     ) -> Result<Status, Self::Error> {
-        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         std::fs::remove_dir(&p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -350,7 +474,7 @@ impl russh_sftp::server::Handler for SftpSession {
         id: u32,
         path: String,
     ) -> Result<Name, Self::Error> {
-        let p = sanitize_path(&path).unwrap_or_else(|| std::path::PathBuf::from(UPLOAD_DIR));
+        let p = self.user_path(&path).unwrap_or_else(|| std::path::PathBuf::from(upload_dir()));
         Ok(Name {
             id,
             files: vec![File::dummy(p.to_string_lossy().to_string())],
@@ -362,7 +486,7 @@ impl russh_sftp::server::Handler for SftpSession {
         id: u32,
         path: String,
     ) -> Result<Attrs, Self::Error> {
-        let p = sanitize_path(&path).ok_or(StatusCode::PermissionDenied)?;
+        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
         Ok(Attrs {
             id,
@@ -376,8 +500,8 @@ impl russh_sftp::server::Handler for SftpSession {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        let old_p = sanitize_path(&oldpath).ok_or(StatusCode::PermissionDenied)?;
-        let new_p = sanitize_path(&newpath).ok_or(StatusCode::PermissionDenied)?;
+        let old_p = self.user_path(&oldpath).ok_or(StatusCode::PermissionDenied)?;
+        let new_p = self.user_path(&newpath).ok_or(StatusCode::PermissionDenied)?;
         std::fs::rename(&old_p, &new_p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -443,7 +567,8 @@ impl SshServer {
 impl Server for SshServer {
     type Handler = SshSession;
 
-    fn new_client(&mut self, _: Option<std::net::SocketAddr>) -> SshSession {
+    fn new_client(&mut self, peer: Option<std::net::SocketAddr>) -> SshSession {
+        let client_ip = peer.map(|a| a.ip().to_string());
         SshSession {
             authed: false,
             input_tx: None,
@@ -456,6 +581,9 @@ impl Server for SshServer {
             ws_xpixel: 0,
             ws_ypixel: 0,
             ssh_password: self.ssh_password.clone(),
+            ssh_user: String::new(),
+            client_ip,
+            session_token: generate_session_token(),
             clients: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -473,6 +601,9 @@ pub struct SshSession {
     ws_xpixel: u32,
     ws_ypixel: u32,
     ssh_password: String,
+    ssh_user: String,
+    client_ip: Option<String>,
+    session_token: String,
     clients: Arc<Mutex<HashMap<ChannelId, Channel<Msg>>>>,
 }
 
@@ -480,9 +611,10 @@ pub struct SshSession {
 impl Handler for SshSession {
     type Error = anyhow::Error;
 
-    async fn auth_password(&mut self, _user: &str, password: &str) -> Result<Auth, Self::Error> {
+    async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
         if self.ssh_password.is_empty() || password == self.ssh_password {
             self.authed = true;
+            self.ssh_user = user.to_string();
             Ok(Auth::Accept)
         } else {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
@@ -539,6 +671,9 @@ impl Handler for SshSession {
 
         let master_fd = self.master_fd.clone();
         let db_conn = self.db_conn.clone();
+        let client_ip = self.client_ip.clone();
+        let session_token = self.session_token.clone();
+        let ssh_user = std::mem::take(&mut self.ssh_user);
         let ws_col = self.ws_col;
         let ws_row = self.ws_row;
         let ws_xpixel = self.ws_xpixel;
@@ -550,6 +685,13 @@ impl Handler for SshSession {
             match fork_result {
                 ForkptyResult::Child => {
                     drop(handle);
+                    if let Some(ref ip) = client_ip {
+                        unsafe { std::env::set_var("SSH_CLIENT_IP", ip) };
+                    }
+                    unsafe { std::env::set_var("SSH_SESSION_TOKEN", &session_token) };
+                    if !ssh_user.is_empty() {
+                        unsafe { std::env::set_var("SSH_USER", &ssh_user) };
+                    }
                     let _ = std::panic::catch_unwind(|| {
                         if let Err(e) = crate::app::run_tui(&db_conn) {
                             eprintln!("Error iniciando TUI: {e}");
@@ -611,7 +753,7 @@ impl Handler for SshSession {
 
                     *master_fd.lock().unwrap() = None;
                     let _ = waitpid(child, None);
-                    let _ = close(fd);
+                    // master (PtyMaster) closes fd on drop
                     let _ = futures::executor::block_on(handle.close(channel_id));
                 }
             }
@@ -689,7 +831,13 @@ impl Handler for SshSession {
                 let mut clients = self.clients.lock().unwrap();
                 clients.remove(&channel_id).unwrap()
             };
-            let sftp = SftpSession::default();
+            let user = self.ssh_user.clone();
+            let token = self.session_token.clone();
+            let ip = self.client_ip.clone();
+            let mut sftp = SftpSession::default();
+            sftp.allowed_user = user;
+            sftp.session_token = token;
+            sftp.client_ip = ip;
             session.channel_success(channel_id);
             russh_sftp::server::run(channel.into_stream(), sftp).await;
         } else {

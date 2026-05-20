@@ -209,6 +209,12 @@ pub struct LangStrings {
     pub status_bar_edit: &'static str,
     pub status_bar_notifications: &'static str,
     pub status_bar_post_search: &'static str,
+    pub status_bar_radio: &'static str,
+
+    pub radio_title: &'static str,
+    pub radio_loading: &'static str,
+    pub radio_no_tags: &'static str,
+    pub radio_help: &'static str,
 
     pub follow_notif: &'static str,
     pub mention_notif: &'static str,
@@ -236,13 +242,13 @@ pub static ES: LangStrings = LangStrings {
     register_error_exists: "El usuario '@{}' ya existe",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navegar   Enter: ver   /: buscar   #: trending   n: nuevo post   s: buscar usuarios   p: perfil   m: mensajes   Ctrl+n: notifs   i: imagen   q: salir",
+    timeline_help: "j/k: navegar  Enter: ver  /: buscar  #: trends  n: post  s: users  p: perfil  m: msgs  Ctrl+n: notif  i: img  q: salir",
     timeline_no_posts: "No hay posts en tu timeline",
     timeline_page: "Página {} — {} posts",
 
     create_post_title: " Nuevo Post ",
     create_post_url_title: " Pegar URL de imagen ",
-    create_post_help: "Enter: publicar   u: subir imagen   Ctrl+U: desde URL   Esc: cancelar",
+    create_post_help: "Enter: publicar   Ctrl+U: subir imagen   Ctrl+L: desde URL   Esc: cancelar",
     create_post_help_url: "Enter: adjuntar imagen desde URL   Esc: cancelar",
     create_post_published: "Post publicado",
     create_post_published_img: "Post con imagen publicado",
@@ -345,6 +351,12 @@ pub static ES: LangStrings = LangStrings {
     status_bar_edit: "Editar Perfil",
     status_bar_notifications: "Notificaciones",
     status_bar_post_search: "Buscar Posts",
+    status_bar_radio: "Radio",
+
+    radio_title: "📻 Radio — #{} ({} posts)",
+    radio_loading: "Cargando hashtags...",
+    radio_no_tags: "No hay hashtags aún. Publica con #tema para poblar la radio.",
+    radio_help: "Enter: ver post  |  r: pausar/reanudar  |  n: siguiente  |  b: salir",
 
     follow_notif: "@{} te ha seguido",
     mention_notif: "@{} te mencionó",
@@ -370,13 +382,13 @@ pub static EN: LangStrings = LangStrings {
     register_error_exists: "User '@{}' already exists",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navigate   Enter: view   /: search   #: trending   n: new post   s: search users   p: profile   m: messages   Ctrl+n: notifs   i: image   q: quit",
+    timeline_help: "j/k: navigate  Enter: view  /: search  #: trends  n: post  s: users  p: profile  m: msgs  Ctrl+n: notif  i: img  q: quit",
     timeline_no_posts: "No posts in your timeline",
     timeline_page: "Page {} — {} posts",
 
     create_post_title: " New Post ",
     create_post_url_title: " Paste image URL ",
-    create_post_help: "Enter: publish   u: upload image   Ctrl+U: from URL   Esc: cancel",
+    create_post_help: "Enter: publish   Ctrl+U: upload image   Ctrl+L: from URL   Esc: cancel",
     create_post_help_url: "Enter: attach image from URL   Esc: cancel",
     create_post_published: "Post published",
     create_post_published_img: "Post with image published",
@@ -479,6 +491,12 @@ pub static EN: LangStrings = LangStrings {
     status_bar_edit: "Edit Profile",
     status_bar_notifications: "Notifications",
     status_bar_post_search: "Search Posts",
+    status_bar_radio: "Radio",
+
+    radio_title: "📻 Radio — #{} ({} posts)",
+    radio_loading: "Loading hashtags...",
+    radio_no_tags: "No hashtags yet. Post with #topic to populate the radio.",
+    radio_help: "Enter: view post  |  r: pause/resume  |  n: next  |  b: back",
 
     follow_notif: "@{} followed you",
     mention_notif: "@{} mentioned you",

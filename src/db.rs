@@ -54,8 +54,11 @@ pub trait DatabaseOps: Send {
     fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
+    fn cleanup_inactive_users(&self, days: i64) -> Result<u64>;
     fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>>;
+    fn export_user_data(&self, username: &str) -> Result<String>;
+    fn clear_image_from_posts(&self, path: &str) -> Result<u64>;
 }
 
 impl DatabaseOps for Database {
@@ -167,11 +170,20 @@ impl DatabaseOps for Database {
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
         Database::cleanup_old_data(self, days)
     }
+    fn cleanup_inactive_users(&self, days: i64) -> Result<u64> {
+        Database::cleanup_inactive_users(self, days)
+    }
     fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
         Database::get_posts_by_hashtag(self, tag, offset, limit)
     }
     fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>> {
         Database::get_trending_hashtags(self, limit)
+    }
+    fn export_user_data(&self, username: &str) -> Result<String> {
+        Database::export_user_data(self, username)
+    }
+    fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
+        Database::clear_image_from_posts(self, path)
     }
 }
 
@@ -184,7 +196,7 @@ impl Database {
     pub fn new(conn_str: &str) -> Result<Self> {
         let manager = PostgresConnectionManager::new(conn_str.parse()?, NoTls);
         let pool = Pool::builder()
-            .max_size(10)
+            .max_size(25)
             .min_idle(Some(0))
             .connection_timeout(Duration::from_secs(3))
             .build(manager)?;
@@ -1117,17 +1129,36 @@ impl Database {
 
     pub fn cleanup_inactive_users(&self, inactive_days: i64) -> Result<u64> {
         let mut conn = self.pool.get()?;
-        let deleted = conn.execute(
-            "DELETE FROM users WHERE id IN (
-                SELECT id FROM users
-                WHERE login_count = 0 AND created_at::timestamptz < NOW() - make_interval(days => $1)
-                UNION
-                SELECT id FROM users
-                WHERE login_count > 0 AND last_login_at::timestamptz < NOW() - make_interval(days => $1)
-            )",
+        let rows = conn.query(
+            "SELECT id FROM users
+             WHERE (login_count = 0 AND created_at::timestamptz < NOW() - make_interval(days => $1))
+                OR (login_count > 0 AND last_login_at::timestamptz < NOW() - make_interval(days => $1))",
             &[&inactive_days],
         )?;
+        let mut deleted = 0u64;
+        for row in &rows {
+            let user_id: i64 = row.get(0);
+            conn.execute("DELETE FROM follows WHERE follower_id = $1 OR following_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)", &[&user_id])?;
+            conn.execute("DELETE FROM comments WHERE user_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM post_hashtags WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)", &[&user_id])?;
+            conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM rate_limits WHERE user_id = $1", &[&user_id])?;
+            conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
+            deleted += 1;
+        }
         Ok(deleted)
+    }
+
+    pub fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
+        let mut conn = self.pool.get()?;
+        let n = conn.execute(
+            "UPDATE posts SET image_path = '' WHERE image_path = $1",
+            &[&path],
+        )?;
+        Ok(n)
     }
 
     pub fn cleanup_rate_limits(&self) -> Result<u64> {
@@ -1139,6 +1170,98 @@ impl Database {
         Ok(deleted)
     }
 
+    pub fn export_user_data(&self, username: &str) -> Result<String> {
+        let mut conn = self.pool.get()?;
+        let username_lower = username.trim().to_lowercase();
+        let user_row = conn.query_opt(
+            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE LOWER(username) = LOWER($1)",
+            &[&username_lower],
+        )?.ok_or_else(|| anyhow::anyhow!("Usuario '{}' no encontrado", username))?;
+
+        let user_id: i64 = user_row.get(0);
+        let user = serde_json::json!({
+            "id": user_id,
+            "username": user_row.get::<_, String>(1),
+            "display_name": user_row.get::<_, String>(2),
+            "bio": user_row.get::<_, String>(3),
+            "utc_offset": user_row.get::<_, i32>(4),
+            "created_at": user_row.get::<_, String>(5),
+        });
+
+        let posts_rows = conn.query(
+            "SELECT id, content, image_path, created_at FROM posts WHERE user_id = $1 ORDER BY created_at DESC",
+            &[&user_id],
+        )?;
+        let posts: Vec<serde_json::Value> = posts_rows.iter().map(|r| {
+            serde_json::json!({
+                "id": r.get::<_, i64>(0),
+                "content": r.get::<_, String>(1),
+                "image_path": r.get::<_, String>(2),
+                "created_at": r.get::<_, String>(3),
+            })
+        }).collect();
+
+        let comments_rows = conn.query(
+            "SELECT id, post_id, content, created_at FROM comments WHERE user_id = $1 ORDER BY created_at DESC",
+            &[&user_id],
+        )?;
+        let comments: Vec<serde_json::Value> = comments_rows.iter().map(|r| {
+            serde_json::json!({
+                "id": r.get::<_, i64>(0),
+                "post_id": r.get::<_, i64>(1),
+                "content": r.get::<_, String>(2),
+                "created_at": r.get::<_, String>(3),
+            })
+        }).collect();
+
+        let msgs_rows = conn.query(
+            "SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, u.username as sender_name
+             FROM messages m JOIN users u ON u.id = m.sender_id
+             WHERE m.sender_id = $1 OR m.receiver_id = $1 ORDER BY m.created_at ASC",
+            &[&user_id],
+        )?;
+        let messages: Vec<serde_json::Value> = msgs_rows.iter().map(|r| {
+            serde_json::json!({
+                "id": r.get::<_, i64>(0),
+                "sender_id": r.get::<_, i64>(1),
+                "receiver_id": r.get::<_, i64>(2),
+                "sender_username": r.get::<_, String>(5),
+                "content": r.get::<_, String>(3),
+                "created_at": r.get::<_, String>(4),
+            })
+        }).collect();
+
+        let followers_rows = conn.query(
+            "SELECT u.username FROM users u JOIN follows f ON f.follower_id = u.id WHERE f.following_id = $1",
+            &[&user_id],
+        )?;
+        let followers: Vec<String> = followers_rows.iter().map(|r| r.get(0)).collect();
+
+        let following_rows = conn.query(
+            "SELECT u.username FROM users u JOIN follows f ON f.following_id = u.id WHERE f.follower_id = $1",
+            &[&user_id],
+        )?;
+        let following: Vec<String> = following_rows.iter().map(|r| r.get(0)).collect();
+
+        let export = serde_json::json!({
+            "exported_at": Utc::now().to_rfc3339(),
+            "user": user,
+            "posts": posts,
+            "comments": comments,
+            "messages": messages,
+            "followers": followers,
+            "following": following,
+        });
+
+        let json_str = serde_json::to_string_pretty(&export)?;
+        let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
+        let filename = format!("export_{}_{}.json", username_lower, timestamp);
+        let path = format!("/data/uploads/{}", filename);
+        std::fs::create_dir_all("/data/uploads").ok();
+        std::fs::write(&path, &json_str)?;
+        Ok(filename)
+    }
+
     pub fn seed_data(&self) -> Result<()> {
         let mut conn = self.pool.get()?;
         let now = chrono::Utc::now();
@@ -1148,142 +1271,311 @@ impl Database {
         conn.batch_execute("
             DELETE FROM notifications; DELETE FROM messages; DELETE FROM post_hashtags;
             DELETE FROM comments; DELETE FROM posts; DELETE FROM follows; DELETE FROM rate_limits; DELETE FROM users;
-        ")?;
+        ").map_err(|e| anyhow::anyhow!("Error limpiando datos: {}", e))?;
 
-        // Users
-        let users = [
-            ("alice",   "password123", "Alice Rodriguez"),
-            ("bob",     "password123", "Bob Martinez"),
-            ("carol",   "password123", "Carolina Lopez"),
-            ("dave",    "password123", "David Chen"),
-            ("eve",     "password123", "Eva Garcia"),
+        // ── 52 Users ────────────────────────────────────────────────────
+        let user_defs: [(&str, &str); 52] = [
+            ("alice",     "Alice Rodríguez"),
+            ("bob",       "Bob Martínez"),
+            ("carol",     "Carolina López"),
+            ("dave",      "David Chen"),
+            ("eve",       "Eva García"),
+            ("frank",     "Francisco Torres"),
+            ("grace",     "Gabriela Ramírez"),
+            ("hank",      "Héctor Vargas"),
+            ("iris",      "Isabel Mendoza"),
+            ("jack",      "Javier Castillo"),
+            ("karen",     "Karen Herrera"),
+            ("leo",       "Leonardo Rivas"),
+            ("maria",     "María Fernández"),
+            ("nacho",     "Ignacio Paredes"),
+            ("olivia",    "Olivia Soto"),
+            ("pablo",     "Pablo Núñez"),
+            ("quinn",     "Quintín Delgado"),
+            ("rosa",      "Rosa Guerrero"),
+            ("sam",       "Samuel Ortega"),
+            ("tina",      "Cristina Campos"),
+            ("ulises",    "Ulises Medina"),
+            ("vero",      "Verónica Rojas"),
+            ("will",      "Wilson Aguilar"),
+            ("xena",      "Ximena Peña"),
+            ("yago",      "Yago Fuentes"),
+            ("zoe",       "Zoe Santana"),
+            ("coder42",   "Dev Master"),
+            ("rustacean", "Rust Fanático"),
+            ("linuxero",  "Tux Lover"),
+            ("pythonista","Py Coder"),
+            ("hackerx",   "Sec Ghost"),
+            ("sysadmin",  "Root Admin"),
+            ("neovimmer", "Vim Enjoyer"),
+            ("frontend",  "CSS Fighter"),
+            ("backend",   "API Builder"),
+            ("fullstack", "Jack of All"),
+            ("devops",    "Pipeline Runner"),
+            ("datawiz",   "Data Wizard"),
+            ("mlguru",    "ML Engineer"),
+            ("designer",  "UI Pixel"),
+            ("scifi_fan", "Scifi Reader"),
+            ("gamer",     "Night Owl"),
+            ("musico",    "Bass Player"),
+            ("fotografo", "Lens Hunter"),
+            ("chefcode",  "Code Chef"),
+            ("cyclist",   "Bike Commuter"),
+            ("yogi",      "Zen Coder"),
+            ("writer",    "Doc Author"),
+            ("tester",    "Bug Finder"),
+            ("architect", "System Dreamer"),
+            ("joker",     "Terminal Joker"),
+            ("newbie",    "Fresh Start"),
         ];
-        let mut ids: [i64; 5] = [0; 5];
-        for (i, (u, p, d)) in users.iter().enumerate() {
-            let hash = bcrypt::hash(p, bcrypt::DEFAULT_COST)?;
-            let row = conn.query_one(
-                "INSERT INTO users (username, password_hash, display_name, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-                &[&u.to_string(), &hash, &d.to_string(), &ago(60*24*7)],
-            )?;
-            ids[i] = row.get(0);
-        }
-        let [a, b, c, d, e] = ids;
 
-        // Follows
-        for (follower, followed) in &[
-            (a,b),(a,c),(a,e),(b,a),(b,c),(b,e),(c,a),(c,b),
-            (c,d),(d,a),(d,c),(d,e),(e,a),(e,b),(e,c),(e,d),
-        ] {
-            conn.execute("INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[follower, followed]).ok();
+        let mut uids: Vec<i64> = Vec::new();
+        for (i, (uname, dname)) in user_defs.iter().enumerate() {
+            let hash = bcrypt::hash("password123", bcrypt::DEFAULT_COST)
+                .map_err(|e| anyhow::anyhow!("bcrypt failed for {}: {}", uname, e))?;
+            let created = if i >= 48 { ago(60*24*800) } else { ago(60*24*7 + i as i64 * 120) };
+            let row = conn.query_opt(
+                "INSERT INTO users (username, password_hash, display_name, created_at, last_login_at, login_count) VALUES ($1, $2, $3, $4, $4, 1) RETURNING id",
+                &[&uname.to_string(), &hash, &dname.to_string(), &created],
+            ).map_err(|e| anyhow::anyhow!("Error insertando usuario {}: {}", uname, e))?
+            .ok_or_else(|| anyhow::anyhow!("INSERT no retornó fila para usuario {}", uname))?;
+            let id: i64 = row.get(0);
+            uids.push(id);
         }
 
-        // Posts
-        let posts_data = [
-            (a, "Hola #redsocial! Este es mi primer post. Alguien mas por aqui?", ago(60*24*3)),
-            (b, "Acabo de terminar un proyecto en #rust. Muy contento con el resultado.", ago(60*24*2)),
-            (c, "Buenos dias #gente. Que estan escuchando hoy? #musica", ago(60*24*2 + 60)),
-            (a, "@bob @carol han visto la nueva pelicula de #scifi? Es increible.", ago(60*24)),
-            (d, "Trabajando en una app con #ratatui y #rust. El TUI quedo espectacular.", ago(60*23)),
-            (e, "Hoy aprendi sobre sistemas distribuidos. #tech #aprendizaje", ago(60*12)),
-            (b, "Comparto mi configuracion de #neovim. Alguien quiere ver screenshots?", ago(60*8)),
-            (c, "@alice gracias por la recomendacion de la peli. #scifi", ago(60*6)),
-            (a, "Reflexion del dia: el software libre cambia vidas. #opensource #filosofia", ago(60*4)),
-            (e, "Cual es su lenguaje de programacion favorito? El mio esta entre #rust y #python.", ago(60*2)),
-            (d, "Termine el MVP de mi proyecto. Ahora viene lo dificil: conseguir usuarios. #startup", ago(60)),
-            (b, "@dave felicitaciones por el MVP! Conozco gente que podria interesarse. #networking", ago(30)),
-            (c, "Nadie: ...  Yo: recompilando el kernel a las 3am #linux #nightowl", ago(15)),
-            (a, "@eve yo tambien prefiero #rust. La seguridad de tipos es adictiva.", ago(5)),
+        // Inactive users: set login_count=0, no last_login for the very last 2
+        for idx in [50, 51] {
+            if let Some(&uid) = uids.get(idx) {
+                conn.execute(
+                    "UPDATE users SET login_count = 0, last_login_at = created_at WHERE id = $1",
+                    &[&uid],
+                )?;
+            }
+        }
+
+        // ── Follows (social graph) ────────────────────────────────────
+        let follows: Vec<(usize, usize)> = vec![
+            (0,1),(0,2),(0,3),(0,4),(0,6),(0,8),(0,12),(0,15),
+            (1,0),(1,2),(1,5),(1,7),(1,26),(1,28),(1,30),
+            (2,0),(2,1),(2,4),(2,9),(2,13),(2,19),(2,35),
+            (3,0),(3,11),(3,14),(3,16),(3,26),(3,29),(3,33),
+            (4,0),(4,1),(4,3),(4,10),(4,17),(4,24),(4,42),
+            (5,1),(5,6),(5,7),(5,15),(5,22),(5,26),(5,38),
+            (6,0),(6,5),(6,8),(6,18),(6,27),(6,31),(6,40),
+            (7,1),(7,5),(7,9),(7,20),(7,28),(7,32),(7,43),
+            (8,0),(8,6),(8,12),(8,21),(8,29),(8,35),(8,44),
+            (9,2),(9,7),(9,13),(9,22),(9,30),(9,36),(9,45),
+            (10,4),(10,8),(10,14),(10,23),(10,27),(10,37),
+            (11,3),(11,9),(11,15),(11,24),(11,28),(11,38),
+            (12,0),(12,8),(12,16),(12,25),(12,29),(12,39),
+            (13,2),(13,9),(13,17),(13,22),(13,26),(13,40),
+            (14,3),(14,10),(14,18),(14,23),(14,27),(14,41),
+            (15,0),(15,5),(15,19),(15,24),(15,28),(15,42),
+            (26,0),(26,1),(26,2),(26,3),(26,4),(26,27),(26,28),(26,29),
+            (27,26),(27,28),(27,29),(27,30),(27,31),(27,32),
+            (28,1),(28,2),(28,26),(28,27),(28,29),(28,33),
+            (29,3),(29,26),(29,27),(29,28),(29,30),(29,34),
+            (30,5),(30,26),(30,29),(30,31),(30,32),(30,35),
+            (31,27),(31,30),(31,33),(31,36),(31,37),
+            (32,28),(32,29),(32,34),(32,38),(32,39),
+            (33,3),(33,26),(33,31),(33,35),(33,40),
+            (34,29),(34,32),(34,36),(34,41),
+            (35,2),(35,8),(35,31),(35,33),(35,37),(35,42),
+            (36,30),(36,33),(36,34),(36,38),(36,43),
         ];
-        let mut pids = Vec::new();
-        for (uid, content, created) in &posts_data {
-            let row = conn.query_one(
+        for (f, t) in &follows {
+            conn.execute(
+                "INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                &[&uids[*f], &uids[*t]],
+            ).ok();
+        }
+
+        // ── Posts (250+) ───────────────────────────────────────────────
+        let templates: [(&str, &[&str]); 38] = [
+            ("Acabo de descubrir #rust y estoy alucinando con el borrow checker", &["rust"]),
+            ("Alguien mas usa #neovim con LSP para desarrollo? Es magia pura", &["neovim"]),
+            ("Hoy compile el kernel de #linux en menos de 5 minutos. Que epoca para estar vivo", &["linux"]),
+            ("El #opensource es lo mejor que le paso a la humanidad. Change my mind", &["opensource"]),
+            ("Buenos dias #gente. Hoy toca deploy a produccion. Deseenme suerte", &["gente"]),
+            ("Recomendaciones de #musica para programar? Necesito focus total", &["musica"]),
+            ("Estoy armando un cluster de Kubernetes en casa. #devops #cloud", &["devops", "cloud"]),
+            ("Lean esto sobre #rust async vs sync. Les vuela la cabeza", &["rust"]),
+            ("El mejor #editor para codigo es el que te deja fluir. Para mi, neovim", &["editor"]),
+            ("Thread sobre #seguridad en aplicaciones web. Abro hilo", &["seguridad"]),
+            ("Quien va a la #rustconf este año? Nos juntamos?", &["rustconf"]),
+            ("Termine mi proyecto en #python. Ahora quiero reescribirlo en rust, es normal?", &["python", "rust"]),
+            ("La documentacion de #postgresql es oro puro. No subestimen la doc oficial", &["postgresql"]),
+            ("Cual es su #terminal favorita? Yo uso alacritty con tmux", &["terminal"]),
+            ("Les presento mi setup de #minimalismo digital. Solo terminal y shell", &["minimalismo"]),
+            ("Acabo de leer un paper sobre #algoritmos distribuidos. Increible", &["algoritmos"]),
+            ("Hoy empece a contribuir a un proyecto #opensource. Que emocion", &["opensource"]),
+            ("Mejor practica para #git: commits atomicos y mensajes claros", &["git"]),
+            ("Reflexion del dia: menos herramientas, mas pensamiento. #filosofia", &["filosofia"]),
+            ("Estoy aprendiendo #golang. Que les parece comparado con rust?", &["golang"]),
+            ("Tip del dia: usa #docker para entornos de desarrollo reproducibles", &["docker"]),
+            ("La #ia esta cambiando como programamos. Opiniones?", &["ia"]),
+            ("Acabo de configurar #nixos y no puedo creer lo limpio que queda todo", &["nixos"]),
+            ("Buenas practicas de #testing: unitarios, integracion y e2e. Los 3 hacen falta", &["testing"]),
+            ("Que monitor usan para programar? Yo tengo uno ultrawide y es gloria", &["hardware"]),
+            ("Los errores de compilacion de #rust son los mejores. Te enseñan en vez de asustarte", &["rust"]),
+            ("Hackathon este fin de semana. Quien se apunta? #hackathon #startup", &["hackathon", "startup"]),
+            ("Mi rutina: cafe, codigo, cafe, deploy, cafe, dormir. #developer #life", &["developer", "life"]),
+            ("Alguien esta usando #htmx? Opiniones sinceras por favor", &["htmx"]),
+            ("La comunidad de #rust es la mas acogedora que conoci en 20 años de carrera", &["rust"]),
+            ("Necesito un libro sobre arquitectura de #software. Recomendaciones?", &["software"]),
+            ("Hoy hice mi primer PR a un proyecto grande. #opensource #achievement", &["opensource", "achievement"]),
+            ("Debate: tabs vs spaces. Yo: tabs para accesibilidad. Ustedes?", &["debate"]),
+            ("Aprendiendo #elixir y el pattern matching me esta volando la cabeza", &["elixir"]),
+            ("Setup minimalista para #productividad: terminal, tmux, neovim, y un buen teclado", &["productividad"]),
+            ("Los que usan #archlinux, como llevan el rolling release? Vale la pena?", &["archlinux"]),
+            ("Hablemos de #backend con rust. Que frameworks recomiendan: axum o actix?", &["backend", "rust"]),
+            ("El #teletrabajo mejoro mi calidad de vida un 300%. No vuelvo a oficina", &["teletrabajo"]),
+        ];
+
+        // Generate ~250 posts spread across users (0..48 active)
+        let mut pids: Vec<i64> = Vec::new();
+        for pi in 0..250 {
+            let uid_idx = (pi * 7 + 3) % 48; // pseudo-random spread
+            let uid = uids[uid_idx];
+            let template_idx = pi % templates.len();
+            let (text, tags) = &templates[template_idx];
+
+            // Vary the content slightly
+            let variants = [
+                format!("{} [{}/{}]", text, pi + 1, 250),
+                format!("{}. Que opinan?", text),
+                format!("{} 🔥", text),
+                format!("{} 👀", text),
+                format!("{} — comparto mi experiencia", text),
+            ];
+            let content = &variants[pi % variants.len()];
+
+            // Timestamp from 15 days ago to now, spread out
+            let mins_ago = (250 - pi) as i64 * 80 + (uid_idx as i64 * 13);
+            let ts = ago(mins_ago);
+
+            let row = conn.query_opt(
                 "INSERT INTO posts (user_id, content, created_at) VALUES ($1, $2, $3) RETURNING id",
-                &[uid, &content.to_string(), created],
-            )?;
+                &[&uid, &content.to_string(), &ts],
+            ).map_err(|e| anyhow::anyhow!("Error insertando post {} (user {}): {}", pi, uid, e))?
+            .ok_or_else(|| anyhow::anyhow!("INSERT post no retornó fila para post {} user {}", pi, uid))?;
             let pid: i64 = row.get(0);
             pids.push(pid);
 
-            // Hashtags
-            for word in content.split_whitespace() {
-                if word.starts_with('#') {
-                    let tag = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '#');
-                    let tag = tag.trim_start_matches('#').to_lowercase();
-                    if !tag.is_empty() {
-                        conn.execute("INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING", &[&pid, &tag]).ok();
-                    }
-                }
+            for tag in *tags {
+                conn.execute(
+                    "INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
+                    &[&pid, &tag.to_lowercase().to_string()],
+                ).ok();
             }
 
-            // Mention notifications
-            for word in content.split_whitespace() {
-                if word.starts_with('@') {
-                    let uname = word.trim_matches(|c: char| !c.is_alphanumeric() && c != '@');
-                    let uname = uname.trim_start_matches('@').to_lowercase();
-                    if let Some(r) = conn.query_opt("SELECT id FROM users WHERE LOWER(username) = $1", &[&uname]).ok().flatten() {
-                        let muid: i64 = r.get(0);
-                        if muid != *uid {
-                            conn.execute(
-                                "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
-                                &[&muid, uid, created, &pid],
-                            ).ok();
-                        }
-                    }
+            // Mention some users occasionally
+            if pi % 5 == 0 {
+                let mentioned_idx = (pi * 3 + 7) % 48;
+                if mentioned_idx != uid_idx {
+                    let muid = uids[mentioned_idx];
+                    conn.execute(
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
+                        &[&muid, &uid, &ts, &pid],
+                    ).ok();
                 }
             }
         }
 
-        // Comments
-        let comments_data: [(usize, i64, &str, Option<i64>); 12] = [
-            (0, b, "Bienvenida @alice! #redsocial", None),
-            (0, c, "Hola Alice, yo tambien soy nueva.", None),
-            (1, a, "Felicidades @bob! Me encantaria ver el codigo. #rust", None),
-            (1, c, "Usaste algun framework?", None),
-            (1, b, "@carol use tokio y ratatui. Te paso el repo.", Some(4)),
-            (3, b, "Si, la vi. Los efectos especiales son brutales.", None),
-            (3, e, "A mi no me gusto tanto, prefiero los libros.", None),
-            (6, a, "Si! Pasa los screenshots. #neovim", None),
-            (8, c, "Totalmente de acuerdo. Yo contribuyo a proyectos #opensource.", None),
-            (8, d, "El open source cambio mi carrera.", None),
-            (11, d, "Gracias @bob! Te escribo por DM.", None),
-            (13, e, "Jaja, el borrow checker es nuestro amigo.", None),
+        // ── Comments (150+) ────────────────────────────────────────────
+        let comment_templates = [
+            "Totalmente de acuerdo!",
+            "No estoy muy seguro de eso...",
+            "Que gran aporte, gracias por compartir",
+            "Me paso algo muy similar",
+            "Podrias dar mas detalles?",
+            "Increible, no sabia eso",
+            "Yo uso otra herramienta pero esto se ve bien",
+            "Gracias por la recomendacion",
+            "Justo lo que necesitaba leer hoy",
+            "Habria que probarlo en produccion",
+            "Tenes algun benchmark de eso?",
+            "Me sirvio mucho tu comentario",
+            "Es por aca, 100%",
+            "Discrepo respetuosamente",
+            "Añado: tambien sirve para testing",
         ];
-        for (pi, uid, content, parent_id) in &comments_data {
-            let pid = pids[*pi];
-            conn.query_one(
+
+        let mut comment_id = 0i64;
+        for ci in 0..160 {
+            let post_idx = (ci * 11 + 5) % pids.len().max(1);
+            let pid = pids[post_idx];
+            let commenter_idx = (ci * 3 + 11) % 48;
+            let uid = uids[commenter_idx];
+            let text = comment_templates[ci % comment_templates.len()];
+
+            let parent = if ci > 10 && ci % 3 == 0 {
+                Some(comment_id - (ci as i64 % 5 + 1))
+            } else {
+                None
+            };
+            // Ensure parent exists
+            let parent = parent.filter(|&p| p > 0 && p < comment_id);
+
+            let ts = ago((160i64 - ci as i64) * 60 + (commenter_idx as i64 * 5));
+
+            let row = conn.query_one(
                 "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                &[&pid, uid, &content.to_string(), &ago(60*24 - 30), parent_id],
+                &[&pid, &uid, &text.to_string(), &ts, &parent],
             ).ok();
+            if let Some(r) = row {
+                comment_id = r.get(0);
+            } else {
+                comment_id += 1;
+            }
         }
 
-        // Messages
-        for (sender, receiver, content, created) in &[
-            (a, b, "Hola Bob! Me encantaron tus posts de Rust.", ago(60*5)),
-            (b, a, "Gracias Alice! Si necesitas ayuda avisame.", ago(60*4)),
-            (a, b, "Me podrias revisar un PR?", ago(60*3)),
-            (b, a, "Claro, pasame el link.", ago(60*2)),
-            (c, d, "Dave, como va el MVP?", ago(60*2)),
-            (d, c, "Va bien! Ya casi termino el frontend.", ago(60)),
-            (d, a, "Alice, tu que sabes de diseno, me ayudas con la UI?", ago(55)),
-            (a, d, "Si, mandame mockups y te doy feedback.", ago(50)),
-            (e, a, "@alice coincido contigo, Rust es el futuro.", ago(40)),
-            (a, e, "Eve, has probado los traits async? Son una maravilla.", ago(30)),
-        ] {
-            conn.execute(
-                "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4)",
-                &[sender, receiver, &content.to_string(), created],
-            ).ok();
+        // ── Messages (conversations) ───────────────────────────────────
+        let mut msg_count = 0;
+        for pair_idx in 0..20 {
+            let a_idx = pair_idx % 48;
+            let b_idx = (pair_idx * 3 + 7) % 48;
+            if a_idx == b_idx { continue; }
+            let a = uids[a_idx];
+            let b = uids[b_idx];
+
+            let conversation: [(&str, bool); 6] = [
+                ("Hola! Como va todo?", true),
+                ("Bien! Vi tu ultimo post, muy bueno", false),
+                ("Gracias! Estoy trabajando en algo nuevo", true),
+                ("Que emocion, conta mas", false),
+                ("Es un proyecto de #rust con TUI", true),
+                ("Pasame el repo cuando este listo!", false),
+            ];
+
+            for (mi, (text, from_a)) in conversation.iter().enumerate() {
+                let (sender, receiver) = if *from_a { (a, b) } else { (b, a) };
+                let ts = ago(60 * 24 * 14 - pair_idx as i64 * 500 - mi as i64 * 120);
+                conn.execute(
+                    "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4)",
+                    &[&sender, &receiver, &text.to_string(), &ts],
+                ).ok();
+                msg_count += 1;
+            }
         }
 
-        // Follow notifications
-        for (follower, followed) in &[(a,b),(a,c),(b,a),(c,a),(d,a),(e,a)] {
+        // ── Follow notifications ───────────────────────────────────────
+        for (f, t) in follows.iter().take(60) {
+            let ts = ago(60 * 24 * 10 - *f as i64 * 30);
             conn.execute(
                 "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'follow', $3, $4)",
-                &[followed, follower, &ago(60*24*2), follower],
+                &[&uids[*t], &uids[*f], &ts, &uids[*f]],
             ).ok();
         }
 
-        println!("Seed: {} usuarios, {} posts, {} comentarios, {} mensajes.",
-            users.len(), posts_data.len(), comments_data.len(), 10);
+        println!(
+            "Seed: {} usuarios, {} posts, {} comentarios, {} mensajes, {} hashtags.",
+            user_defs.len(),
+            pids.len(),
+            160,
+            msg_count,
+            templates.len(),
+        );
         Ok(())
     }
 }
@@ -1754,6 +2046,10 @@ use chrono::{DateTime, Utc};
             Ok((0, 0))
         }
 
+        fn cleanup_inactive_users(&self, _days: i64) -> Result<u64> {
+            Ok(0)
+        }
+
         fn get_posts_by_hashtag(&self, tag: &str, _offset: u64, _limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let tag_binding = tag.to_lowercase();
@@ -1784,6 +2080,22 @@ use chrono::{DateTime, Utc};
             let mut result: Vec<(String, i64)> = counts.into_iter().collect();
             result.sort_by(|a, b| b.1.cmp(&a.1));
             Ok(result)
+        }
+
+        fn export_user_data(&self, _username: &str) -> Result<String> {
+            anyhow::bail!("Export no soportado en MockDatabase");
+        }
+
+        fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
+            let mut data = self.data.lock().unwrap();
+            let mut count = 0u64;
+            for post in data.posts.iter_mut() {
+                if post.image_path.as_deref() == Some(path) {
+                    post.image_path = None;
+                    count += 1;
+                }
+            }
+            Ok(count)
         }
     }
 

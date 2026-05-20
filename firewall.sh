@@ -4,62 +4,87 @@ set -e
 # ─── Config ───────────────────────────────────────────────
 SSH_PORT=2222          # Puerto de la red social
 SERVER_SSH_PORT=22     # Puerto SSH tradicional para administrar el servidor
+TABLE_NAME="agora_fw"
 # ───────────────────────────────────────────────────────────
 
-echo "Aplicando reglas de iptables..."
+echo "Aplicando reglas de nftables..."
 
-# Limpiar reglas existentes
-iptables -F
-iptables -X
-iptables -t nat -F
-iptables -t mangle -F
+# Cargar la tabla si ya existe (para poder flushearla)
+nft list table inet "$TABLE_NAME" &>/dev/null && nft delete table inet "$TABLE_NAME" || true
 
-# Política por defecto: denegar todo
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
+nft -f - <<EOF
+table inet ${TABLE_NAME} {
+    # ── Sets ──────────────────────────────────────────
+    set scp_allowed {
+        type ipv4_addr
+        flags timeout
+        timeout 10m
+    }
 
-# Permitir tráfico local (loopback)
-iptables -A INPUT -i lo -j ACCEPT
+    set ssh_ratelimit_v4 {
+        type ipv4_addr
+        flags dynamic,timeout
+        timeout 1m
+        size 65535
+    }
 
-# Permitir conexiones establecidas y relacionadas
-iptables -A INPUT -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+    # ── Chains ────────────────────────────────────────
+    chain input {
+        type filter hook input priority filter; policy drop;
 
-# Permitir SSH tradicional para administración del servidor
-iptables -A INPUT -p tcp --dport $SERVER_SSH_PORT -j ACCEPT
+        # Loopback
+        iif lo accept
 
-# Permitir la red social por SSH
-iptables -A INPUT -p tcp --dport $SSH_PORT -j ACCEPT
+        # Conexiones establecidas/relacionadas
+        ct state established,related accept
 
-# Rate-limit conexiones nuevas al puerto de la red social
-iptables -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW \
-  -m limit --limit 10/minute --limit-burst 5 -j ACCEPT
-iptables -A INPUT -p tcp --dport $SSH_PORT -m conntrack --ctstate NEW \
-  -j DROP
+        # SSH administración (con rate-limit)
+        tcp dport ${SERVER_SSH_PORT} ct state new \
+            add @ssh_ratelimit_v4 { ip saddr limit rate over 5/minute } \
+            log prefix "[FW ADMIN BLOCK] " drop
+        tcp dport ${SERVER_SSH_PORT} accept
 
-# Rate-limit conexiones nuevas al SSH tradicional
-iptables -A INPUT -p tcp --dport $SERVER_SSH_PORT -m conntrack --ctstate NEW \
-  -m limit --limit 5/minute --limit-burst 3 -j ACCEPT
-iptables -A INPUT -p tcp --dport $SERVER_SSH_PORT -m conntrack --ctstate NEW \
-  -j DROP
+        # Red social (con rate-limit)
+        tcp dport ${SSH_PORT} ct state new \
+            add @ssh_ratelimit_v4 { ip saddr limit rate over 10/minute } \
+            log prefix "[FW AGORA BLOCK] " drop
+        tcp dport ${SSH_PORT} accept
 
-# Protección contra escaneo de puertos (SYN flood)
-iptables -A INPUT -p tcp --syn -m limit --limit 1/s --limit-burst 3 -j ACCEPT
-iptables -A INPUT -p tcp --syn -j DROP
+        # SCP temporal: solo IPs en el set scp_allowed (upload/download efímero)
+        tcp dport ${SSH_PORT} ip saddr @scp_allowed accept
 
-# Permitir ICMP (ping) con rate-limit
-iptables -A INPUT -p icmp --icmp-type echo-request -m limit --limit 1/s -j ACCEPT
-iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+        # Protección SYN flood
+        tcp flags syn ct state new limit rate 5/second accept
+        tcp flags syn ct state new drop
 
-# Log de paquetes denegados (opcional, comentar si llena los logs)
-iptables -A INPUT -m limit --limit 5/min -j LOG --log-prefix "[FW BLOCKED] " --log-level 4
+        # ICMP (ping) con rate-limit
+        icmp type echo-request limit rate 1/second accept
+        icmp type echo-request drop
 
-echo "✔ Reglas aplicadas correctamente."
+        # Log de paquetes denegados
+        limit rate 5/minute log prefix "[FW BLOCKED] "
+    }
+
+    chain forward {
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        type filter hook output priority filter; policy accept;
+    }
+}
+EOF
+
+echo "✔ Reglas nftables aplicadas correctamente."
 echo ""
 echo "Puertos abiertos:"
-echo "  - $SERVER_SSH_PORT (SSH administración, con rate-limit)"
-echo "  - $SSH_PORT       (Red social, con rate-limit)"
+echo "  - $SERVER_SSH_PORT (SSH administración, rate-limit 5/min)"
+echo "  - $SSH_PORT       (Red social, rate-limit 10/min)"
+echo ""
+echo "SCP temporal:"
+echo "  - nft add element inet ${TABLE_NAME} scp_allowed { <IP> }"
+echo "  - nft delete element inet ${TABLE_NAME} scp_allowed { <IP> }"
 echo ""
 echo "Para hacer persistente:"
-echo "  Debian/Ubuntu: apt install iptables-persistent"
-echo "  o: iptables-save > /etc/iptables/rules.v4"
+echo "  Debian/Ubuntu: apt install nftables && systemctl enable nftables"
+echo "  Guardar reglas: nft list ruleset > /etc/nftables.conf"

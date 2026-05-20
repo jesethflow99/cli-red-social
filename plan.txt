@@ -1,0 +1,122 @@
+utilidad esperada en la app
+AGORA - Red Social Terminal-First sobre SSH/Tor
+
+Concepto General
+
+AGORA es una red social minimalista orientada a privacidad, accesible completamente desde terminal mediante conexiones SSH. Combina lo mejor de BBS clásicas, IRC y foros textuales, rediseñado para un entorno TUI (Terminal User Interface) moderno.
+
+No hay navegadores, no hay JavaScript, no hay apps. Solo tu terminal, SSH y texto.
+
+Filosofía:
+
+· Minimalismo funcional
+· Privacidad por diseño
+· Interfaces lentas y deliberadas (nada de feeds infinitos)
+· Software autocontenible y self-hostable
+· Restricciones como características, no como bugs
+
+---
+
+Acceso
+
+```bash
+ssh agora.social -t
+# o vía Tor
+torsocks ssh agora.onion -t
+```
+
+El usuario nunca obtiene una shell real. La sesión SSH lanza directamente una TUI hecha en Rust.
+
+---
+
+Tecnologías
+
+· Backend: Rust (async + multithreading)
+· Transporte: SSH (sesiones persistentes y seguras)
+· Aislamiento: Docker + nftables
+· Base de datos: PostgreSQL
+· Renderizado de imágenes: Chafa
+· Anonimato: Tor (opcional)
+
+---
+
+Sistema Social
+
+Publicaciones:
+
+· Texto plano
+· Hashtags dinámicos (#linux, #rust, #cyberpunk) en lugar de subforos fijos
+· Hilos de respuestas
+· Imágenes (procesadas y limpiadas)
+
+Mensajes directos:
+
+· Privados
+· Expiración automática a los 90 días
+· El destinatario puede exportar la conversación antes de que expire
+
+Notificaciones:
+
+· Efímeras
+· Eliminación automática
+
+Moderación:
+
+· Por defecto: libertad total + rate limiting por acciones
+· Opcional: sistema de plugins/middleware para agregar reglas (filtros, bloqueos, etc.) sin modificar el núcleo
+
+---
+
+Interfaz TUI
+
+· Navegación 100% por teclado
+· Actualización bajo demanda (no websockets): cada interacción del usuario refresca el contenido
+· Consumo mínimo de recursos
+· Modo "radio" : vista que rota lentamente por hashtags populares tipo ticker a velocidad humana
+
+---
+
+Imágenes
+
+Upload:
+
+· SCP temporal habilitado por nftables solo para la IP del usuario
+· Validación, limpieza de metadata, reescalado a 512px
+· Formatos permitidos: PNG, JPG, JPEG, WebP (SVG bloqueado)
+
+Renderizado:
+
+· Las imágenes se descargan en hilos asíncronos (no bloquean el feed)
+· Mientras se cargan: placeholder
+· Si falla: enlace para descargar por SCP temporal
+
+URLs externas:
+
+· El servidor no almacena la imagen, solo la URL
+· Bajo demanda: se descarga, valida, limpia, muestra y elimina
+
+---
+
+Backup y Exportación
+
+· Comando agora export --format=json → genera archivo temporal + enlace SCP efímero
+· El usuario puede descargar su historial completo (posts, MDs, etc.)
+· Útil antes de la expiración automática de cuentas inactivas (2 años)
+
+Política de expiración:
+
+· Notificaciones y MDs: 90 días
+· Cuentas inactivas (sin interacción mínima): 2 años
+
+---
+
+Identidad y Múltiples Dispositivos
+El ssh solo permite cifrar el tunel ssh, la autenticacion se hace dentro de la tui cuando ya nada puede registrar logs de lo que haces
+
+Federación / Multi-instancia
+
+AGORA NO es ActivityPub ni federado por defecto.
+
+Cada instancia es un mundo aparte. La filosofía es más cercana a un BBS clásico o a tilde.club que al Fediverso. Si alguien corre su propia instancia, opera de forma independiente.
+
+---

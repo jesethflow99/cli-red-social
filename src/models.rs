@@ -48,6 +48,7 @@ pub enum Screen {
     PostSearch,
     HashtagView,
     HashtagTrending,
+    Radio,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -1,51 +1,65 @@
-# cli-red-social
+# AGORA — Red Social Terminal-First sobre SSH
 
-Red social en la terminal, accesible vía SSH.
+Red social minimalista orientada a privacidad. Sin navegador, sin JavaScript, sin cookies: solo tu terminal, SSH y texto.
 
-## Requisitos
+```
+ssh agora.social -t          # o vía Tor: torsocks ssh agora.onion -t
+```
 
-- Docker y Docker Compose (recomendado)
-- O Rust toolchain + PostgreSQL para ejecución local
+---
 
-## Inicio rápido (Docker)
+## Inicio rápido
 
 ```bash
-# Clonar
 git clone <repo> && cd cli-red-social
 
-# Opcional: configurar contraseñas y puerto
+# Generar keys de host (para multi-instancia)
+./setup-keys.sh
+
+# Opcional: configurar contraseñas
 export DB_PASSWORD=clave_segura
 export SSH_PASSWORD=otra_clave
-export SSH_PORT=2222  # Usá 22 en producción para ssh directo
+export SSH_PORT=2222
 
-# Levantar
+# Levantar (nginx + 3 instancias + PostgreSQL)
 docker compose up -d
 
 # Conectarse
 ssh localhost -p 2222 -t
-# O si usaste puerto 22: ssh localhost -t
 ```
 
-## Ejecución local
+## Desarrollo local
 
 ```bash
-# Asegurate de tener PostgreSQL corriendo
-cargo run -- --tui          # Modo local (sin SSH)
-cargo run                   # Servidor SSH en puerto 2222
-cargo run -- --port 22      # Servidor SSH en puerto 22
+# Solo PostgreSQL en Docker
+docker compose up -d db
+
+# Seed de datos (52 usuarios, 250+ posts)
+cargo run -- --seed
+
+# TUI directo (sin SSH)
+cargo run -- --tui
+
+# Servidor SSH completo
+cargo run -- --port 2222
+
+# Con logs a archivo
+cargo run -- --port 2222 --log agora.log
 ```
 
 ## Variables de entorno
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `DATABASE_URL` | `postgres://social:social@localhost/social` | Conexión a PostgreSQL |
-| `SSH_PASSWORD` | `agora` | Contraseña SSH |
-| `SSH_PORT` | `2222` | Puerto del servidor SSH |
-| `DB_PASSWORD` | `agora` | Contraseña de PostgreSQL (solo Docker) |
-| `RUST_LOG` | — | Nivel de logging (`info`, `debug`, etc.) |
-| `TOR_PROXY` | `127.0.0.1:9050` | Proxy SOCKS5 para URLs .onion |
+| `DATABASE_URL` | `postgres://social:agora@localhost/social` | Conexión PostgreSQL |
+| `SSH_PASSWORD` | `agora` | Contraseña SSH compartida |
+| `SSH_PORT` | `2222` | Puerto público |
+| `DB_PASSWORD` | `agora` | Contraseña PostgreSQL (Docker) |
+| `RUST_LOG` | `info` | Nivel de logging |
 | `LANG` | `es` | Idioma (`es` o `en`) |
+| `AGORA_UPLOAD_DIR` | `./uploads` o `/data/uploads` | Directorio de imágenes |
+| `AGORA_MODERATION_PLUGINS` | — | Plugins: `spam,profanity,link` |
+| `SSH_CLIENT_IP` | — | IP del cliente (seteada por el servidor) |
 
 ## Uso
 
@@ -54,59 +68,123 @@ cargo run -- --port 22      # Servidor SSH en puerto 22
 - **Login:** `usuario:contraseña`
 - **Registro:** `usuario:contraseña:nombre`
 
-### Teclas
+### Atajos principales
 
 | Tecla | Acción |
-|---|---|---|
-| `j` / `k` o flechas | Navegar |
+|---|---|
+| `j`/`k` o flechas | Navegar |
 | `Enter` | Ver post / seleccionar |
 | `n` | Nuevo post |
-| `/` | Buscar posts (Tab: filtrar por fecha) |
-| `c` | Comentar |
+| `Ctrl+U` | Subir imagen (modo recepción SCP) |
+| `Ctrl+L` | Adjuntar imagen desde URL |
+| `/` | Buscar posts |
+| `#` | Trending hashtags |
+| `R` | Modo Radio (ticker de hashtags) |
 | `s` | Buscar usuarios |
 | `p` | Mi perfil |
+| `E` | Exportar datos (JSON) |
 | `m` | Mensajes directos |
-| `Ctrl+n` | Notificaciones |
-| `e` | Editar post / perfil |
-| `i` | Ver imagen adjunta |
+| `Ctrl+N` | Notificaciones |
+| `i` | Ver imagen |
+| `d` | Descargar imagen / Borrar imagen en upload |
+| `D` | Eliminar post (confirma con `y/n`) |
 | `f` | Seguir / dejar de seguir |
-| `Tab` | Cambiar entre login y registro / cambiar filtro |
-| `Esc` o `q` | Volver / salir |
+| `e` | Editar post / perfil |
+| `Ctrl+Q` | Salir |
+| `Tab` | Cambiar login/registro / cambiar filtro |
 
-## Producción en VPS
+### Subir imágenes (SCP)
+
+Desde la TUI, presioná `Ctrl+U` para entrar en modo recepción. El comando SCP se muestra en pantalla:
 
 ```bash
-# Puerto 22 para ssh directo (sin -p)
-export SSH_PORT=22
-export SSH_PASSWORD=muylarga_y_segura
-export DB_PASSWORD=otra_muy_segura
-
-# Firewall
-sudo ./firewall.sh
-
-# Iniciar
-SSH_PORT=22 SSH_PASSWORD=muylarga_y_segura DB_PASSWORD=otra_muy_segura docker compose up -d
-
-# Conectarse directo (el username de SSH no importa)
-ssh tu-servidor.com -t
+scp -P 2222 archivo.jpg localhost:jeseth/archivo.jpg
 ```
 
-> **Nota:** Si tu VPS ya usa el puerto 22 para OpenSSH, usá otro puerto (2222, 8022, etc.) o pará el sshd existente primero.
+- La imagen se valida, se limpia de metadata y se convierte a JPEG (máx 512px)
+- Se guarda en `uploads/jeseth/`
+- Solo se permite subir al directorio de tu usuario de sesión
+- Las imágenes se detectan automáticamente en la TUI
 
-## Licencia
+### Exportar datos
 
-AGPL-3.0 — Cualquiera puede usar, modificar y distribuir el código,
-pero si lo servís en una red pública, tenés que publicar los cambios.
+```bash
+# CLI
+cargo run -- --export --user jeseth --format json
+
+# TUI: desde tu perfil, presioná E
+```
+
+Genera `export_jeseth_20260520_120000.json` con posts, comentarios, mensajes, seguidores.
+
+### Plugins de moderación
+
+```bash
+AGORA_MODERATION_PLUGINS=spam,profanity,link cargo run -- --port 2222
+```
+
+- `spam`: bloquea mayúsculas excesivas y caracteres repetidos
+- `profanity`: bloquea palabras configuradas
+- `link`: bloquea URLs sospechosas
+
+## Producción
+
+```bash
+# 1. Generar claves
+./setup-keys.sh
+
+# 2. Firewall
+sudo ./firewall.sh
+
+# 3. Contraseñas seguras
+export SSH_PASSWORD="$(openssl rand -base64 32)"
+export DB_PASSWORD="$(openssl rand -base64 32)"
+
+# 4. Desplegar (nginx + 3 instancias + PostgreSQL)
+SSH_PASSWORD="$SSH_PASSWORD" DB_PASSWORD="$DB_PASSWORD" docker compose up -d
+
+# 5. Seed de datos
+docker compose exec agora1 agora --seed
+```
 
 ## Arquitectura
 
 ```
-┌──────────────┐     ┌──────────────┐     ┌────────────┐
-│ SSH Client   │────▶│ SSH Server   │────▶│ Ratatui    │
-│ (PuTTY, etc) │     │ (russh:2222) │     │ TUI        │
-└──────────────┘     └──────┬───────┘     └────────────┘
-                            │ forkpty
-                    ┌───────┴───────┐
-                    │ PostgreSQL    │
-                    └───────────────┘
+     ┌──────────────┐
+     │ SSH Client   │  ssh -p 2222
+     └──────┬───────┘
+            │
+     ┌──────▼──────┐
+     │ nginx:2222   │  (TCP stream proxy)
+     └──┬────┬────┬─┘
+        │    │    │
+   ┌────▼┐ ┌▼──┐ ┌▼────┐
+   │ago1 │ │2  │ │ago3 │   (3 instancias)
+   └──┬──┘ └┬──┘ └──┬──┘
+      └──────┼───────┘
+          ┌──▼──┐
+          │ DB  │          (PostgreSQL)
+          └─────┘
 ```
+
+## Documentación
+
+| Documento | Contenido |
+|---|---|
+| `MANUAL_TECNICO.md` | Arquitectura, seguridad, código, API |
+| `ESCALABILIDAD.md` | Cómo soporta 500-1500 usuarios simultáneos |
+| `plan.txt` | Filosofía y concepto original |
+
+## Licencia
+
+AGPL-3.0
+
+---
+
+## Donaciones ❤️
+
+Si AGORA te gusta y querés apoyar el desarrollo:
+
+[![PayPal](https://img.shields.io/badge/PayPal-Donar-blue?style=flat&logo=paypal)](https://paypal.me/ceggarr199)
+
+**PayPal:** `ceggarr199@gmail.com`

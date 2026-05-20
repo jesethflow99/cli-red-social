@@ -4,8 +4,10 @@ use std::sync::Arc;
 
 mod app;
 mod db;
+mod firewall;
 mod i18n;
 mod models;
+mod plugins;
 mod ssh;
 mod theme;
 
@@ -26,19 +28,70 @@ struct Cli {
 
     #[arg(long)]
     seed: bool,
+
+    #[arg(long)]
+    export: bool,
+
+    #[arg(long)]
+    user: Option<String>,
+
+    #[arg(long, default_value = "json")]
+    format: String,
+
+    #[arg(long, default_value = "")]
+    log: String,
+}
+
+fn setup_logging(log_file: &str, stderr: bool) {
+    if log_file.is_empty() {
+        if stderr {
+            tracing_subscriber::fmt()
+                .with_writer(std::io::stderr)
+                .with_max_level(tracing::Level::INFO)
+                .init();
+        }
+        return;
+    }
+
+    let file = match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(log_file)
+    {
+        Ok(f) => f,
+        Err(e) => {
+            if stderr {
+                eprintln!("No se pudo abrir archivo de log: {}", e);
+            }
+            return;
+        }
+    };
+
+    tracing_subscriber::fmt()
+        .with_writer(std::sync::Mutex::new(file))
+        .with_max_level(tracing::Level::DEBUG)
+        .init();
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if !cli.tui {
-        tracing_subscriber::fmt()
-            .with_writer(std::io::stderr)
-            .init();
-    }
+    setup_logging(&cli.log, !cli.tui && !cli.export);
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
     let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
+
+    if cli.export {
+        let database = db::Database::new(&db_url)?;
+        let username = cli.user.as_deref().unwrap_or("");
+        if username.is_empty() {
+            anyhow::bail!("Debes especificar --user <username> para exportar");
+        }
+        let result = database.export_user_data(username)?;
+        println!("Export exitoso: {}", result);
+        println!("Descarga con: scp -P 2222 localhost:{} .", result);
+        return Ok(());
+    }
 
     if cli.seed {
         let database = db::Database::new(&db_url)?;
@@ -86,6 +139,11 @@ fn spawn_cleanup_thread(db: Arc<db::Database>) {
         match db.cleanup_old_data(90) {
             Ok((m, n)) => tracing::info!("Cleanup: {} mensajes, {} notificaciones eliminados", m, n),
             Err(e) => tracing::error!("Error en cleanup: {}", e),
+        }
+        match db.cleanup_inactive_users(730) {
+            Ok(n) if n > 0 => tracing::info!("Cleanup: {} cuentas inactivas eliminadas", n),
+            Ok(_) => {}
+            Err(e) => tracing::error!("Error en cleanup de cuentas: {}", e),
         }
     });
 }

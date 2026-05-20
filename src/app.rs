@@ -28,7 +28,8 @@ pub fn run_tui(db_conn: &str) -> Result<()> {
     terminal.hide_cursor()?;
     terminal.clear()?;
 
-    let mut app = App::new(app_db, Lang::from_env());
+    let plugins = crate::plugins::load_plugins_from_env("AGORA_MODERATION_PLUGINS");
+    let mut app = App::new(app_db, Lang::from_env(), plugins);
     let result = app.run(&mut terminal);
     let _ = terminal.show_cursor();
     result
@@ -66,6 +67,7 @@ pub struct App {
     pub db: Box<dyn DatabaseOps>,
     pub lang: Lang,
     pub theme: AppTheme,
+    pub plugins: crate::plugins::PluginRegistry,
     pub current_user: Option<User>,
     pub screen: Screen,
     pub timeline: Vec<Post>,
@@ -116,6 +118,16 @@ pub struct App {
     pub hashtag_posts: Vec<Post>,
     pub hashtag_current: String,
     pub trending_hashtags: Vec<(String, i64)>,
+    pub radio_hashtags: Vec<(String, i64)>,
+    pub radio_idx: usize,
+    pub radio_paused: bool,
+    pub radio_post: Option<Post>,
+    pub radio_tick_frame: u64,
+    pub upload_known_count: usize,
+    pub upload_waiting: bool,
+    pub upload_new_file: Option<String>,
+    pub upload_client_ip: Option<String>,
+    pub upload_watch_count: usize,
 }
 
 #[derive(Clone)]
@@ -178,7 +190,7 @@ impl App {
         SPINNER[(self.frame_count as usize / 3) % SPINNER.len()]
     }
 
-    pub fn new(db: Box<dyn DatabaseOps>, lang: Lang) -> Self {
+    pub fn new(db: Box<dyn DatabaseOps>, lang: Lang, plugins: crate::plugins::PluginRegistry) -> Self {
         Self {
             db,
             lang,
@@ -233,6 +245,17 @@ impl App {
             hashtag_posts: vec![],
             hashtag_current: String::new(),
             trending_hashtags: vec![],
+            radio_hashtags: vec![],
+            radio_idx: 0,
+            radio_paused: false,
+            radio_post: None,
+            radio_tick_frame: 0,
+            upload_known_count: 0,
+            upload_waiting: false,
+            upload_new_file: None,
+            upload_client_ip: None,
+            upload_watch_count: 0,
+            plugins,
         }
     }
 
@@ -247,6 +270,62 @@ impl App {
     pub fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
         loop {
             self.frame_count += 1;
+
+            if self.screen == Screen::Radio && !self.radio_paused && !self.radio_hashtags.is_empty() {
+                if self.frame_count - self.radio_tick_frame > 96 {
+                    self.radio_idx = (self.radio_idx + 1) % self.radio_hashtags.len();
+                    self.radio_tick_frame = self.frame_count;
+                    if let Err(e) = self.advance_radio() {
+                        tracing::error!("Radio advance failed: {e}");
+                    }
+                }
+            }
+
+            if self.upload_mode && self.upload_waiting {
+                if self.frame_count % 10 == 0 {
+                    let username = self.current_user.as_ref().unwrap().username.clone();
+                    let current = crate::ssh::list_uploaded_images(&username);
+                    if current.len() > self.upload_known_count {
+                        let prev: std::collections::HashSet<String> = self.uploaded_images
+                            .iter().map(|(n, _)| n.clone()).collect();
+                        let new_files: Vec<String> = current.iter()
+                            .map(|(n, _)| n.clone())
+                            .filter(|n| !prev.contains(n))
+                            .collect();
+                        if let Some(new_name) = new_files.into_iter().next() {
+                            self.upload_new_file = Some(new_name.clone());
+                            eprintln!("[agora] ✅ Nuevo archivo detectado: {}", new_name);
+                        }
+                        self.upload_waiting = false;
+                        self.upload_known_count = current.len();
+                        self.uploaded_images = current;
+                        self.list_state.select(Some(0));
+                        self.set_status(format!("✅ Archivo recibido — seleccioná con Enter"));
+                    }
+                }
+            }
+
+            // Global watcher: detecta nuevos archivos en cualquier pantalla
+            if self.current_user.is_some() && self.frame_count % 30 == 0 {
+                let username = self.current_user.as_ref().unwrap().username.clone();
+                let current = crate::ssh::list_uploaded_images(&username);
+                if current.len() != self.upload_watch_count {
+                    if current.len() > self.upload_watch_count {
+                        let prev: std::collections::HashSet<String> = self.uploaded_images
+                            .iter().map(|(n, _)| n.clone()).collect();
+                        let new_names: Vec<String> = current.iter()
+                            .map(|(n, _)| n.clone())
+                            .filter(|n| !prev.contains(n))
+                            .collect();
+                        if let Some(name) = new_names.first() {
+                            self.set_status(format!("🆕 Nuevo archivo: {}", name));
+                        }
+                    }
+                    self.upload_watch_count = current.len();
+                    self.uploaded_images = current;
+                    self.upload_known_count = self.uploaded_images.len();
+                }
+            }
 
             if self.needs_clear {
                 terminal.clear()?;
@@ -337,6 +416,7 @@ impl App {
             Screen::PostSearch => self.handle_post_search_key(key),
             Screen::HashtagView => self.handle_hashtag_key(key),
             Screen::HashtagTrending => self.handle_hashtag_trending_key(key),
+            Screen::Radio => self.handle_radio_key(key),
         }
     }
 
@@ -359,6 +439,10 @@ impl App {
                         Ok(result) => match result {
                             AuthResult::Success(user) => {
                                 self.current_user = Some(user);
+                                self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
+                                if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
+                                    crate::ssh::write_scp_user_for_token(&ip, &username);
+                                }
                                 self.screen = Screen::Timeline;
                                 self.page = 0;
                                 self.input.clear();
@@ -409,9 +493,17 @@ impl App {
                     } else if let Err(e) = self.db.check_register_rate_limit() {
                         self.set_status(format!("{}", e));
                     } else {
+                        if let Err(e) = self.plugins.can_register(username, display) {
+                            self.set_status(e.to_string());
+                            return Ok(true);
+                        }
                         match self.db.register_user(username, password, display) {
                             Ok(user) => {
                                 self.current_user = Some(user);
+                                self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
+                                if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
+                                    crate::ssh::write_scp_user_for_token(&ip, &username);
+                                }
                                 self.screen = Screen::Timeline;
                                 self.page = 0;
                                 self.input.clear();
@@ -443,7 +535,7 @@ impl App {
     fn handle_timeline_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         self.status_message = None;
         match key.code {
-            KeyCode::Char('q') => return Ok(false),
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Char('/') => {
                 self.input.clear();
                 self.post_search_results.clear();
@@ -473,6 +565,18 @@ impl App {
                 let id = self.current_user.as_ref().unwrap().id;
                 self.screen = Screen::Profile(id);
                 self.load_profile(id)?;
+            }
+            KeyCode::Char('R') => {
+                self.radio_hashtags = self.db.get_trending_hashtags(50)?;
+                self.radio_idx = 0;
+                self.radio_paused = false;
+                self.radio_tick_frame = 0;
+                if self.radio_hashtags.is_empty() {
+                    self.set_status(t!(self, radio_no_tags).to_string());
+                } else {
+                    self.advance_radio()?;
+                    self.screen = Screen::Radio;
+                }
             }
             KeyCode::Char('#') => {
                 self.trending_hashtags = self.db.get_trending_hashtags(20)?;
@@ -544,7 +648,7 @@ impl App {
         if self.upload_mode {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => {
-                    self.upload_mode = false;
+                    self.leave_upload_mode();
                     self.input.clear();
                     self.input.push_str(&self.saved_post_input);
                     self.saved_post_input.clear();
@@ -553,12 +657,12 @@ impl App {
                     if let Some(i) = self.list_state.selected() {
                         if let Some((name, _)) = self.uploaded_images.get(i) {
                             let username = &self.current_user.as_ref().unwrap().username;
-                            let upload_path = format!("/data/uploads/{}/{}", username, name);
+                            let upload_path = format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
                             self.attached_image = Some(upload_path);
                             self.set_status(format!("Imagen adjuntada: {}", name));
                         }
                     }
-                    self.upload_mode = false;
+                    self.leave_upload_mode();
                     self.input.clear();
                     self.input.push_str(&self.saved_post_input);
                     self.saved_post_input.clear();
@@ -575,6 +679,38 @@ impl App {
                     if len > 0 {
                         let i = self.list_state.selected().unwrap_or(0);
                         self.list_state.select(Some((i + 1).min(len - 1)));
+                    }
+                }
+                KeyCode::Char('r') => {
+                    let username = &self.current_user.as_ref().unwrap().username.clone();
+                    self.uploaded_images = crate::ssh::list_uploaded_images(&username);
+                    self.upload_known_count = self.uploaded_images.len();
+                    self.set_status(format!("Lista actualizada ({} archivos)", self.upload_known_count));
+                }
+                KeyCode::Char('d') => {
+                    let username = self.current_user.as_ref().unwrap().username.clone();
+                    if let Some(i) = self.list_state.selected() {
+                        if let Some((name, _)) = self.uploaded_images.get(i) {
+                            let path = format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
+                            if std::fs::remove_file(&path).is_ok() {
+                                // Clear image reference from posts that used it
+                                let _ = self.db.clear_image_from_posts(&path);
+                                // If we had this image attached, detach it
+                                if self.attached_image.as_ref() == Some(&path) {
+                                    self.attached_image = None;
+                                }
+                                self.set_status(format!("Borrado: {}", name));
+                            } else {
+                                self.set_status(format!("No se pudo borrar: {}", name));
+                            }
+                            self.uploaded_images = crate::ssh::list_uploaded_images(&username);
+                            self.upload_known_count = self.uploaded_images.len();
+                            if self.uploaded_images.is_empty() {
+                                self.list_state.select(None);
+                            } else if i >= self.uploaded_images.len() {
+                                self.list_state.select(Some(self.uploaded_images.len() - 1));
+                            }
+                        }
                     }
                 }
                 _ => {}
@@ -617,19 +753,23 @@ impl App {
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.saved_post_input = self.input.clone();
                 self.input.clear();
-                self.url_mode = true;
-                self.set_status(t!(self, create_post_attach_prompt).to_string());
+                self.upload_mode = true;
+                self.upload_waiting = true;
+                self.upload_new_file = None;
+                let username = &self.current_user.as_ref().unwrap().username;
+                eprintln!("[agora] 📥 Modo recepción: usuario={}", username);
+                eprintln!("[agora] 📥 Esperando archivo en uploads/{}...", username);
+                self.uploaded_images = crate::ssh::list_uploaded_images(username);
+                self.upload_known_count = self.uploaded_images.len();
+                self.list_state.select(Some(0));
+                let cmd = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username);
+                self.set_status(format!("📥 ESPERANDO ARCHIVO — {}", cmd));
             }
-            KeyCode::Char('u') => {
+            KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
                 self.saved_post_input = self.input.clone();
                 self.input.clear();
-                self.upload_mode = true;
-                let username = &self.current_user.as_ref().unwrap().username;
-                self.uploaded_images = crate::ssh::list_uploaded_images(username);
-                self.list_state.select(Some(0));
-                if self.uploaded_images.is_empty() {
-                    self.set_status(format!("Sin imágenes. scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username));
-                }
+                self.url_mode = true;
+                self.set_status(t!(self, create_post_attach_prompt).to_string());
             }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => { self.input.pop(); }
@@ -643,6 +783,12 @@ impl App {
                 if !self.input.trim().is_empty() {
                     let user_id = self.current_user.as_ref().unwrap().id;
                     let content = self.input.trim().to_string();
+                    if let Err(e) = self.plugins.filter_post(user_id, &content) {
+                        self.set_status(e.to_string());
+                        self.input.clear();
+                        self.attached_image = None;
+                        return Ok(true);
+                    }
                     let img = self.attached_image.clone();
                     self.db.create_post(user_id, &content, img.as_deref())?;
                     let status = if img.is_some() { t!(self, create_post_published_img) } else { t!(self, create_post_published) };
@@ -814,7 +960,6 @@ impl App {
             std::thread::spawn(move || {
                 let _ = tx.send(Self::sync_download(&url));
             });
-            // Poll with timeout via event system
             let start = std::time::Instant::now();
             let result = loop {
                 if start.elapsed() > std::time::Duration::from_secs(15) {
@@ -824,7 +969,6 @@ impl App {
                     break result;
                 }
                 if let Ok(true) = event::poll(std::time::Duration::from_millis(200)) {
-                    // Drain events so TUI stays responsive
                     let _ = event::read();
                 }
             };
@@ -839,24 +983,25 @@ impl App {
             path
         };
 
-        // Now clear and show
+        // Clear screen and show image
         print!("\x1b[2J\x1b[H");
         let _ = std::io::stdout().flush();
-
         let shown = Self::view_image(actual_path);
 
         if !shown {
-            println!("{}", t!(app, image_no_viewer));
+            println!("{}\n", t!(app, image_no_viewer));
             if Self::is_url(path) { println!("URL: {}", path); }
             else { println!("Archivo: {}", actual_path); }
         }
 
-        println!("\n{}", t!(app, image_download_prompt));
+        // Bottom bar
+        let bar = format!("\n─────────────────────────────────────────────────────────\n  d: descargar  |  Enter/q/Esc: volver");
+        println!("{}", bar);
         let _ = std::io::stdout().flush();
 
         let start = std::time::Instant::now();
         loop {
-            if start.elapsed() > std::time::Duration::from_secs(30) {
+            if start.elapsed() > std::time::Duration::from_secs(60) {
                 break;
             }
             match event::poll(std::time::Duration::from_millis(200)) {
@@ -866,8 +1011,6 @@ impl App {
                             match key.code {
                                 KeyCode::Char('d') => {
                                     Self::print_download_instructions(actual_path, app);
-                                    println!("\n{}", t!(app, image_press_q));
-                                    let _ = std::io::stdout().flush();
                                 }
                                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
                                 _ => {}
@@ -943,39 +1086,25 @@ impl App {
     }
 
     fn print_download_instructions(path: &str, app: &mut App) {
-        println!("\n{}", t!(app, image_download_header));
+        let fname = path.rsplit('/').next().unwrap_or("imagen.jpg");
         let data = match std::fs::read(path) {
             Ok(d) => d,
             Err(_) => {
-                println!("  {}", t!(app, image_download_error));
+                println!("\n  Error al leer el archivo.");
                 return;
             }
         };
-        let ext = path.rsplit('.').next().unwrap_or("jpg");
-        let filename = format!("imagen.{}", ext);
-        let fname = path.rsplit('/').next().unwrap_or("imagen.jpg");
 
-        println!("  {}", t!(app, image_download_info));
-        println!("  {} — {}", filename, Self::format_size(data.len() as u64));
+        // Copy to uploads dir for SCP download
+        let copy_name = format!("{}", fname);
+        let copy_path = format!("{}/{}", crate::ssh::upload_dir(), fname);
+        let _ = std::fs::create_dir_all(crate::ssh::upload_dir());
+        std::fs::write(&copy_path, &data).ok();
 
-        // Copy to uploads dir so user can SCP download it
-        let copied;
-        let scp_path = if path.starts_with("/data/uploads/") {
-            fname
-        } else {
-            copied = format!("/data/uploads/{}", fname);
-            let _ = std::fs::create_dir_all("/data/uploads");
-            if std::fs::write(&copied, &data).is_ok() {
-                fname
-            } else {
-                fname
-            }
-        };
-
-        println!("  {}", t!(app, image_download_scp));
-        println!("  \x1b[32mscp -P 2222 localhost:{} .\x1b[0m", scp_path);
-        println!();
-        println!("{}", t!(app, image_press_q));
+        println!("\n  📥 Descargar: {} — {}", fname, Self::format_size(data.len() as u64));
+        println!("  scp -P 2222 localhost:{} .\n", copy_name);
+        println!("  d: descargar  |  Enter/q/Esc: volver");
+        let _ = std::io::stdout().flush();
     }
 
     fn wait_for_exit_key() {
@@ -1023,6 +1152,12 @@ impl App {
                     if !self.comment_input.trim().is_empty() {
                         let parent_id = self.reply_to_comment_id.take();
                         if let Some(ref post) = self.viewed_post.clone() {
+                            if let Err(e) = self.plugins.filter_comment(user_id, self.comment_input.trim()) {
+                                self.set_status(e.to_string());
+                                self.comment_mode = false;
+                                self.comment_input.clear();
+                                return Ok(true);
+                            }
                             self.db.add_comment(post.id, user_id, self.comment_input.trim(), parent_id)?;
                             self.post_comments = self.db.get_comments(post.id)?;
                             let tree = build_comment_tree(&self.post_comments);
@@ -1594,6 +1729,22 @@ impl App {
                     }
                 }
             }
+            KeyCode::Char('E') => {
+                if self.viewed_user.as_ref().map(|u| u.id) == Some(user_id) {
+                    let username = self.current_user.as_ref().unwrap().username.clone();
+                    if let Some(ip) = crate::firewall::get_client_ip("SSH_CLIENT_IP") {
+                        crate::firewall::allow_scp(&ip);
+                    }
+                    match self.db.export_user_data(&username) {
+                        Ok(filename) => {
+                            self.set_status(format!("Exportado: {}. Descarga con: scp -P 2222 localhost:{} .", filename, filename));
+                        }
+                        Err(e) => {
+                            self.set_status(format!("Error exportando: {}", e));
+                        }
+                    }
+                }
+            }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.viewed_user_posts.len();
                 if len > 0 {
@@ -1851,6 +2002,109 @@ impl App {
         Ok(true)
     }
 
+    fn leave_upload_mode(&mut self) {
+        self.upload_mode = false;
+        self.upload_waiting = false;
+        self.upload_new_file = None;
+    }
+
+    fn advance_radio(&mut self) -> Result<()> {
+        if self.radio_hashtags.is_empty() {
+            return Ok(());
+        }
+        let tag = &self.radio_hashtags[self.radio_idx % self.radio_hashtags.len()].0.clone();
+        let posts = self.db.get_posts_by_hashtag(tag, 0, 1)?;
+        if let Some(post) = posts.into_iter().next() {
+            self.radio_post = Some(post);
+        } else {
+            self.radio_idx = (self.radio_idx + 1) % self.radio_hashtags.len().max(1);
+            return self.advance_radio();
+        }
+        Ok(())
+    }
+
+    fn handle_radio_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        match key.code {
+            KeyCode::Char('b') | KeyCode::Esc => {
+                self.screen = Screen::Timeline;
+                self.refresh_timeline()?;
+            }
+            KeyCode::Char('r') => {
+                self.radio_paused = !self.radio_paused;
+                if !self.radio_paused {
+                    self.radio_tick_frame = self.frame_count;
+                }
+            }
+            KeyCode::Char('n') => {
+                self.radio_idx = (self.radio_idx + 1) % self.radio_hashtags.len().max(1);
+                self.radio_tick_frame = self.frame_count;
+                self.advance_radio()?;
+            }
+            KeyCode::Enter => {
+                if let Some(ref post) = self.radio_post.clone() {
+                    let pid = post.id;
+                    self.viewed_post = Some(post.clone());
+                    self.refresh_comments(pid)?;
+                    self.comment_input.clear();
+                    self.comment_list_state = ListState::default();
+                    self.edit_mode = false;
+                    self.screen = Screen::PostDetail(pid);
+                }
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn render_radio(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Min(1)])
+            .margin(1)
+            .split(area);
+
+        if self.radio_hashtags.is_empty() {
+            let msg = Paragraph::new(t!(self, radio_no_tags))
+                .style(Style::default().fg(self.theme.muted))
+                .wrap(Wrap { trim: false });
+            f.render_widget(msg, chunks[0]);
+            return;
+        }
+
+        if let Some((tag, count)) = self.radio_hashtags.get(self.radio_idx % self.radio_hashtags.len()) {
+            let title = t!(self, radio_title).replace("{}", tag).replace("{}", &count.to_string());
+            let status = if self.radio_paused { " [PAUSADO]" } else { "" };
+            let header = Paragraph::new(Line::from(Span::styled(
+                format!("{}{}", title, status),
+                self.theme.header_style,
+            )))
+            .block(self.theme.simple_block())
+            .wrap(Wrap { trim: false });
+            f.render_widget(header, chunks[0]);
+        }
+
+        if let Some(ref post) = self.radio_post {
+            let ago = i18n::ago(self.lang, &post.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
+            let content_spans = Self::render_content_with_tags(&post.content, self.theme.accent, self.theme.success);
+            let mut line_spans = vec![
+                Span::styled(format!("@{}", post.username), Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD)),
+                Span::raw("\n\n"),
+            ];
+            line_spans.extend(content_spans);
+            line_spans.push(Span::raw("\n\n"));
+            line_spans.push(Span::styled(format!("[{}]", ago), Style::default().fg(self.theme.muted)));
+
+            let post_par = Paragraph::new(Line::from(line_spans))
+                .block(self.theme.simple_block())
+                .wrap(Wrap { trim: false });
+            f.render_widget(post_par, chunks[1]);
+        }
+
+        let help = Paragraph::new(Line::from(Span::styled(t!(self, radio_help), Style::default().fg(self.theme.secondary))))
+            .wrap(Wrap { trim: false });
+        f.render_widget(help, chunks[2]);
+    }
+
     fn refresh_timeline(&mut self) -> Result<()> {
         let user_id = self.current_user.as_ref().unwrap().id;
         let offset = self.page as u64 * self.page_size as u64;
@@ -1951,6 +2205,10 @@ impl App {
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let partner_id = self.chat_partner.as_ref().map(|u| u.id).unwrap_or(0);
+                    if let Err(e) = self.plugins.filter_message(user_id, partner_id, self.input.trim()) {
+                        self.set_status(e.to_string());
+                        return Ok(true);
+                    }
                     let msg = self.db.send_message(user_id, partner_id, self.input.trim())?;
                     self.chat_messages.push(msg);
                     self.input.clear();
@@ -2289,6 +2547,7 @@ impl App {
                 Screen::PostSearch => self.render_post_search(f, content_area),
                 Screen::HashtagView => self.render_hashtag_view(f, content_area),
                 Screen::HashtagTrending => self.render_hashtag_trending(f, content_area),
+                Screen::Radio => self.render_radio(f, content_area),
             }
         } else {
             match self.screen {
@@ -2333,6 +2592,7 @@ impl App {
             Screen::Notifications => t!(self, status_bar_notifications),
             Screen::PostSearch => t!(self, status_bar_post_search),
             Screen::HashtagView | Screen::HashtagTrending => t!(self, hashtag_trending),
+            Screen::Radio => t!(self, status_bar_radio),
             Screen::Login | Screen::Register => "",
         };
 
@@ -2420,13 +2680,13 @@ impl App {
         let mut constraints = vec![
             Constraint::Length(3),
             Constraint::Length(0),
-            Constraint::Length(1),
+            Constraint::Min(1),
         ];
         let status_h = if self.status_message.is_some() { 1 } else { 0 };
         if status_h > 0 {
             constraints[1] = Constraint::Length(status_h);
         }
-        constraints.push(Constraint::Min(5));
+        constraints.push(Constraint::Length(1));
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -2478,14 +2738,14 @@ impl App {
             .style(self.theme.list_item_style(i))
         }).collect();
 
-        let timeline_chunk = chunks.len() - 1;
+        let timeline_chunk = 2;
         let list = List::new(items)
             .block(self.theme.simple_block())
             .highlight_style(self.theme.highlight())
             .highlight_symbol("> ");
         f.render_stateful_widget(list, chunks[timeline_chunk], &mut self.list_state.clone());
 
-        let help_idx = 2;
+        let help_idx = chunks.len() - 1;
         let help = Paragraph::new(Line::from(Span::styled(t!(self, timeline_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
         f.render_widget(help, chunks[help_idx]);
     }
@@ -2507,28 +2767,40 @@ impl App {
         if self.upload_mode {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+                .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
                 .margin(1)
                 .split(area);
 
-            let header = Paragraph::new(Line::from(Span::styled(" 📷 Imágenes subidas ", self.theme.header_style)))
+            let spinner = if self.upload_waiting { self.spinner_char().to_string() } else { "✓".into() };
+            let header_text = format!(" 📷 Imágenes — escuchando {}  ", spinner);
+            let header = Paragraph::new(Line::from(Span::styled(header_text, self.theme.header_style)))
                 .block(self.theme.simple_block());
             f.render_widget(header, chunks[0]);
 
+            let username = self.current_user.as_ref().map(|u| u.username.as_str()).unwrap_or("usuario");
+            let hint = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg  [↑↓: elegir  Enter: seleccionar  d: borrar  Esc: volver]", username);
+            let hint_par = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(self.theme.secondary))));
+            f.render_widget(hint_par, chunks[1]);
+
             if self.uploaded_images.is_empty() {
-                let hint = format!("Sin imágenes. scp -P 2222 archivo.jpg localhost:{}/archivo.jpg",
-                    self.current_user.as_ref().map(|u| u.username.as_str()).unwrap_or("usuario"));
-                let empty = Paragraph::new(hint)
+                let empty = Paragraph::new("(sin archivos aún)")
                     .style(Style::default().fg(self.theme.muted));
-                f.render_widget(empty, chunks[1]);
+                f.render_widget(empty, chunks[2]);
             } else {
                 let selected = self.list_state.selected().unwrap_or(0);
                 let total = self.uploaded_images.len();
                 let items: Vec<ListItem> = self.uploaded_images.iter().enumerate().map(|(i, (name, size))| {
                     let bullet = if total > 0 && i == selected { "▶ " } else { "  " };
+                    let is_new = self.upload_new_file.as_ref().map_or(false, |n| n == name);
+                    let name_style = if is_new {
+                        Style::default().fg(self.theme.success).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(self.theme.accent)
+                    };
+                    let prefix = if is_new { "🆕 " } else { "" };
                     ListItem::new(Line::from(vec![
                         Span::raw(bullet),
-                        Span::styled(name, Style::default().fg(self.theme.accent)),
+                        Span::styled(format!("{}{}", prefix, name), name_style),
                         Span::raw("  "),
                         Span::styled(size, Style::default().fg(self.theme.muted)),
                     ]))
@@ -2539,11 +2811,16 @@ impl App {
                     .block(self.theme.simple_block())
                     .highlight_style(self.theme.highlight())
                     .highlight_symbol("  ");
-                f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
+                f.render_stateful_widget(list, chunks[2], &mut self.list_state.clone());
             }
 
-            let help = Paragraph::new(Line::from(Span::styled("j/k: navegar  Enter: seleccionar  Esc: cancelar", Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
-            f.render_widget(help, chunks[2]);
+            let help_text = if self.upload_waiting {
+                format!("{} Esperando archivo... (r: refrescar  Esc: cancelar)", self.spinner_char())
+            } else {
+                "✅ Archivo listo — Enter para seleccionar  Esc: cancelar".to_string()
+            };
+            let help = Paragraph::new(Line::from(Span::styled(help_text, Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+            f.render_widget(help, chunks[3]);
             return;
         }
 
@@ -2580,12 +2857,15 @@ impl App {
 
     fn render_post_detail(&self, f: &mut Frame, area: Rect) {
         if let Some(ref post) = self.viewed_post {
+            let has_status = self.confirming_delete_post || self.status_message.is_some();
+            let status_h = if has_status { 2 } else { 0 };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
                     Constraint::Length(3),
+                    Constraint::Length(status_h),
                     Constraint::Min(1),
-                    Constraint::Length(3),
+                    Constraint::Length(1),
                 ])
                 .margin(1)
                 .split(area);
@@ -2596,6 +2876,20 @@ impl App {
                 .style(self.theme.header_style)
                 .block(self.theme.simple_block());
             f.render_widget(header, chunks[0]);
+
+            if has_status {
+                let status = if self.confirming_delete_post {
+                    t!(self, post_detail_delete_confirm).to_string()
+                } else {
+                    self.status_message.clone().unwrap_or_default()
+                };
+                let st = Paragraph::new(status)
+                    .style(Style::default().fg(self.theme.error));
+                f.render_widget(st, chunks[1]);
+            }
+
+            let content_idx = 2;
+            let help_idx = 3;
 
             let mut inner = vec![
                 Constraint::Length(1),  // post text
@@ -2614,7 +2908,7 @@ impl App {
                 .direction(Direction::Vertical)
                 .constraints(inner)
                 .margin(1)
-                .split(chunks[1]);
+                .split(chunks[content_idx]);
 
             let mut idx = 0;
             let text = Paragraph::new(post.content.as_str())
@@ -2682,7 +2976,7 @@ impl App {
             } else {
                 Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_view), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
             };
-            f.render_widget(help, chunks[2]);
+            f.render_widget(help, chunks[help_idx]);
         }
     }
 }
