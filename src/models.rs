@@ -9,6 +9,7 @@ pub struct User {
     pub bio: String,
     pub utc_offset: i32,
     pub created_at: DateTime<Utc>,
+    pub public_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,6 +61,7 @@ pub struct Message {
     pub content: String,
     pub created_at: DateTime<Utc>,
     pub read: bool,
+    pub encrypted: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -92,6 +94,7 @@ mod tests {
             bio: "Hello".into(),
             utc_offset: 0,
             created_at: make_date(),
+            public_key: None,
         };
         assert_eq!(user.id, 1);
         assert_eq!(user.username, "testuser");
@@ -152,6 +155,7 @@ mod tests {
             content: "Hey Bob!".into(),
             created_at: make_date(),
             read: false,
+            encrypted: false,
         };
         assert!(!msg.read);
         assert_eq!(msg.sender_username, "alice");

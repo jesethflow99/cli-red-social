@@ -119,4 +119,41 @@ AGORA NO es ActivityPub ni federado por defecto.
 
 Cada instancia es un mundo aparte. La filosofía es más cercana a un BBS clásico o a tilde.club que al Fediverso. Si alguien corre su propia instancia, opera de forma independiente.
 
+Anonimato
+
+· La IP registrada en logs es la del ISP/proveedor (NAT), no la del dispositivo final
+· Despliegue sobre Tor Onion Service → IP del cliente invisible para el servidor
+· Sin email, teléfono ni datos reales requeridos
+· El username de SSH no se asocia a ningún usuario de Agora
+
 ---
+
+Cifrado End-to-End de Mensajería (Plan)
+
+Objetivo: que los mensajes directos sean ilegibles para el servidor.
+
+Fase 1 — X25519 + AES-GCM (por sesión)
+· Cada usuario genera un par de claves X25519 al registrarse
+· La clave pública se almacena en la BD (public_key TEXT)
+· Al iniciar un chat, los clientes hacen ECDH con las claves públicas
+· Derivar shared secret → AES-256-GCM
+· Los mensajes se cifran en la TUI antes de enviarse
+· La BD solo ve ciphertext + nonce + tag
+· Claves privadas: nunca salen de la sesión TUI (memoria)
+
+Fase 2 — Doble Ratchet (Signal Protocol simplificado)
+· Cada mensaje rota la clave (ratchet de Diffie-Hellman)
+· Forward secrecy: comprometer una clave no revela mensajes pasados
+· Post-compromise security: el ratchet se autocura
+
+Fase 3 — Grupos cifrados
+· Sender keys para chats grupales
+· Rotación de claves al entrar/salir miembros
+
+Consideraciones:
+· Las claves públicas se comparten vía el servidor (no cifradas, solo autenticadas)
+· El servidor no puede leer mensajes pero sí metadatos (quién habla con quién, cuándo)
+· Para ocultar metadatos → Tor Onion Service resuelve eso
+· Las notificaciones de "nuevo mensaje" no revelan contenido
+
+Prioridad: Fase 1 (ECDH estático) para MVP de mensajería cifrada.

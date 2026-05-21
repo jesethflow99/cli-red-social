@@ -3,6 +3,7 @@ use chrono::{DateTime, Utc};
 use postgres::NoTls;
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
+use sha2::{Sha256, Digest};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
@@ -14,6 +15,93 @@ pub enum AuthResult {
     Success(User),
     UserNotFound,
     WrongPassword,
+}
+
+// ── E2E Encryption helpers ────────────────────────────────
+
+pub fn derive_keypair(password: &str, username: &str) -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
+    let mut hasher = Sha256::new();
+    hasher.update(b"agora-x25519-v1:");
+    hasher.update(username.to_lowercase().as_bytes());
+    hasher.update(b":");
+    hasher.update(password.as_bytes());
+    let hash: [u8; 32] = hasher.finalize().into();
+    let secret = x25519_dalek::StaticSecret::from(hash);
+    let public = x25519_dalek::PublicKey::from(&secret);
+    (secret, public)
+}
+
+pub fn e2e_encrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &str, plaintext: &str) -> Result<String> {
+    use base64::Engine;
+
+    let their_bytes = base64::engine::general_purpose::STANDARD
+        .decode(their_public_b64)
+        .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+    let their_key: [u8; 32] = their_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
+    let their_public = x25519_dalek::PublicKey::from(their_key);
+
+    let shared = our_secret.diffie_hellman(&their_public);
+    let aes_key: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"agora-aes-v1:");
+        hasher.update(shared.as_bytes());
+        hasher.finalize().into()
+    };
+
+    let nonce_bytes: [u8; 12] = rand::random();
+    let ciphertext = aes_encrypt(&aes_key, &nonce_bytes, plaintext.as_bytes())?;
+
+    let mut combined = Vec::new();
+    combined.extend_from_slice(&nonce_bytes);
+    combined.extend_from_slice(&ciphertext);
+    Ok(base64::engine::general_purpose::STANDARD.encode(&combined))
+}
+
+pub fn e2e_decrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &str, encrypted_b64: &str) -> Result<String> {
+    use base64::Engine;
+
+    let their_bytes = base64::engine::general_purpose::STANDARD
+        .decode(their_public_b64)
+        .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
+    let their_key: [u8; 32] = their_bytes.try_into()
+        .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
+    let their_public = x25519_dalek::PublicKey::from(their_key);
+
+    let shared = our_secret.diffie_hellman(&their_public);
+    let aes_key: [u8; 32] = {
+        let mut hasher = Sha256::new();
+        hasher.update(b"agora-aes-v1:");
+        hasher.update(shared.as_bytes());
+        hasher.finalize().into()
+    };
+
+    let combined = base64::engine::general_purpose::STANDARD
+        .decode(encrypted_b64)
+        .map_err(|e| anyhow::anyhow!("Invalid ciphertext: {}", e))?;
+    if combined.len() < 12 {
+        anyhow::bail!("Ciphertext too short");
+    }
+    let plaintext = aes_decrypt(&aes_key, &combined[..12], &combined[12..])?;
+    String::from_utf8(plaintext).map_err(|e| anyhow::anyhow!("Invalid UTF-8: {}", e))
+}
+
+fn aes_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::aead::Aead;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("Invalid key"))?;
+    cipher.encrypt(Nonce::from_slice(nonce), plaintext)
+        .map_err(|e| anyhow::anyhow!("AES encrypt: {}", e))
+}
+
+fn aes_decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    use aes_gcm::aead::Aead;
+    let cipher = Aes256Gcm::new_from_slice(key)
+        .map_err(|_| anyhow::anyhow!("Invalid key"))?;
+    cipher.decrypt(Nonce::from_slice(nonce), ciphertext)
+        .map_err(|e| anyhow::anyhow!("AES decrypt: {}", e))
 }
 
 #[allow(dead_code)]
@@ -38,7 +126,7 @@ pub trait DatabaseOps: Send {
     fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()>;
     fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()>;
     fn delete_user(&self, user_id: i64) -> Result<()>;
-    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message>;
+    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message>;
     fn get_conversations(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>>;
     fn get_unread_count(&self, user_id: i64) -> Result<i64>;
@@ -59,6 +147,7 @@ pub trait DatabaseOps: Send {
     fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>>;
     fn export_user_data(&self, username: &str) -> Result<String>;
     fn clear_image_from_posts(&self, path: &str) -> Result<u64>;
+    fn get_public_key(&self, user_id: i64) -> Result<Option<String>>;
 }
 
 impl DatabaseOps for Database {
@@ -122,8 +211,8 @@ impl DatabaseOps for Database {
     fn delete_user(&self, user_id: i64) -> Result<()> {
         Database::delete_user(self, user_id)
     }
-    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
-        Database::send_message(self, sender_id, receiver_id, content)
+    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message> {
+        Database::send_message(self, sender_id, receiver_id, content, encrypted)
     }
     fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
         Database::get_conversations(self, user_id)
@@ -184,6 +273,9 @@ impl DatabaseOps for Database {
     }
     fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
         Database::clear_image_from_posts(self, path)
+    }
+    fn get_public_key(&self, user_id: i64) -> Result<Option<String>> {
+        Database::get_public_key(self, user_id)
     }
 }
 
@@ -309,6 +401,7 @@ impl Database {
             );
             ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TEXT NOT NULL DEFAULT '';
             ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0;
+            ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT NOT NULL DEFAULT '';
             CREATE TABLE IF NOT EXISTS posts (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id),
@@ -336,6 +429,7 @@ impl Database {
                 created_at TEXT NOT NULL,
                 read INTEGER NOT NULL DEFAULT 0
             );
+            ALTER TABLE messages ADD COLUMN IF NOT EXISTS encrypted INTEGER NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS notifications (
                 id BIGSERIAL PRIMARY KEY,
                 user_id BIGINT NOT NULL REFERENCES users(id),
@@ -386,9 +480,11 @@ impl Database {
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
         let now = Utc::now().to_rfc3339();
         let username_lower = username.trim().to_lowercase();
+        let (_, public_key) = derive_keypair(password, &username_lower);
+        let pk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public_key.as_bytes());
         let rows = conn.query(
-            "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at) VALUES ($1, $2, $3, 0, $4) RETURNING id",
-            &[&username_lower, &hash, &display_name, &now],
+            "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at, public_key) VALUES ($1, $2, $3, 0, $4, $5) RETURNING id",
+            &[&username_lower, &hash, &display_name, &now, &pk_b64],
         )?;
         let id: i64 = rows[0].get(0);
         Ok(User {
@@ -398,6 +494,7 @@ impl Database {
             bio: String::new(),
             utc_offset: 0,
             created_at: now.parse().unwrap(),
+            public_key: Some(pk_b64),
         })
     }
 
@@ -405,7 +502,7 @@ impl Database {
         let conn = self.pool.get().map_err(|e| anyhow::anyhow!("pool.get failed: {e}"))?;
         let mut conn = conn;
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash FROM users WHERE LOWER(username) = LOWER($1)",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash, public_key FROM users WHERE LOWER(username) = LOWER($1)",
             &[&username],
         ).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
         if let Some(row) = rows.into_iter().next() {
@@ -417,6 +514,7 @@ impl Database {
                     "UPDATE users SET last_login_at = $1, login_count = login_count + 1 WHERE id = $2",
                     &[&now, &id],
                 ).map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
+                let pk: String = row.get(7);
                 return Ok(AuthResult::Success(User {
                     id: row.get(0),
                     username: row.get(1),
@@ -424,6 +522,7 @@ impl Database {
                     bio: row.get(3),
                     utc_offset: row.get(4),
                     created_at: row.get::<_, String>(5).parse().unwrap(),
+                    public_key: if pk.is_empty() { None } else { Some(pk) },
                 }));
             } else {
                 return Ok(AuthResult::WrongPassword);
@@ -435,7 +534,7 @@ impl Database {
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE id = $1",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE id = $1",
             &[&id],
         )?;
         Ok(rows.into_iter().next().map(|row| User {
@@ -444,6 +543,7 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
+                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }))
     }
@@ -452,7 +552,7 @@ impl Database {
         let mut conn = self.pool.get()?;
         let pattern = format!("%{}%", query);
         let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY username LIMIT $2 OFFSET $3",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY username LIMIT $2 OFFSET $3",
             &[&pattern, &(limit as i64), &(offset as i64)],
         )?;
         Ok(rows.iter().map(|row| User {
@@ -461,6 +561,7 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
+                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
@@ -677,7 +778,7 @@ impl Database {
     pub fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              JOIN follows f ON f.follower_id = u.id
              WHERE f.following_id = $1",
@@ -689,6 +790,7 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
+                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
@@ -938,7 +1040,7 @@ impl Database {
     pub fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              JOIN follows f ON f.following_id = u.id
              WHERE f.follower_id = $1",
@@ -950,17 +1052,18 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
+                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
 
-    pub fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
+    pub fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message> {
         self.check_rate_limit(sender_id, "message", 10, 60)?;
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
         let rows = conn.query(
-            "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-            &[&sender_id, &receiver_id, &content, &now],
+            "INSERT INTO messages (sender_id, receiver_id, content, created_at, encrypted) VALUES ($1, $2, $3, $4, $5) RETURNING id",
+            &[&sender_id, &receiver_id, &content, &now, &(encrypted as i32)],
         )?;
         let id: i64 = rows[0].get(0);
         let username: String = conn.query_one(
@@ -975,13 +1078,14 @@ impl Database {
             content: content.to_string(),
             created_at: now.parse().unwrap(),
             read: false,
+            encrypted,
         })
     }
 
     pub fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at
+            "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              WHERE u.id IN (
                  SELECT DISTINCT CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END
@@ -997,6 +1101,7 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
+                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }).collect())
     }
@@ -1004,7 +1109,7 @@ impl Database {
     pub fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
-            "SELECT m.id, m.sender_id, m.receiver_id, u.username, m.content, m.created_at, m.read
+            "SELECT m.id, m.sender_id, m.receiver_id, u.username, m.content, m.created_at, m.read, m.encrypted
              FROM messages m
              JOIN users u ON u.id = m.sender_id
              WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
@@ -1019,6 +1124,7 @@ impl Database {
             content: row.get(4),
             created_at: row.get::<_, String>(5).parse().unwrap(),
             read: row.get::<_, i32>(6) != 0,
+            encrypted: row.get::<_, i32>(7) != 0,
         }).collect())
     }
 
@@ -1152,6 +1258,18 @@ impl Database {
         Ok(deleted)
     }
 
+    pub fn get_public_key(&self, user_id: i64) -> Result<Option<String>> {
+        let mut conn = self.pool.get()?;
+        let row = conn.query_opt(
+            "SELECT public_key FROM users WHERE id = $1",
+            &[&user_id],
+        )?;
+        Ok(row.and_then(|r| {
+            let pk: String = r.get(0);
+            if pk.is_empty() { None } else { Some(pk) }
+        }))
+    }
+
     pub fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
         let mut conn = self.pool.get()?;
         let n = conn.execute(
@@ -1174,7 +1292,7 @@ impl Database {
         let mut conn = self.pool.get()?;
         let username_lower = username.trim().to_lowercase();
         let user_row = conn.query_opt(
-            "SELECT id, username, display_name, bio, utc_offset, created_at FROM users WHERE LOWER(username) = LOWER($1)",
+            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE LOWER(username) = LOWER($1)",
             &[&username_lower],
         )?.ok_or_else(|| anyhow::anyhow!("Usuario '{}' no encontrado", username))?;
 
@@ -1669,6 +1787,7 @@ use chrono::{DateTime, Utc};
                 bio: String::new(),
                 utc_offset: 0,
                 created_at: Utc::now(),
+                public_key: None,
             };
             data.users.push((user.clone(), hash));
             Ok(user)
@@ -1910,7 +2029,7 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str) -> Result<Message> {
+        fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, _encrypted: bool) -> Result<Message> {
             self.check_rate_limit(sender_id, "message", 10, 60)?;
             let mut data = self.data.lock().unwrap();
             let username = data.users.iter()
@@ -1927,6 +2046,7 @@ use chrono::{DateTime, Utc};
                 content: content.to_string(),
                 created_at: Utc::now(),
                 read: false,
+                encrypted: _encrypted,
             };
             data.messages.push(msg.clone());
             Ok(msg)
@@ -2084,6 +2204,13 @@ use chrono::{DateTime, Utc};
 
         fn export_user_data(&self, _username: &str) -> Result<String> {
             anyhow::bail!("Export no soportado en MockDatabase");
+        }
+
+        fn get_public_key(&self, _user_id: i64) -> Result<Option<String>> {
+            let data = self.data.lock().unwrap();
+            Ok(data.users.iter()
+                .find(|(u, _)| u.id == _user_id)
+                .and_then(|(u, _)| u.public_key.clone()))
         }
 
         fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
@@ -2261,7 +2388,7 @@ use chrono::{DateTime, Utc};
             let db = setup();
             db.create_post(1, "Alice post", None).unwrap();
             db.follow_user(1, 2).unwrap();
-            db.send_message(1, 2, "Hi").unwrap();
+            db.send_message(1, 2, "Hi", false).unwrap();
             db.delete_user(1).unwrap();
 
             assert!(db.get_user_by_id(1).unwrap().is_none());
@@ -2272,7 +2399,7 @@ use chrono::{DateTime, Utc};
         #[test]
         fn test_messages() {
             let db = setup();
-            let msg = db.send_message(1, 2, "Hey Bob!").unwrap();
+            let msg = db.send_message(1, 2, "Hey Bob!", false).unwrap();
             assert_eq!(msg.content, "Hey Bob!");
             assert!(!msg.read);
 
@@ -2287,8 +2414,8 @@ use chrono::{DateTime, Utc};
         #[test]
         fn test_unread_messages() {
             let db = setup();
-            db.send_message(1, 2, "Msg1").unwrap();
-            db.send_message(1, 2, "Msg2").unwrap();
+            db.send_message(1, 2, "Msg1", false).unwrap();
+            db.send_message(1, 2, "Msg2", false).unwrap();
 
             let unread = db.get_unread_count(2).unwrap();
             assert_eq!(unread, 2);

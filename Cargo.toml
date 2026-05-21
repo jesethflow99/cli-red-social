@@ -28,3 +28,7 @@ reqwest = { version = "0.12", features = ["blocking"] }
 base64 = "0.22"
 curl = { version = "0.4" }
 image = { version = "0.25", default-features = false, features = ["jpeg", "png", "gif", "webp"] }
+x25519-dalek = { version = "2", features = ["static_secrets"] }
+aes-gcm = "0.10"
+sha2 = "0.10"
+rand = "0.8"

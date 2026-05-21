@@ -20,7 +20,7 @@ struct Cli {
     #[arg(long, default_value = "2222")]
     port: u16,
 
-    #[arg(long, default_value = "postgres://social:agora@localhost/social")]
+    #[arg(long, default_value = "postgres://social:agora@localhost:5433/social")]
     db: String,
 
     #[arg(long, default_value = "host_key")]

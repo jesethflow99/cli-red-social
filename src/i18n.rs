@@ -177,6 +177,7 @@ pub struct LangStrings {
     pub chat_input_title: &'static str,
 
     pub notifications_title: &'static str,
+    pub notifications_help: &'static str,
     pub notifications_empty: &'static str,
 
     pub edit_profile_title: &'static str,
@@ -242,13 +243,13 @@ pub static ES: LangStrings = LangStrings {
     register_error_exists: "El usuario '@{}' ya existe",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navegar  Enter: ver  /: buscar  #: trends  n: post  s: users  p: perfil  m: msgs  Ctrl+n: notif  i: img  q: salir",
+    timeline_help: "j/k: nav  Enter: ver  /: buscar  #: trends  n: post  s: users  p: perfil  m: msgs  Ctrl+n: notif  i: img  Ctrl+q: salir",
     timeline_no_posts: "No hay posts en tu timeline",
     timeline_page: "Página {} — {} posts",
 
     create_post_title: " Nuevo Post ",
     create_post_url_title: " Pegar URL de imagen ",
-    create_post_help: "Enter: publicar   Ctrl+U: subir imagen   Ctrl+L: desde URL   Esc: cancelar",
+    create_post_help: "Enter: publicar   Ctrl+P: subir imagen   Ctrl+U: desde URL   Esc: cancelar",
     create_post_help_url: "Enter: adjuntar imagen desde URL   Esc: cancelar",
     create_post_published: "Post publicado",
     create_post_published_img: "Post con imagen publicado",
@@ -259,7 +260,7 @@ pub static ES: LangStrings = LangStrings {
 
     post_detail_comments: " Comentarios ",
     post_detail_no_comments: "Sin comentarios",
-    post_detail_help_view: "c: comentar   r: responder   i: imagen   ↑↓: navegar   d: eliminar comentario   e: editar   D: eliminar post   b: volver",
+    post_detail_help_view: "c: comentar  r: responder  i: imagen  ↑↓: nav  d: borrar coment  e: editar  D: borrar post  b: volver",
     post_detail_help_edit: "Enter: guardar   Esc: cancelar",
     post_detail_help_comment: "Enter: enviar   Esc: cancelar",
     post_detail_edit_title: " Editando post ",
@@ -277,7 +278,7 @@ pub static ES: LangStrings = LangStrings {
     profile_following: "Siguiendo",
     profile_not_following: "No sigues",
     profile_you: "tu perfil",
-    profile_help: "w: seguidores   g: siguiendo   f: follow/unfollow   e: editar perfil   x: borrar cuenta   m: mensaje   b: volver",
+    profile_help: "w: seguidores   g: siguiendo   f: follow/unfollow   e: editar perfil   m: mensaje   b: volver",
     profile_help_follow: "f: seguir",
     profile_help_unfollow: "f: dejar de seguir",
     profile_followed: "Siguiendo a @{}",
@@ -302,7 +303,7 @@ pub static ES: LangStrings = LangStrings {
     post_search_filter_7d: "Últimos 7 días",
     post_search_filter_30d: "Últimos 30 días",
     post_search_filter_title: " Filtrar por fecha ",
-    post_search_help: "Tab: cambiar filtro  Ctrl+f/p: cambiar página  Enter: buscar/seleccionar  Esc: volver",
+    post_search_help: "Tab: cambiar filtro  Ctrl+f/b: cambiar página  Enter: buscar/seleccionar  Esc: volver",
     post_search_results: " Resultados ",
 
     hashtag_title: " #{} — Posts",
@@ -313,13 +314,14 @@ pub static ES: LangStrings = LangStrings {
     messages_title: "📬 {} — Conversaciones",
     messages_empty: "No tienes conversaciones aún",
     messages_conversations: " Conversaciones ",
-    messages_help: "j/k: navegar   Enter: abrir   b: volver   q: salir",
+    messages_help: "j/k: navegar   Enter: abrir   Esc/b: volver",
 
-    chat_header: "💬 Chat con @{}  |  b: volver  Ctrl+q: salir",
+    chat_header: "💬 Chat con @{}  |  Esc: volver  Ctrl+q: salir",
     chat_input_title: " Mensaje (Enter: enviar) ",
 
     notifications_title: "🔔 Notificaciones",
     notifications_empty: "No tienes notificaciones",
+    notifications_help: "j/k: navegar  Enter: abrir  b/Esc: volver",
 
     edit_profile_title: "✏️ Editando perfil — @{}",
     edit_profile_name: " Nombre ",
@@ -382,13 +384,13 @@ pub static EN: LangStrings = LangStrings {
     register_error_exists: "User '@{}' already exists",
 
     timeline_title: "📱 @{} — Timeline",
-    timeline_help: "j/k: navigate  Enter: view  /: search  #: trends  n: post  s: users  p: profile  m: msgs  Ctrl+n: notif  i: img  q: quit",
+    timeline_help: "j/k: nav  Enter: view  /: search  #: trends  n: post  s: users  p: profile  m: msgs  Ctrl+n: notif  i: img  Ctrl+q: quit",
     timeline_no_posts: "No posts in your timeline",
     timeline_page: "Page {} — {} posts",
 
     create_post_title: " New Post ",
     create_post_url_title: " Paste image URL ",
-    create_post_help: "Enter: publish   Ctrl+U: upload image   Ctrl+L: from URL   Esc: cancel",
+    create_post_help: "Enter: publish   Ctrl+P: upload image   Ctrl+U: from URL   Esc: cancel",
     create_post_help_url: "Enter: attach image from URL   Esc: cancel",
     create_post_published: "Post published",
     create_post_published_img: "Post with image published",
@@ -399,7 +401,7 @@ pub static EN: LangStrings = LangStrings {
 
     post_detail_comments: " Comments ",
     post_detail_no_comments: "No comments",
-    post_detail_help_view: "c: comment   r: reply   i: image   ↑↓: navigate   d: delete comment   e: edit   D: delete post   b: back",
+    post_detail_help_view: "c: comment  r: reply  i: image  ↑↓: nav  d: del comment  e: edit  D: del post  b: back",
     post_detail_help_edit: "Enter: save   Esc: cancel",
     post_detail_help_comment: "Enter: send   Esc: cancel",
     post_detail_edit_title: " Editing post ",
@@ -417,7 +419,7 @@ pub static EN: LangStrings = LangStrings {
     profile_following: "Following",
     profile_not_following: "Not following",
     profile_you: "your profile",
-    profile_help: "w: followers   g: following   f: follow/unfollow   e: edit profile   x: delete account   m: message   b: back",
+    profile_help: "w: followers   g: following   f: follow/unfollow   e: edit profile   m: message   b: back",
     profile_help_follow: "f: follow",
     profile_help_unfollow: "f: unfollow",
     profile_followed: "Following @{}",
@@ -442,7 +444,7 @@ pub static EN: LangStrings = LangStrings {
     post_search_filter_7d: "Last 7 days",
     post_search_filter_30d: "Last 30 days",
     post_search_filter_title: " Filter by date ",
-    post_search_help: "Tab: change filter  Ctrl+f/p: change page  Enter: search/select  Esc: back",
+    post_search_help: "Tab: change filter  Ctrl+f/b: change page  Enter: search/select  Esc: back",
     post_search_results: " Results ",
 
     hashtag_title: " #{} — Posts",
@@ -453,13 +455,14 @@ pub static EN: LangStrings = LangStrings {
     messages_title: "📬 {} — Conversations",
     messages_empty: "No conversations yet",
     messages_conversations: " Conversations ",
-    messages_help: "j/k: navigate   Enter: open   b: back   q: quit",
+    messages_help: "j/k: navigate   Enter: open   Esc/b: back",
 
-    chat_header: "💬 Chat with @{}  |  b: back  Ctrl+q: quit",
+    chat_header: "💬 Chat with @{}  |  Esc: back  Ctrl+q: quit",
     chat_input_title: " Message (Enter: send) ",
 
     notifications_title: "🔔 Notifications",
     notifications_empty: "No notifications",
+    notifications_help: "j/k: navigate  Enter: open  b/Esc: back",
 
     edit_profile_title: "✏️ Editing profile — @{}",
     edit_profile_name: " Name ",

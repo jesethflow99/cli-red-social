@@ -128,6 +128,7 @@ pub struct App {
     pub upload_new_file: Option<String>,
     pub upload_client_ip: Option<String>,
     pub upload_watch_count: usize,
+    pub e2e_secret: Option<x25519_dalek::StaticSecret>,
 }
 
 #[derive(Clone)]
@@ -255,6 +256,7 @@ impl App {
             upload_new_file: None,
             upload_client_ip: None,
             upload_watch_count: 0,
+            e2e_secret: None,
             plugins,
         }
     }
@@ -439,6 +441,8 @@ impl App {
                         Ok(result) => match result {
                             AuthResult::Success(user) => {
                                 self.current_user = Some(user);
+                                let (secret, _) = crate::db::derive_keypair(password, username);
+                                self.e2e_secret = Some(secret);
                                 self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
                                 if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
                                     crate::ssh::write_scp_user_for_token(&ip, &username);
@@ -500,6 +504,8 @@ impl App {
                         match self.db.register_user(username, password, display) {
                             Ok(user) => {
                                 self.current_user = Some(user);
+                                let (secret, _) = crate::db::derive_keypair(password, username);
+                                self.e2e_secret = Some(secret);
                                 self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
                                 if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
                                     crate::ssh::write_scp_user_for_token(&ip, &username);
@@ -753,6 +759,12 @@ impl App {
             KeyCode::Char('u') if key.modifiers == KeyModifiers::CONTROL => {
                 self.saved_post_input = self.input.clone();
                 self.input.clear();
+                self.url_mode = true;
+                self.set_status(t!(self, create_post_attach_prompt).to_string());
+            }
+            KeyCode::Char('p') if key.modifiers == KeyModifiers::CONTROL => {
+                self.saved_post_input = self.input.clone();
+                self.input.clear();
                 self.upload_mode = true;
                 self.upload_waiting = true;
                 self.upload_new_file = None;
@@ -764,12 +776,6 @@ impl App {
                 self.list_state.select(Some(0));
                 let cmd = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username);
                 self.set_status(format!("📥 ESPERANDO ARCHIVO — {}", cmd));
-            }
-            KeyCode::Char('l') if key.modifiers == KeyModifiers::CONTROL => {
-                self.saved_post_input = self.input.clone();
-                self.input.clear();
-                self.url_mode = true;
-                self.set_status(t!(self, create_post_attach_prompt).to_string());
             }
             KeyCode::Char(c) => self.input.push(c),
             KeyCode::Backspace => { self.input.pop(); }
@@ -2148,6 +2154,25 @@ impl App {
         Ok(())
     }
 
+    fn decrypt_chat_messages(&mut self) {
+        let secret = self.e2e_secret.as_ref().map(|s| {
+            let bytes = s.to_bytes();
+            x25519_dalek::StaticSecret::from(bytes)
+        });
+        let partner_pk = self.chat_partner.as_ref().and_then(|p| p.public_key.clone());
+        for msg in &mut self.chat_messages {
+            if msg.encrypted {
+                if let (Some(secret), Some(pk)) = (&secret, &partner_pk) {
+                    if let Ok(plain) = crate::db::e2e_decrypt(secret, pk, &msg.content) {
+                        msg.content = plain;
+                    } else {
+                        msg.content = "[🔒 mensaje cifrado — no se pudo descifrar]".into();
+                    }
+                }
+            }
+        }
+    }
+
     fn load_chat(&mut self, other_id: i64) -> Result<()> {
         let user_id = self.current_user.as_ref().unwrap().id;
         self.chat_partner = self.db.get_user_by_id(other_id)?;
@@ -2209,7 +2234,7 @@ impl App {
                         self.set_status(e.to_string());
                         return Ok(true);
                     }
-                    let msg = self.db.send_message(user_id, partner_id, self.input.trim())?;
+                    let msg = self.db.send_message(user_id, partner_id, self.input.trim(), false)?;
                     self.chat_messages.push(msg);
                     self.input.clear();
                     self.unread_count = self.db.get_unread_count(user_id)?;
