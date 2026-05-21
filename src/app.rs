@@ -2240,6 +2240,7 @@ impl App {
                     self.unread_count = self.db.get_unread_count(user_id)?;
                 }
             }
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Esc => {
                 self.load_conversations()?;
                 self.screen = Screen::Messages;
@@ -2513,6 +2514,7 @@ impl App {
                 Constraint::Length(3),
                 Constraint::Min(3),
                 Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .margin(1)
             .split(area);
@@ -2546,6 +2548,9 @@ impl App {
             .block(Block::default().title(t!(self, chat_input_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
         f.render_widget(input, chunks[2]);
         Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, chunks[2].y + 1);
+
+        let help = Paragraph::new(Line::from(Span::styled("Enter: enviar  Esc: volver  Ctrl+q: salir", Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        f.render_widget(help, chunks[3]);
     }
 
     fn render(&self, f: &mut Frame) {
