@@ -2,6 +2,10 @@
 
 Guía completa para usar la red social desde tu terminal.
 
+> Este manual documenta la **TUI nativa** (Ratatui). Si tu conexión SSH sirve
+> **AGORA OpenTUI** (la interfaz por defecto en el despliegue Docker), la
+> navegación es distinta — ver [`ui-opentui/README.md`](ui-opentui/README.md).
+
 ---
 
 ## Índice
@@ -56,6 +60,17 @@ Ejemplo:  jeseth:m1cl4v3:Jeseth G.
 - Contraseña: mínimo 4 caracteres
 - Nombre: el que se mostrará en tu perfil
 
+Si el servidor tiene el registro en modo invitación
+(`REGISTRATION_MODE=invite`, el default en el despliegue Docker), agregá el
+código de invitación al final:
+
+```
+Formato: usuario:contraseña:nombre:invitación
+Ejemplo:  jeseth:m1cl4v3:Jeseth G.:AB12CD34
+```
+
+Cada código es de un solo uso. Pedile uno a quien administre el servidor.
+
 ### Iniciar sesión
 
 ```
@@ -85,8 +100,8 @@ Tu feed principal. Muestra las publicaciones de las personas que seguís y las t
 | `k` / `↑` | Publicación anterior |
 | `Enter` | Ver detalle de la publicación |
 | `n` | Crear nueva publicación |
-| `Ctrl+U` | Subir imagen (modo recepción SCP) |
-| `Ctrl+L` | Adjuntar imagen desde URL |
+| `Ctrl+P` | Subir imagen (modo recepción SCP) |
+| `Ctrl+U` | Adjuntar imagen desde URL |
 | `/` | Buscar publicaciones |
 | `#` | Ver trending hashtags |
 | `R` | Modo Radio (ticker automático) |
@@ -117,8 +132,8 @@ Presioná `n` desde el timeline para crear una publicación.
 | Tecla | Acción |
 |---|---|
 | Escribir texto | Redactar contenido |
-| `Ctrl+U` | Adjuntar imagen desde archivo local (SCP) |
-| `Ctrl+L` | Adjuntar imagen desde URL |
+| `Ctrl+P` | Adjuntar imagen desde archivo local (SCP) |
+| `Ctrl+U` | Adjuntar imagen desde URL |
 | `Enter` | Publicar |
 | `Esc` | Cancelar |
 
@@ -128,14 +143,14 @@ Presioná `n` desde el timeline para crear una publicación.
 - Las menciones (`@usuario`) generan notificación al mencionado
 - Límite: 5 publicaciones por minuto
 
-### Adjuntar imagen desde URL (`Ctrl+L`)
+### Adjuntar imagen desde URL (`Ctrl+U`)
 
-1. Presioná `Ctrl+L`
+1. Presioná `Ctrl+U`
 2. Pegá la URL de la imagen (debe terminar en .jpg, .jpeg, .png, .gif o .webp)
 3. Presioná `Enter`
 4. La URL se guarda en la publicación (la imagen se descarga solo al verla)
 
-### Adjuntar imagen local (`Ctrl+U`)
+### Adjuntar imagen local (`Ctrl+P`)
 
 Ver sección [Subir imágenes](#61-subir-imágenes-locales-scp).
 
@@ -174,7 +189,7 @@ Desde trending, seleccioná uno con `Enter`. Verás todas las publicaciones etiq
 
 Este es el método para subir imágenes desde tu computadora al servidor.
 
-1. En la pantalla de crear publicación, presioná `Ctrl+U`
+1. En la pantalla de crear publicación, presioná `Ctrl+P`
 2. La TUI entra en **modo recepción** y te muestra el comando SCP exacto:
 
    ```
@@ -229,7 +244,7 @@ Copiá ese comando en otra terminal para descargar la imagen a tu computadora.
 
 ### 6.4 Borrar imágenes
 
-Desde el modo recepción (`Ctrl+U`):
+Desde el modo recepción (`Ctrl+P`):
 1. Seleccioná la imagen con las flechas
 2. Presioná `d`
 3. La imagen se borra del disco y se desvincula de cualquier publicación que la usara
@@ -543,8 +558,8 @@ El archivo incluye:
 | Tecla | Acción |
 |---|---|
 | `n` | Nuevo post |
-| `Ctrl+U` | Subir imagen |
-| `Ctrl+L` | Adjuntar URL |
+| `Ctrl+P` | Subir imagen |
+| `Ctrl+U` | Adjuntar URL |
 | `/` | Buscar posts |
 | `#` | Trending hashtags |
 | `R` | Modo Radio |

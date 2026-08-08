@@ -29,10 +29,15 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info
-      - SSH_PASSWORD=${SSH_PASSWORD:-agora}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:-agora}@db/social
+      - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
+      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
       - LANG=${LANG:-es}
+      - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
       - AGORA_UPLOAD_DIR=/data/uploads
+      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
+      - NODE_NO_WARNINGS=1
+      - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
+      - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
     command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
     networks:
       - agora_net
@@ -50,10 +55,15 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info
-      - SSH_PASSWORD=${SSH_PASSWORD:-agora}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:-agora}@db/social
+      - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
+      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
       - LANG=${LANG:-es}
+      - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
       - AGORA_UPLOAD_DIR=/data/uploads
+      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
+      - NODE_NO_WARNINGS=1
+      - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
+      - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
     command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
     networks:
       - agora_net
@@ -71,10 +81,15 @@ services:
         condition: service_healthy
     environment:
       - RUST_LOG=info
-      - SSH_PASSWORD=${SSH_PASSWORD:-agora}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:-agora}@db/social
+      - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
+      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
       - LANG=${LANG:-es}
+      - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
       - AGORA_UPLOAD_DIR=/data/uploads
+      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
+      - NODE_NO_WARNINGS=1
+      - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
+      - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
     command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
     networks:
       - agora_net
@@ -88,7 +103,7 @@ services:
       - "127.0.0.1:5433:5432"
     environment:
       POSTGRES_USER: social
-      POSTGRES_PASSWORD: ${DB_PASSWORD:-agora}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD in .env}
       POSTGRES_DB: social
     volumes:
       - pgdata:/var/lib/postgresql/data

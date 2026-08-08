@@ -41,13 +41,14 @@ impl AppTheme {
     }
 
     pub fn status_bar(&self) -> Style {
-        Style::default().fg(self.status_bar_fg).bg(self.status_bar_bg)
+        Style::default()
+            .fg(self.status_bar_fg)
+            .bg(self.status_bar_bg)
     }
 
     pub fn highlight(&self) -> Style {
         Style::default().bg(self.highlight_bg)
     }
-
 }
 
 impl Default for AppTheme {

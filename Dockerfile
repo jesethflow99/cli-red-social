@@ -17,7 +17,15 @@ RUN cargo build --release
 COPY . .
 RUN touch src/main.rs && cargo build --release
 
-FROM debian:bookworm-slim
+FROM node:26-bookworm-slim AS ui-builder
+
+WORKDIR /opt/agora-ui
+COPY ui-opentui/package.json ui-opentui/package-lock.json ./
+RUN npm ci
+COPY ui-opentui/tsconfig.json ./
+COPY ui-opentui/src ./src
+
+FROM node:26-bookworm-slim
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
@@ -31,6 +39,10 @@ RUN useradd -m -s /bin/bash app
 RUN mkdir /data && chown app:app /data
 
 COPY --from=builder /app/target/release/agora /usr/local/bin/agora
+COPY --from=ui-builder /opt/agora-ui /opt/agora-ui
+
+ENV AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
+ENV AGORA_BACKEND_BIN=/usr/local/bin/agora
 
 WORKDIR /data
 EXPOSE 2222

@@ -1,16 +1,16 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use anyhow::Result;
 use async_trait::async_trait;
 use image::GenericImageView;
-use nix::pty::{forkpty, ForkptyResult};
+use nix::pty::{ForkptyResult, forkpty};
 use nix::sys::wait::waitpid;
-use nix::unistd::{write};
+use nix::unistd::write;
 use russh::keys::key::KeyPair;
 use russh::keys::load_secret_key;
 use russh::server::*;
@@ -25,7 +25,9 @@ pub fn upload_dir() -> &'static str {
     use std::sync::LazyLock;
     static DIR: LazyLock<String> = LazyLock::new(|| {
         if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR") {
-            if !d.is_empty() { return d; }
+            if !d.is_empty() {
+                return d;
+            }
         }
         if std::path::Path::new("/data").exists() {
             "/data/uploads".into()
@@ -75,7 +77,10 @@ pub fn clear_scp_user_for_token(token: &str) {
 
 fn generate_session_token() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
     let pid = std::process::id();
     format!("{:x}", ts.wrapping_mul(pid as u128))
 }
@@ -123,7 +128,10 @@ impl SftpSession {
                 return None;
             }
         };
-        let allowed = read_scp_user_for_token(&ip);
+        // Los comandos asistidos usan un usuario SSH efímero como token. Se
+        // conserva el bloqueo por IP para compatibilidad con el flujo antiguo.
+        let allowed =
+            read_scp_user_for_token(&self.allowed_user).or_else(|| read_scp_user_for_token(&ip));
         let user = match allowed {
             Some(u) => u,
             None => {
@@ -133,6 +141,15 @@ impl SftpSession {
         };
         sanitize_path_for_user(path, &user)
     }
+
+    /// Resuelve una ruta para operaciones de solo lectura (descarga,
+    /// listado, stat). Las imágenes subidas quedan adjuntas a posts
+    /// públicos, así que cualquier sesión SSH autenticada puede leerlas;
+    /// solo la escritura se restringe al directorio del propio usuario
+    /// mediante `user_path`.
+    fn read_path(&self, path: &str) -> Option<std::path::PathBuf> {
+        sanitize_path(path)
+    }
 }
 
 fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
@@ -140,7 +157,12 @@ fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn sanitize_path_for_user(path: &str, user: &str) -> Option<std::path::PathBuf> {
-    let path = path.trim_start_matches('/');
+    let mut path = path.trim_start_matches('/');
+    // Clients (notably OpenSSH's SFTP-based scp when the destination arg is
+    // omitted) send targets like "./file.jpg" instead of a bare filename.
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
     let upload_base = std::path::PathBuf::from(upload_dir());
 
     if path.is_empty() || path == "." {
@@ -153,7 +175,11 @@ fn sanitize_path_for_user(path: &str, user: &str) -> Option<std::path::PathBuf> 
     let (user_dir, relative) = if let Some((first, rest)) = path.split_once('/') {
         // If a specific user is required, reject mismatch
         if !user.is_empty() && first != user {
-            tracing::info!("SCP rejected: path user '{}' != session user '{}'", first, user);
+            tracing::info!(
+                "SCP rejected: path user '{}' != session user '{}'",
+                first,
+                user
+            );
             return None;
         }
         (first, rest)
@@ -179,7 +205,11 @@ fn sanitize_path_for_user(path: &str, user: &str) -> Option<std::path::PathBuf> 
         return Some(full);
     }
 
-    tracing::warn!("path escape attempt: {} not in {}", full.display(), base.display());
+    tracing::warn!(
+        "path escape attempt: {} not in {}",
+        full.display(),
+        base.display()
+    );
     None
 }
 
@@ -187,7 +217,10 @@ fn process_image(path: &std::path::Path) {
     let img = match image::open(path) {
         Ok(i) => i,
         Err(_) => {
-            tracing::warn!("Uploaded file is not a valid image, deleting: {}", path.display());
+            tracing::warn!(
+                "Uploaded file is not a valid image, deleting: {}",
+                path.display()
+            );
             let _ = std::fs::remove_file(path);
             return;
         }
@@ -209,13 +242,22 @@ fn process_image(path: &std::path::Path) {
     let jpeg_path = path.with_extension("jpg");
     let mut buf = Vec::new();
     let mut cursor = std::io::Cursor::new(&mut buf);
-    if resized.write_to(&mut cursor, image::ImageFormat::Jpeg).is_ok() {
+    if resized
+        .write_to(&mut cursor, image::ImageFormat::Jpeg)
+        .is_ok()
+    {
         let _ = std::fs::write(&jpeg_path, &buf);
         if jpeg_path != path {
             let _ = std::fs::remove_file(path);
         }
-        tracing::info!("Image processed: {} -> {} ({}x{}, {} bytes)",
-            path.display(), jpeg_path.display(), new_w, new_h, buf.len());
+        tracing::info!(
+            "Image processed: {} -> {} ({}x{}, {} bytes)",
+            path.display(),
+            jpeg_path.display(),
+            new_w,
+            new_h,
+            buf.len()
+        );
     }
 }
 
@@ -227,7 +269,10 @@ pub fn list_uploaded_images(username: &str) -> Vec<(String, String)> {
         for entry in entries.flatten() {
             let path = entry.path();
             if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if matches!(ext.to_lowercase().as_str(), "jpg" | "jpeg" | "png" | "gif" | "webp") {
+                if matches!(
+                    ext.to_lowercase().as_str(),
+                    "jpg" | "jpeg" | "png" | "gif" | "webp"
+                ) {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
                         images.push((name.to_string(), format!("{:.1} KB", size as f64 / 1024.0)));
@@ -261,7 +306,11 @@ impl russh_sftp::server::Handler for SftpSession {
             return Err(StatusCode::ConnectionLost);
         }
         self.version = Some(version);
-        tracing::info!("SFTP version: {:?}, extensions: {:?}", self.version, extensions);
+        tracing::info!(
+            "SFTP version: {:?}, extensions: {:?}",
+            self.version,
+            extensions
+        );
         Ok(Version::new())
     }
 
@@ -274,11 +323,13 @@ impl russh_sftp::server::Handler for SftpSession {
     ) -> Result<Handle, Self::Error> {
         let _ = std::fs::create_dir_all(upload_dir());
 
-        let p = self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?;
-        let write = pflags.contains(OpenFlags::WRITE);
-
         let write = pflags.contains(OpenFlags::WRITE);
         let read = pflags.contains(OpenFlags::READ);
+        let p = if write {
+            self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?
+        } else {
+            self.read_path(&filename).ok_or(StatusCode::PermissionDenied)?
+        };
 
         let file = if write {
             std::fs::File::create(&p).map_err(|_| StatusCode::Failure)?
@@ -291,26 +342,28 @@ impl russh_sftp::server::Handler for SftpSession {
         };
 
         let handle = self.next_handle();
-        self.open_files.insert(handle.clone(), OpenFile {
-            path: p,
-            file: Arc::new(Mutex::new(file)),
-            is_write: write,
-        });
+        self.open_files.insert(
+            handle.clone(),
+            OpenFile {
+                path: p,
+                file: Arc::new(Mutex::new(file)),
+                is_write: write,
+            },
+        );
 
         Ok(Handle { id, handle })
     }
 
-    async fn close(
-        &mut self,
-        id: u32,
-        handle: String,
-    ) -> Result<Status, Self::Error> {
+    async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
         if let Some(open_file) = self.open_files.remove(&handle) {
             if open_file.is_write {
                 let path = open_file.path.clone();
                 tokio::task::spawn_blocking(move || {
                     process_image(&path);
                 });
+                if self.allowed_user.starts_with("upload-") {
+                    clear_scp_user_for_token(&self.allowed_user);
+                }
             }
         }
         Ok(Self::status_ok(id))
@@ -326,7 +379,8 @@ impl russh_sftp::server::Handler for SftpSession {
         use std::io::{Read, Seek};
         let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
         let mut file = open_file.file.lock().unwrap();
-        file.seek(std::io::SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
         let mut buf = vec![0u8; len as usize];
         let n = file.read(&mut buf).map_err(|_| StatusCode::Failure)?;
         buf.truncate(n);
@@ -343,7 +397,8 @@ impl russh_sftp::server::Handler for SftpSession {
         use std::io::{Seek, Write};
         let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
         let mut file = open_file.file.lock().unwrap();
-        file.seek(std::io::SeekFrom::Start(offset)).map_err(|_| StatusCode::Failure)?;
+        file.seek(std::io::SeekFrom::Start(offset))
+            .map_err(|_| StatusCode::Failure)?;
 
         let current_pos = offset + data.len() as u64;
         if current_pos > MAX_IMAGE_SIZE {
@@ -354,12 +409,8 @@ impl russh_sftp::server::Handler for SftpSession {
         Ok(Self::status_ok(id))
     }
 
-    async fn lstat(
-        &mut self,
-        id: u32,
-        path: String,
-    ) -> Result<Attrs, Self::Error> {
-        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let p = self.read_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
         Ok(Attrs {
             id,
@@ -367,11 +418,7 @@ impl russh_sftp::server::Handler for SftpSession {
         })
     }
 
-    async fn fstat(
-        &mut self,
-        id: u32,
-        handle: String,
-    ) -> Result<Attrs, Self::Error> {
+    async fn fstat(&mut self, id: u32, handle: String) -> Result<Attrs, Self::Error> {
         let open_file = self.open_files.get(&handle).ok_or(StatusCode::BadMessage)?;
         let file = open_file.file.lock().unwrap();
         let meta = file.metadata().map_err(|_| StatusCode::Failure)?;
@@ -399,12 +446,8 @@ impl russh_sftp::server::Handler for SftpSession {
         Ok(Self::status_ok(id))
     }
 
-    async fn opendir(
-        &mut self,
-        id: u32,
-        path: String,
-    ) -> Result<Handle, Self::Error> {
-        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
+    async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
+        let p = self.read_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let _ = std::fs::read_dir(&p).map_err(|_| StatusCode::NoSuchFile)?;
 
         let handle = self.next_handle();
@@ -414,12 +457,12 @@ impl russh_sftp::server::Handler for SftpSession {
         Ok(Handle { id, handle })
     }
 
-    async fn readdir(
-        &mut self,
-        id: u32,
-        handle: String,
-    ) -> Result<Name, Self::Error> {
-        let dir_path = self.open_dirs.get(&handle).ok_or(StatusCode::BadMessage)?.clone();
+    async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let dir_path = self
+            .open_dirs
+            .get(&handle)
+            .ok_or(StatusCode::BadMessage)?
+            .clone();
 
         let entries = std::fs::read_dir(&dir_path).map_err(|_| StatusCode::NoSuchFile)?;
         let mut files = Vec::new();
@@ -438,12 +481,10 @@ impl russh_sftp::server::Handler for SftpSession {
         Ok(Name { id, files })
     }
 
-    async fn remove(
-        &mut self,
-        id: u32,
-        filename: String,
-    ) -> Result<Status, Self::Error> {
-        let p = self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?;
+    async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
+        let p = self
+            .user_path(&filename)
+            .ok_or(StatusCode::PermissionDenied)?;
         std::fs::remove_file(&p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -459,34 +500,24 @@ impl russh_sftp::server::Handler for SftpSession {
         Ok(Self::status_ok(id))
     }
 
-    async fn rmdir(
-        &mut self,
-        id: u32,
-        path: String,
-    ) -> Result<Status, Self::Error> {
+    async fn rmdir(&mut self, id: u32, path: String) -> Result<Status, Self::Error> {
         let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
         std::fs::remove_dir(&p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
 
-    async fn realpath(
-        &mut self,
-        id: u32,
-        path: String,
-    ) -> Result<Name, Self::Error> {
-        let p = self.user_path(&path).unwrap_or_else(|| std::path::PathBuf::from(upload_dir()));
+    async fn realpath(&mut self, id: u32, path: String) -> Result<Name, Self::Error> {
+        let p = self
+            .user_path(&path)
+            .unwrap_or_else(|| std::path::PathBuf::from(upload_dir()));
         Ok(Name {
             id,
             files: vec![File::dummy(p.to_string_lossy().to_string())],
         })
     }
 
-    async fn stat(
-        &mut self,
-        id: u32,
-        path: String,
-    ) -> Result<Attrs, Self::Error> {
-        let p = self.user_path(&path).ok_or(StatusCode::PermissionDenied)?;
+    async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let p = self.read_path(&path).ok_or(StatusCode::PermissionDenied)?;
         let meta = std::fs::metadata(&p).map_err(|_| StatusCode::NoSuchFile)?;
         Ok(Attrs {
             id,
@@ -500,8 +531,12 @@ impl russh_sftp::server::Handler for SftpSession {
         oldpath: String,
         newpath: String,
     ) -> Result<Status, Self::Error> {
-        let old_p = self.user_path(&oldpath).ok_or(StatusCode::PermissionDenied)?;
-        let new_p = self.user_path(&newpath).ok_or(StatusCode::PermissionDenied)?;
+        let old_p = self
+            .user_path(&oldpath)
+            .ok_or(StatusCode::PermissionDenied)?;
+        let new_p = self
+            .user_path(&newpath)
+            .ok_or(StatusCode::PermissionDenied)?;
         std::fs::rename(&old_p, &new_p).map_err(|_| StatusCode::Failure)?;
         Ok(Self::status_ok(id))
     }
@@ -546,7 +581,11 @@ pub struct SshServer {
 
 impl SshServer {
     pub fn new(db: Arc<Database>, db_conn: &str, ssh_password: &str) -> Self {
-        Self { _db: db, db_conn: db_conn.to_string(), ssh_password: ssh_password.to_string() }
+        Self {
+            _db: db,
+            db_conn: db_conn.to_string(),
+            ssh_password: ssh_password.to_string(),
+        }
     }
 
     pub async fn run(&mut self, port: u16, key_path: &str) -> Result<()> {
@@ -618,12 +657,20 @@ impl Handler for SshSession {
             Ok(Auth::Accept)
         } else {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-            Ok(Auth::Reject { proceed_with_methods: None })
+            Ok(Auth::Reject {
+                proceed_with_methods: None,
+            })
         }
     }
 
-    async fn auth_publickey(&mut self, _: &str, _: &russh::keys::key::PublicKey) -> Result<Auth, Self::Error> {
-        Ok(Auth::Reject { proceed_with_methods: None })
+    async fn auth_publickey(
+        &mut self,
+        _: &str,
+        _: &russh::keys::key::PublicKey,
+    ) -> Result<Auth, Self::Error> {
+        Ok(Auth::Reject {
+            proceed_with_methods: None,
+        })
     }
 
     async fn channel_open_session(
@@ -692,11 +739,31 @@ impl Handler for SshSession {
                     if !ssh_user.is_empty() {
                         unsafe { std::env::set_var("SSH_USER", &ssh_user) };
                     }
-                    let _ = std::panic::catch_unwind(|| {
-                        if let Err(e) = crate::app::run_tui(&db_conn) {
-                            eprintln!("Error iniciando TUI: {e}");
+                    let opentui_entry = std::env::var("AGORA_OPENTUI_ENTRY").ok();
+                    if let Some(entry) =
+                        opentui_entry.filter(|path| std::path::Path::new(path).is_file())
+                    {
+                        let status = std::process::Command::new("node")
+                            .args(["--experimental-ffi", "--import", "tsx", &entry])
+                            .env("AGORA_BACKEND_BIN", "/usr/local/bin/agora")
+                            .env("DATABASE_URL", &db_conn)
+                            .current_dir(
+                                std::path::Path::new(&entry)
+                                    .parent()
+                                    .and_then(std::path::Path::parent)
+                                    .unwrap_or_else(|| std::path::Path::new("/opt/agora-ui")),
+                            )
+                            .status();
+                        if let Err(error) = status {
+                            eprintln!("Error iniciando OpenTUI: {error}");
                         }
-                    });
+                    } else {
+                        let _ = std::panic::catch_unwind(|| {
+                            if let Err(e) = crate::app::run_tui(&db_conn) {
+                                eprintln!("Error iniciando TUI: {e}");
+                            }
+                        });
+                    }
                     std::process::exit(0);
                 }
                 ForkptyResult::Parent { master, child } => {
@@ -708,7 +775,9 @@ impl Handler for SshSession {
                         ws_xpixel: ws_xpixel as u16,
                         ws_ypixel: ws_ypixel as u16,
                     };
-                    unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws); }
+                    unsafe {
+                        nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws);
+                    }
                     let child_exited = Arc::new(AtomicBool::new(false));
 
                     let h1 = handle.clone();
@@ -737,11 +806,8 @@ impl Handler for SshSession {
                             break;
                         }
                         match rt.block_on(async {
-                            tokio::time::timeout(
-                                std::time::Duration::from_millis(200),
-                                rx.recv(),
-                            )
-                            .await
+                            tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+                                .await
                         }) {
                             Ok(Some(data)) => {
                                 let _ = write(&master, &data);
@@ -797,25 +863,19 @@ impl Handler for SshSession {
                 ws_xpixel: xpixel as u16,
                 ws_ypixel: ypixel as u16,
             };
-            unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws); }
+            unsafe {
+                nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws);
+            }
         }
         Ok(())
     }
 
-    async fn channel_eof(
-        &mut self,
-        _: ChannelId,
-        _: &mut Session,
-    ) -> Result<(), Self::Error> {
+    async fn channel_eof(&mut self, _: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
         self.input_tx = None;
         Ok(())
     }
 
-    async fn channel_close(
-        &mut self,
-        _: ChannelId,
-        _: &mut Session,
-    ) -> Result<(), Self::Error> {
+    async fn channel_close(&mut self, _: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
         self.input_tx = None;
         Ok(())
     }

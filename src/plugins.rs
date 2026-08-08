@@ -3,10 +3,18 @@ use std::collections::HashSet;
 
 pub trait ModerationPlugin: Send + Sync {
     fn name(&self) -> &str;
-    fn filter_post(&self, _user_id: i64, _content: &str) -> Result<()> { Ok(()) }
-    fn filter_comment(&self, _user_id: i64, _content: &str) -> Result<()> { Ok(()) }
-    fn filter_message(&self, _sender_id: i64, _receiver_id: i64, _content: &str) -> Result<()> { Ok(()) }
-    fn can_register(&self, _username: &str, _display_name: &str) -> Result<()> { Ok(()) }
+    fn filter_post(&self, _user_id: i64, _content: &str) -> Result<()> {
+        Ok(())
+    }
+    fn filter_comment(&self, _user_id: i64, _content: &str) -> Result<()> {
+        Ok(())
+    }
+    fn filter_message(&self, _sender_id: i64, _receiver_id: i64, _content: &str) -> Result<()> {
+        Ok(())
+    }
+    fn can_register(&self, _username: &str, _display_name: &str) -> Result<()> {
+        Ok(())
+    }
 }
 
 pub struct PluginRegistry {
@@ -15,7 +23,9 @@ pub struct PluginRegistry {
 
 impl PluginRegistry {
     pub fn new() -> Self {
-        Self { plugins: Vec::new() }
+        Self {
+            plugins: Vec::new(),
+        }
     }
 
     pub fn register(&mut self, plugin: Box<dyn ModerationPlugin>) {
@@ -87,11 +97,15 @@ pub fn load_plugins_from_env(env_var: &str) -> PluginRegistry {
 pub struct SpamFilter;
 
 impl SpamFilter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl ModerationPlugin for SpamFilter {
-    fn name(&self) -> &str { "spam" }
+    fn name(&self) -> &str {
+        "spam"
+    }
 
     fn filter_post(&self, _user_id: i64, content: &str) -> Result<()> {
         if content.len() > 5000 {
@@ -144,15 +158,18 @@ pub struct ProfanityFilter {
 
 impl ProfanityFilter {
     pub fn new() -> Self {
-        let blocked: HashSet<String> = vec![
-            "spamword1", "spamword2",
-        ].into_iter().map(|s| s.to_string()).collect();
+        let blocked: HashSet<String> = vec!["spamword1", "spamword2"]
+            .into_iter()
+            .map(|s| s.to_string())
+            .collect();
         Self { blocked }
     }
 }
 
 impl ModerationPlugin for ProfanityFilter {
-    fn name(&self) -> &str { "profanity" }
+    fn name(&self) -> &str {
+        "profanity"
+    }
 
     fn filter_post(&self, _user_id: i64, content: &str) -> Result<()> {
         let lower = content.to_lowercase();
@@ -188,17 +205,28 @@ impl ModerationPlugin for ProfanityFilter {
 pub struct LinkFilter;
 
 impl LinkFilter {
-    pub fn new() -> Self { Self }
+    pub fn new() -> Self {
+        Self
+    }
 }
 
 impl ModerationPlugin for LinkFilter {
-    fn name(&self) -> &str { "link" }
+    fn name(&self) -> &str {
+        "link"
+    }
 
     fn filter_post(&self, _user_id: i64, content: &str) -> Result<()> {
         let lower = content.to_lowercase();
         let suspicious = [
-            ".ru/", ".cn/", "bit.ly/", "tinyurl.com/", "short.link/",
-            "free-", "click-here", "act-now", "limited-offer",
+            ".ru/",
+            ".cn/",
+            "bit.ly/",
+            "tinyurl.com/",
+            "short.link/",
+            "free-",
+            "click-here",
+            "act-now",
+            "limited-offer",
         ];
         for s in &suspicious {
             if lower.contains(s) {

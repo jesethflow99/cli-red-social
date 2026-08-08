@@ -1,4 +1,12 @@
 target/
+node_modules/
 .git/
 data/
 host_key
+.env
+*.log
+export_*.json
+backups/
+social.db
+uploads/
+keys/

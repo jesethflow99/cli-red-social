@@ -8,6 +8,7 @@ mod firewall;
 mod i18n;
 mod models;
 mod plugins;
+mod rpc;
 mod ssh;
 mod theme;
 
@@ -40,6 +41,26 @@ struct Cli {
 
     #[arg(long, default_value = "")]
     log: String,
+
+    /// Genera una invitación de un solo uso y muestra el código una sola vez.
+    #[arg(long)]
+    invite_create: bool,
+
+    /// Días de validez para --invite-create.
+    #[arg(long, default_value_t = 7)]
+    invite_days: i64,
+
+    /// Lista invitaciones sin revelar sus códigos.
+    #[arg(long)]
+    invite_list: bool,
+
+    /// Revoca una invitación pendiente mediante su código.
+    #[arg(long)]
+    invite_revoke: Option<String>,
+
+    /// Ejecuta el backend local JSONL para la interfaz OpenTUI.
+    #[arg(long, hide = true)]
+    rpc: bool,
 }
 
 fn setup_logging(log_file: &str, stderr: bool) {
@@ -76,10 +97,50 @@ fn setup_logging(log_file: &str, stderr: bool) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    setup_logging(&cli.log, !cli.tui && !cli.export);
+    setup_logging(&cli.log, !cli.tui && !cli.export && !cli.rpc);
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
     let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
+
+    if cli.rpc {
+        let database = db::Database::new(&db_url)?;
+        return rpc::run(database);
+    }
+
+    let admin_actions = usize::from(cli.invite_create)
+        + usize::from(cli.invite_list)
+        + usize::from(cli.invite_revoke.is_some());
+    if admin_actions > 1 {
+        anyhow::bail!("Usa una sola acción de invitaciones a la vez.");
+    }
+    if admin_actions == 1 {
+        let database = db::Database::new(&db_url)?;
+        if cli.invite_create {
+            let code = database.create_invitation(cli.invite_days)?;
+            println!("Invitación creada (válida {} días):", cli.invite_days);
+            println!("{}", code);
+            println!("El código no puede consultarse de nuevo.");
+        } else if cli.invite_list {
+            println!("ID\tESTADO\tEXPIRA\tUSUARIO");
+            for (id, _created, expires, used, username) in database.list_invitations()? {
+                let state = if used { "usada" } else { "pendiente" };
+                println!(
+                    "{}\t{}\t{}\t{}",
+                    id,
+                    state,
+                    expires,
+                    username.unwrap_or_else(|| "-".to_string())
+                );
+            }
+        } else if let Some(code) = cli.invite_revoke.as_deref() {
+            if database.revoke_invitation(code)? {
+                println!("Invitación revocada.");
+            } else {
+                anyhow::bail!("La invitación no existe o ya fue utilizada.");
+            }
+        }
+        return Ok(());
+    }
 
     if cli.export {
         let database = db::Database::new(&db_url)?;
@@ -107,7 +168,9 @@ fn main() -> Result<()> {
         if !ssh_password.is_empty() {
             println!("Autenticación SSH por contraseña habilitada.");
         } else {
-            println!("⚠  SSH_PASSWORD no configurada. Usando contraseña por defecto: \"agora\". Configurá SSH_PASSWORD para producción.");
+            println!(
+                "⚠  SSH_PASSWORD no configurada. Usando contraseña por defecto: \"agora\". Configurá SSH_PASSWORD para producción."
+            );
         }
         let database = Arc::new(db::Database::new(&db_url)?);
         database.cleanup_old_data(90).ok();
@@ -127,23 +190,33 @@ fn main() -> Result<()> {
     Ok(())
 }
 
-async fn run_server(db: Arc<db::Database>, db_url: String, port: u16, key: String, ssh_password: &str) -> Result<()> {
+async fn run_server(
+    db: Arc<db::Database>,
+    db_url: String,
+    port: u16,
+    key: String,
+    ssh_password: &str,
+) -> Result<()> {
     let mut server = ssh::SshServer::new(db, &db_url, ssh_password);
     server.run(port, &key).await?;
     Ok(())
 }
 
 fn spawn_cleanup_thread(db: Arc<db::Database>) {
-    std::thread::spawn(move || loop {
-        std::thread::sleep(std::time::Duration::from_secs(86400));
-        match db.cleanup_old_data(90) {
-            Ok((m, n)) => tracing::info!("Cleanup: {} mensajes, {} notificaciones eliminados", m, n),
-            Err(e) => tracing::error!("Error en cleanup: {}", e),
-        }
-        match db.cleanup_inactive_users(730) {
-            Ok(n) if n > 0 => tracing::info!("Cleanup: {} cuentas inactivas eliminadas", n),
-            Ok(_) => {}
-            Err(e) => tracing::error!("Error en cleanup de cuentas: {}", e),
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(86400));
+            match db.cleanup_old_data(90) {
+                Ok((m, n)) => {
+                    tracing::info!("Cleanup: {} mensajes, {} notificaciones eliminados", m, n)
+                }
+                Err(e) => tracing::error!("Error en cleanup: {}", e),
+            }
+            match db.cleanup_inactive_users(730) {
+                Ok(n) if n > 0 => tracing::info!("Cleanup: {} cuentas inactivas eliminadas", n),
+                Ok(_) => {}
+                Err(e) => tracing::error!("Error en cleanup de cuentas: {}", e),
+            }
         }
     });
 }

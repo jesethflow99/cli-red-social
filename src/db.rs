@@ -3,13 +3,13 @@ use chrono::{DateTime, Utc};
 use postgres::NoTls;
 use r2d2::Pool;
 use r2d2_postgres::PostgresConnectionManager;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 use std::time::Instant;
 
-use crate::models::{Comment, Message, Notification, Post, User};
+use crate::models::{Comment, Message, MessagePreview, Notification, Post, User};
 
 pub enum AuthResult {
     Success(User),
@@ -19,7 +19,10 @@ pub enum AuthResult {
 
 // ── E2E Encryption helpers ────────────────────────────────
 
-pub fn derive_keypair(password: &str, username: &str) -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
+pub fn derive_keypair(
+    password: &str,
+    username: &str,
+) -> (x25519_dalek::StaticSecret, x25519_dalek::PublicKey) {
     let mut hasher = Sha256::new();
     hasher.update(b"agora-x25519-v1:");
     hasher.update(username.to_lowercase().as_bytes());
@@ -31,13 +34,25 @@ pub fn derive_keypair(password: &str, username: &str) -> (x25519_dalek::StaticSe
     (secret, public)
 }
 
-pub fn e2e_encrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &str, plaintext: &str) -> Result<String> {
+fn invitation_hash(code: &str) -> String {
+    use base64::Engine;
+
+    let digest = Sha256::digest(code.as_bytes());
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(digest)
+}
+
+pub fn e2e_encrypt(
+    our_secret: &x25519_dalek::StaticSecret,
+    their_public_b64: &str,
+    plaintext: &str,
+) -> Result<String> {
     use base64::Engine;
 
     let their_bytes = base64::engine::general_purpose::STANDARD
         .decode(their_public_b64)
         .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
-    let their_key: [u8; 32] = their_bytes.try_into()
+    let their_key: [u8; 32] = their_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
     let their_public = x25519_dalek::PublicKey::from(their_key);
 
@@ -58,13 +73,18 @@ pub fn e2e_encrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &s
     Ok(base64::engine::general_purpose::STANDARD.encode(&combined))
 }
 
-pub fn e2e_decrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &str, encrypted_b64: &str) -> Result<String> {
+pub fn e2e_decrypt(
+    our_secret: &x25519_dalek::StaticSecret,
+    their_public_b64: &str,
+    encrypted_b64: &str,
+) -> Result<String> {
     use base64::Engine;
 
     let their_bytes = base64::engine::general_purpose::STANDARD
         .decode(their_public_b64)
         .map_err(|e| anyhow::anyhow!("Invalid public key: {}", e))?;
-    let their_key: [u8; 32] = their_bytes.try_into()
+    let their_key: [u8; 32] = their_bytes
+        .try_into()
         .map_err(|_| anyhow::anyhow!("Invalid public key length"))?;
     let their_public = x25519_dalek::PublicKey::from(their_key);
 
@@ -87,26 +107,32 @@ pub fn e2e_decrypt(our_secret: &x25519_dalek::StaticSecret, their_public_b64: &s
 }
 
 fn aes_encrypt(key: &[u8; 32], nonce: &[u8; 12], plaintext: &[u8]) -> Result<Vec<u8>> {
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("Invalid key"))?;
-    cipher.encrypt(Nonce::from_slice(nonce), plaintext)
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("Invalid key"))?;
+    cipher
+        .encrypt(Nonce::from_slice(nonce), plaintext)
         .map_err(|e| anyhow::anyhow!("AES encrypt: {}", e))
 }
 
 fn aes_decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>> {
-    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
     use aes_gcm::aead::Aead;
-    let cipher = Aes256Gcm::new_from_slice(key)
-        .map_err(|_| anyhow::anyhow!("Invalid key"))?;
-    cipher.decrypt(Nonce::from_slice(nonce), ciphertext)
+    use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
+    let cipher = Aes256Gcm::new_from_slice(key).map_err(|_| anyhow::anyhow!("Invalid key"))?;
+    cipher
+        .decrypt(Nonce::from_slice(nonce), ciphertext)
         .map_err(|e| anyhow::anyhow!("AES decrypt: {}", e))
 }
 
 #[allow(dead_code)]
 pub trait DatabaseOps: Send {
-    fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User>;
+    fn register_user(
+        &self,
+        username: &str,
+        password: &str,
+        display_name: &str,
+        invite_code: Option<&str>,
+    ) -> Result<User>;
     fn check_register_rate_limit(&self) -> Result<()>;
     fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult>;
     fn get_user_by_id(&self, id: i64) -> Result<Option<User>>;
@@ -120,27 +146,65 @@ pub trait DatabaseOps: Send {
     fn get_following(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>>;
-    fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment>;
+    fn add_comment(
+        &self,
+        post_id: i64,
+        user_id: i64,
+        content: &str,
+        parent_id: Option<i64>,
+    ) -> Result<Comment>;
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>>;
     fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()>;
     fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()>;
     fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()>;
     fn delete_user(&self, user_id: i64) -> Result<()>;
-    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message>;
+    fn send_message(
+        &self,
+        sender_id: i64,
+        receiver_id: i64,
+        content: &str,
+        encrypted: bool,
+    ) -> Result<Message>;
     fn get_conversations(&self, user_id: i64) -> Result<Vec<User>>;
     fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>>;
     fn get_unread_count(&self, user_id: i64) -> Result<i64>;
+    fn get_recent_message_previews(&self, user_id: i64, limit: i64) -> Result<Vec<MessagePreview>>;
     fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()>;
-    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()>;
+    fn update_profile(
+        &self,
+        user_id: i64,
+        display_name: &str,
+        bio: &str,
+        utc_offset: i32,
+    ) -> Result<()>;
     fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()>;
-    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()>;
-    fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>>;
+    fn add_notification(
+        &self,
+        user_id: i64,
+        from_user_id: i64,
+        notif_type: &str,
+        related_id: Option<i64>,
+    ) -> Result<()>;
+    fn get_notifications(&self, user_id: i64, offset: u64, limit: u64)
+    -> Result<Vec<Notification>>;
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64>;
     fn mark_notifications_read(&self, user_id: i64) -> Result<()>;
-    fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
+    fn search_posts(
+        &self,
+        query: &str,
+        time_filter: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Post>>;
     fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
     fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
-    fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()>;
+    fn check_rate_limit(
+        &self,
+        user_id: i64,
+        action: &str,
+        max: usize,
+        window_secs: u64,
+    ) -> Result<()>;
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)>;
     fn cleanup_inactive_users(&self, days: i64) -> Result<u64>;
     fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>>;
@@ -154,8 +218,14 @@ impl DatabaseOps for Database {
     fn check_register_rate_limit(&self) -> Result<()> {
         Database::check_register_rate_limit(self)
     }
-    fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
-        Database::register_user(self, username, password, display_name)
+    fn register_user(
+        &self,
+        username: &str,
+        password: &str,
+        display_name: &str,
+        invite_code: Option<&str>,
+    ) -> Result<User> {
+        Database::register_user(self, username, password, display_name, invite_code)
     }
     fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
         Database::authenticate(self, username, password)
@@ -193,7 +263,13 @@ impl DatabaseOps for Database {
     fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
         Database::get_post_by_id(self, post_id)
     }
-    fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
+    fn add_comment(
+        &self,
+        post_id: i64,
+        user_id: i64,
+        content: &str,
+        parent_id: Option<i64>,
+    ) -> Result<Comment> {
         Database::add_comment(self, post_id, user_id, content, parent_id)
     }
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
@@ -211,7 +287,13 @@ impl DatabaseOps for Database {
     fn delete_user(&self, user_id: i64) -> Result<()> {
         Database::delete_user(self, user_id)
     }
-    fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message> {
+    fn send_message(
+        &self,
+        sender_id: i64,
+        receiver_id: i64,
+        content: &str,
+        encrypted: bool,
+    ) -> Result<Message> {
         Database::send_message(self, sender_id, receiver_id, content, encrypted)
     }
     fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
@@ -223,19 +305,39 @@ impl DatabaseOps for Database {
     fn get_unread_count(&self, user_id: i64) -> Result<i64> {
         Database::get_unread_count(self, user_id)
     }
+    fn get_recent_message_previews(&self, user_id: i64, limit: i64) -> Result<Vec<MessagePreview>> {
+        Database::get_recent_message_previews(self, user_id, limit)
+    }
     fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
         Database::mark_messages_read(self, user_id, other_id)
     }
-    fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
+    fn update_profile(
+        &self,
+        user_id: i64,
+        display_name: &str,
+        bio: &str,
+        utc_offset: i32,
+    ) -> Result<()> {
         Database::update_profile(self, user_id, display_name, bio, utc_offset)
     }
     fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
         Database::update_timezone(self, user_id, utc_offset)
     }
-    fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
+    fn add_notification(
+        &self,
+        user_id: i64,
+        from_user_id: i64,
+        notif_type: &str,
+        related_id: Option<i64>,
+    ) -> Result<()> {
         Database::add_notification(self, user_id, from_user_id, notif_type, related_id)
     }
-    fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
+    fn get_notifications(
+        &self,
+        user_id: i64,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Notification>> {
         Database::get_notifications(self, user_id, offset, limit)
     }
     fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
@@ -244,7 +346,13 @@ impl DatabaseOps for Database {
     fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
         Database::mark_notifications_read(self, user_id)
     }
-    fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+    fn search_posts(
+        &self,
+        query: &str,
+        time_filter: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Post>> {
         Database::search_posts(self, query, time_filter, offset, limit)
     }
     fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
@@ -253,7 +361,13 @@ impl DatabaseOps for Database {
     fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
         Database::search_posts_by_date(self, query, offset, limit)
     }
-    fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+    fn check_rate_limit(
+        &self,
+        user_id: i64,
+        action: &str,
+        max: usize,
+        window_secs: u64,
+    ) -> Result<()> {
         Database::check_rate_limit(self, user_id, action, max, window_secs)
     }
     fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
@@ -292,14 +406,21 @@ impl Database {
             .min_idle(Some(0))
             .connection_timeout(Duration::from_secs(3))
             .build(manager)?;
-        let db = Self { pool, rate_limiter: Mutex::new(HashMap::new()) };
+        let db = Self {
+            pool,
+            rate_limiter: Mutex::new(HashMap::new()),
+        };
         let mut last_err = anyhow::anyhow!("could not connect to database");
         for i in 0..12 {
             match db.init_schema() {
                 Ok(()) => return Ok(db),
                 Err(e) => {
                     last_err = e;
-                    eprintln!("[agora] DB connection attempt {} failed, retrying in {}s...", i + 1, i + 1);
+                    eprintln!(
+                        "[agora] DB connection attempt {} failed, retrying in {}s...",
+                        i + 1,
+                        i + 1
+                    );
                     std::thread::sleep(std::time::Duration::from_secs(i as u64 + 1));
                 }
             }
@@ -320,7 +441,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+    pub fn check_rate_limit(
+        &self,
+        user_id: i64,
+        action: &str,
+        max: usize,
+        window_secs: u64,
+    ) -> Result<()> {
         let mut conn = self.pool.get()?;
         let now = Utc::now();
         let window_start = now - chrono::Duration::seconds(window_secs as i64);
@@ -364,10 +491,7 @@ impl Database {
                     &[&ban_until_str, &user_id, &action, &window_start_str],
                 )?;
 
-                anyhow::bail!(
-                    "Demasiadas solicitudes. Espera {} segundos.",
-                    ban_duration
-                );
+                anyhow::bail!("Demasiadas solicitudes. Espera {} segundos.", ban_duration);
             }
 
             conn.execute(
@@ -451,6 +575,14 @@ impl Database {
                 tag TEXT NOT NULL,
                 PRIMARY KEY (post_id, tag)
             );
+            CREATE TABLE IF NOT EXISTS invitations (
+                id BIGSERIAL PRIMARY KEY,
+                code_hash TEXT UNIQUE NOT NULL,
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                used_at TEXT NOT NULL DEFAULT '',
+                used_by BIGINT REFERENCES users(id) ON DELETE SET NULL
+            );
             CREATE INDEX IF NOT EXISTS idx_post_hashtags_tag ON post_hashtags(tag);",
         )?;
         // Migrate existing SERIAL/INTEGER columns to BIGINT if they exist
@@ -470,23 +602,79 @@ impl Database {
              ALTER TABLE notifications ALTER COLUMN user_id TYPE BIGINT;
              ALTER TABLE notifications ALTER COLUMN from_user_id TYPE BIGINT;
              ALTER TABLE notifications ADD COLUMN IF NOT EXISTS related_id BIGINT DEFAULT NULL;
-             ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id BIGINT DEFAULT NULL;"
-        ).ok();
+             ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id BIGINT DEFAULT NULL;",
+        )
+        .ok();
         Ok(())
     }
 
-    pub fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
+    pub fn register_user(
+        &self,
+        username: &str,
+        password: &str,
+        display_name: &str,
+        invite_code: Option<&str>,
+    ) -> Result<User> {
         let mut conn = self.pool.get()?;
+        let registration_mode = std::env::var("REGISTRATION_MODE")
+            .unwrap_or_else(|_| "open".to_string())
+            .to_lowercase();
+        if registration_mode == "closed" {
+            anyhow::bail!("El registro está cerrado por el administrador.");
+        }
+        if !matches!(registration_mode.as_str(), "open" | "invite" | "closed") {
+            anyhow::bail!("REGISTRATION_MODE debe ser open, invite o closed");
+        }
+
+        let username_lower = username.trim().to_lowercase();
+        let mut tx = conn.transaction()?;
+        let invitation_id = if registration_mode == "invite" {
+            let code = invite_code
+                .map(str::trim)
+                .filter(|code| !code.is_empty())
+                .ok_or_else(|| anyhow::anyhow!("Se requiere un código de invitación."))?;
+            let code_hash = invitation_hash(code);
+            let row = tx.query_opt(
+                "SELECT id, expires_at, used_at FROM invitations WHERE code_hash = $1 FOR UPDATE",
+                &[&code_hash],
+            )?;
+            let row = row.ok_or_else(|| anyhow::anyhow!("Código de invitación inválido."))?;
+            let expires_at: String = row.get(1);
+            let used_at: String = row.get(2);
+            if !used_at.is_empty() {
+                anyhow::bail!("Este código de invitación ya fue utilizado.");
+            }
+            let expiry = expires_at.parse::<DateTime<Utc>>()?;
+            if Utc::now() >= expiry {
+                anyhow::bail!("Este código de invitación expiró.");
+            }
+            Some(row.get::<_, i64>(0))
+        } else {
+            None
+        };
+
+        // Las validaciones rápidas ocurren antes del trabajo criptográfico para
+        // responder inmediatamente ante invitaciones ausentes o inválidas.
         let hash = bcrypt::hash(password, bcrypt::DEFAULT_COST)?;
         let now = Utc::now().to_rfc3339();
-        let username_lower = username.trim().to_lowercase();
         let (_, public_key) = derive_keypair(password, &username_lower);
-        let pk_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, public_key.as_bytes());
-        let rows = conn.query(
+        let pk_b64 = base64::Engine::encode(
+            &base64::engine::general_purpose::STANDARD,
+            public_key.as_bytes(),
+        );
+
+        let rows = tx.query(
             "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at, public_key) VALUES ($1, $2, $3, 0, $4, $5) RETURNING id",
             &[&username_lower, &hash, &display_name, &now, &pk_b64],
         )?;
         let id: i64 = rows[0].get(0);
+        if let Some(invitation_id) = invitation_id {
+            tx.execute(
+                "UPDATE invitations SET used_at = $1, used_by = $2 WHERE id = $3",
+                &[&now, &id, &invitation_id],
+            )?;
+        }
+        tx.commit()?;
         Ok(User {
             id,
             username: username_lower,
@@ -498,8 +686,52 @@ impl Database {
         })
     }
 
+    pub fn create_invitation(&self, valid_days: i64) -> Result<String> {
+        use base64::Engine;
+
+        if valid_days < 1 || valid_days > 365 {
+            anyhow::bail!("La duración debe estar entre 1 y 365 días.");
+        }
+        let code =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(rand::random::<[u8; 24]>());
+        let code_hash = invitation_hash(&code);
+        let now = Utc::now();
+        let expires_at = now + chrono::Duration::days(valid_days);
+        let mut conn = self.pool.get()?;
+        conn.execute(
+            "INSERT INTO invitations (code_hash, created_at, expires_at) VALUES ($1, $2, $3)",
+            &[&code_hash, &now.to_rfc3339(), &expires_at.to_rfc3339()],
+        )?;
+        Ok(code)
+    }
+
+    pub fn list_invitations(&self) -> Result<Vec<(i64, String, String, bool, Option<String>)>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT i.id, i.created_at, i.expires_at, i.used_at <> '', u.username
+             FROM invitations i LEFT JOIN users u ON u.id = i.used_by ORDER BY i.id DESC",
+            &[],
+        )?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+            .collect())
+    }
+
+    pub fn revoke_invitation(&self, code: &str) -> Result<bool> {
+        let mut conn = self.pool.get()?;
+        let deleted = conn.execute(
+            "DELETE FROM invitations WHERE code_hash = $1 AND used_at = ''",
+            &[&invitation_hash(code.trim())],
+        )?;
+        Ok(deleted == 1)
+    }
+
     pub fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
-        let conn = self.pool.get().map_err(|e| anyhow::anyhow!("pool.get failed: {e}"))?;
+        let conn = self
+            .pool
+            .get()
+            .map_err(|e| anyhow::anyhow!("pool.get failed: {e}"))?;
         let mut conn = conn;
         let rows = conn.query(
             "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash, public_key FROM users WHERE LOWER(username) = LOWER($1)",
@@ -543,7 +775,10 @@ impl Database {
             display_name: row.get(2),
             bio: row.get(3),
             utc_offset: row.get(4),
-                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
+            public_key: {
+                let pk: String = row.get(6);
+                if pk.is_empty() { None } else { Some(pk) }
+            },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }))
     }
@@ -555,18 +790,29 @@ impl Database {
             "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY username LIMIT $2 OFFSET $3",
             &[&pattern, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| User {
-            id: row.get(0),
-            username: row.get(1),
-            display_name: row.get(2),
-            bio: row.get(3),
-            utc_offset: row.get(4),
-                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| User {
+                id: row.get(0),
+                username: row.get(1),
+                display_name: row.get(2),
+                bio: row.get(3),
+                utc_offset: row.get(4),
+                public_key: {
+                    let pk: String = row.get(6);
+                    if pk.is_empty() { None } else { Some(pk) }
+                },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            })
+            .collect())
     }
 
-    pub fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+    pub fn create_post(
+        &self,
+        user_id: i64,
+        content: &str,
+        image_path: Option<&str>,
+    ) -> Result<Post> {
         if content.len() > 5000 {
             anyhow::bail!("El post es demasiado largo (máximo 5000 caracteres)");
         }
@@ -582,10 +828,9 @@ impl Database {
             &[&user_id, &content, &img, &now],
         )?;
         let id: i64 = rows[0].get(0);
-        let username: String = conn.query_one(
-            "SELECT username FROM users WHERE id = $1",
-            &[&user_id],
-        )?.get(0);
+        let username: String = conn
+            .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])?
+            .get(0);
 
         let hashtags = Self::extract_hashtags(content);
         for tag in &hashtags {
@@ -635,17 +880,20 @@ impl Database {
              LIMIT $2 OFFSET $3",
             &[&tag_lower, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
     pub fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>> {
@@ -657,9 +905,7 @@ impl Database {
              LIMIT $1",
             &[&(limit as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            (row.get(0), row.get(1))
-        }).collect())
+        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
     }
 
     fn extract_hashtags(content: &str) -> Vec<String> {
@@ -734,17 +980,20 @@ impl Database {
              LIMIT $2 OFFSET $3",
             &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
     pub fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
@@ -784,15 +1033,21 @@ impl Database {
              WHERE f.following_id = $1",
             &[&user_id],
         )?;
-        Ok(rows.iter().map(|row| User {
-            id: row.get(0),
-            username: row.get(1),
-            display_name: row.get(2),
-            bio: row.get(3),
-            utc_offset: row.get(4),
-                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| User {
+                id: row.get(0),
+                username: row.get(1),
+                display_name: row.get(2),
+                bio: row.get(3),
+                utc_offset: row.get(4),
+                public_key: {
+                    let pk: String = row.get(6);
+                    if pk.is_empty() { None } else { Some(pk) }
+                },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            })
+            .collect())
     }
 
     pub fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
@@ -804,20 +1059,29 @@ impl Database {
              ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
             &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
-    pub fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+    pub fn search_posts(
+        &self,
+        query: &str,
+        time_filter: &str,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Post>> {
         let mut conn = self.pool.get()?;
         let interval = match time_filter {
             "24h" => Some("24 hours"),
@@ -837,7 +1101,8 @@ impl Database {
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
              WHERE p.content ILIKE $1
-             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3".to_string()
+             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3"
+                .to_string()
         };
         let pattern = format!("%{}%", query);
         let rows = if let Some(iv) = interval {
@@ -845,17 +1110,20 @@ impl Database {
         } else {
             conn.query(&sql, &[&pattern, &(limit as i64), &(offset as i64)])?
         };
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
     pub fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
@@ -868,17 +1136,20 @@ impl Database {
              ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
             &[&pattern, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
     pub fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
@@ -891,17 +1162,20 @@ impl Database {
              ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
             &[&pattern, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| {
-            let img: String = row.get(4);
-            Post {
-                id: row.get(0),
-                user_id: row.get(1),
-                username: row.get(2),
-                content: row.get(3),
-                image_path: if img.is_empty() { None } else { Some(img) },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            }
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| {
+                let img: String = row.get(4);
+                Post {
+                    id: row.get(0),
+                    user_id: row.get(1),
+                    username: row.get(2),
+                    content: row.get(3),
+                    image_path: if img.is_empty() { None } else { Some(img) },
+                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                }
+            })
+            .collect())
     }
 
     pub fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
@@ -918,12 +1192,20 @@ impl Database {
             content: row.get(3),
             image_path: if let Some(img) = row.get::<_, Option<String>>(4) {
                 if img.is_empty() { None } else { Some(img) }
-            } else { None },
+            } else {
+                None
+            },
             created_at: row.get::<_, String>(5).parse().unwrap(),
         }))
     }
 
-    pub fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
+    pub fn add_comment(
+        &self,
+        post_id: i64,
+        user_id: i64,
+        content: &str,
+        parent_id: Option<i64>,
+    ) -> Result<Comment> {
         self.check_rate_limit(user_id, "comment", 10, 60)?;
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
@@ -932,10 +1214,9 @@ impl Database {
             &[&post_id, &user_id, &content, &now, &parent_id],
         )?;
         let id: i64 = rows[0].get(0);
-        let username: String = conn.query_one(
-            "SELECT username FROM users WHERE id = $1",
-            &[&user_id],
-        )?.get(0);
+        let username: String = conn
+            .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])?
+            .get(0);
 
         let mentioned = Self::extract_mentions(content);
         for mentioned_username in &mentioned {
@@ -975,15 +1256,18 @@ impl Database {
              ORDER BY c.created_at ASC",
             &[&post_id],
         )?;
-        Ok(rows.iter().map(|row| Comment {
-            id: row.get(0),
-            post_id: row.get(1),
-            user_id: row.get(2),
-            username: row.get(3),
-            content: row.get(4),
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-            parent_comment_id: row.get(6),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Comment {
+                id: row.get(0),
+                post_id: row.get(1),
+                user_id: row.get(2),
+                username: row.get(3),
+                content: row.get(4),
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+                parent_comment_id: row.get(6),
+            })
+            .collect())
     }
 
     pub fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
@@ -1025,14 +1309,23 @@ impl Database {
 
     pub fn delete_user(&self, user_id: i64) -> Result<()> {
         let mut conn = self.pool.get()?;
-        conn.execute("DELETE FROM follows WHERE follower_id = $1 OR following_id = $1", &[&user_id])?;
+        conn.execute(
+            "DELETE FROM follows WHERE follower_id = $1 OR following_id = $1",
+            &[&user_id],
+        )?;
         conn.execute(
             "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)",
             &[&user_id],
         )?;
         conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
-        conn.execute("DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1", &[&user_id])?;
-        conn.execute("DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1", &[&user_id])?;
+        conn.execute(
+            "DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1",
+            &[&user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1",
+            &[&user_id],
+        )?;
         conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
         Ok(())
     }
@@ -1046,18 +1339,30 @@ impl Database {
              WHERE f.follower_id = $1",
             &[&user_id],
         )?;
-        Ok(rows.iter().map(|row| User {
-            id: row.get(0),
-            username: row.get(1),
-            display_name: row.get(2),
-            bio: row.get(3),
-            utc_offset: row.get(4),
-                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| User {
+                id: row.get(0),
+                username: row.get(1),
+                display_name: row.get(2),
+                bio: row.get(3),
+                utc_offset: row.get(4),
+                public_key: {
+                    let pk: String = row.get(6);
+                    if pk.is_empty() { None } else { Some(pk) }
+                },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            })
+            .collect())
     }
 
-    pub fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, encrypted: bool) -> Result<Message> {
+    pub fn send_message(
+        &self,
+        sender_id: i64,
+        receiver_id: i64,
+        content: &str,
+        encrypted: bool,
+    ) -> Result<Message> {
         self.check_rate_limit(sender_id, "message", 10, 60)?;
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
@@ -1066,10 +1371,9 @@ impl Database {
             &[&sender_id, &receiver_id, &content, &now, &(encrypted as i32)],
         )?;
         let id: i64 = rows[0].get(0);
-        let username: String = conn.query_one(
-            "SELECT username FROM users WHERE id = $1",
-            &[&sender_id],
-        )?.get(0);
+        let username: String = conn
+            .query_one("SELECT username FROM users WHERE id = $1", &[&sender_id])?
+            .get(0);
         Ok(Message {
             id,
             sender_id,
@@ -1095,15 +1399,21 @@ impl Database {
              ORDER BY u.username",
             &[&user_id],
         )?;
-        Ok(rows.iter().map(|row| User {
-            id: row.get(0),
-            username: row.get(1),
-            display_name: row.get(2),
-            bio: row.get(3),
-            utc_offset: row.get(4),
-                public_key: { let pk: String = row.get(6); if pk.is_empty() { None } else { Some(pk) } },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| User {
+                id: row.get(0),
+                username: row.get(1),
+                display_name: row.get(2),
+                bio: row.get(3),
+                utc_offset: row.get(4),
+                public_key: {
+                    let pk: String = row.get(6);
+                    if pk.is_empty() { None } else { Some(pk) }
+                },
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+            })
+            .collect())
     }
 
     pub fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
@@ -1116,25 +1426,59 @@ impl Database {
              ORDER BY m.created_at ASC",
             &[&user_id, &other_id],
         )?;
-        Ok(rows.iter().map(|row| Message {
-            id: row.get(0),
-            sender_id: row.get(1),
-            receiver_id: row.get(2),
-            sender_username: row.get(3),
-            content: row.get(4),
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-            read: row.get::<_, i32>(6) != 0,
-            encrypted: row.get::<_, i32>(7) != 0,
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Message {
+                id: row.get(0),
+                sender_id: row.get(1),
+                receiver_id: row.get(2),
+                sender_username: row.get(3),
+                content: row.get(4),
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+                read: row.get::<_, i32>(6) != 0,
+                encrypted: row.get::<_, i32>(7) != 0,
+            })
+            .collect())
     }
 
     pub fn get_unread_count(&self, user_id: i64) -> Result<i64> {
         let mut conn = self.pool.get()?;
-        let count: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND read = 0",
-            &[&user_id],
-        )?.get(0);
+        let count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND read = 0",
+                &[&user_id],
+            )?
+            .get(0);
         Ok(count)
+    }
+
+    pub fn get_recent_message_previews(
+        &self,
+        user_id: i64,
+        limit: i64,
+    ) -> Result<Vec<MessagePreview>> {
+        let mut conn = self.pool.get()?;
+        let rows = conn.query(
+            "SELECT sender_id, username, content, created_at, read FROM (
+                 SELECT DISTINCT ON (m.sender_id) m.sender_id, u.username, m.content, m.created_at, m.read
+                 FROM messages m JOIN users u ON u.id = m.sender_id
+                 WHERE m.receiver_id = $1
+                 ORDER BY m.sender_id, m.created_at DESC
+             ) latest
+             ORDER BY created_at DESC
+             LIMIT $2",
+            &[&user_id, &limit],
+        )?;
+        Ok(rows
+            .iter()
+            .map(|row| MessagePreview {
+                sender_id: row.get(0),
+                sender_username: row.get(1),
+                content: row.get(2),
+                created_at: row.get::<_, String>(3).parse().unwrap(),
+                unread: row.get::<_, i32>(4) == 0,
+            })
+            .collect())
     }
 
     pub fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
@@ -1146,7 +1490,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
+    pub fn update_profile(
+        &self,
+        user_id: i64,
+        display_name: &str,
+        bio: &str,
+        utc_offset: i32,
+    ) -> Result<()> {
         let mut conn = self.pool.get()?;
         conn.execute(
             "UPDATE users SET display_name = $1, bio = $2, utc_offset = $3 WHERE id = $4",
@@ -1165,7 +1515,13 @@ impl Database {
         Ok(())
     }
 
-    pub fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
+    pub fn add_notification(
+        &self,
+        user_id: i64,
+        from_user_id: i64,
+        notif_type: &str,
+        related_id: Option<i64>,
+    ) -> Result<()> {
         let mut conn = self.pool.get()?;
         let now = Utc::now().to_rfc3339();
         conn.execute(
@@ -1175,7 +1531,12 @@ impl Database {
         Ok(())
     }
 
-    pub fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
+    pub fn get_notifications(
+        &self,
+        user_id: i64,
+        offset: u64,
+        limit: u64,
+    ) -> Result<Vec<Notification>> {
         let mut conn = self.pool.get()?;
         let rows = conn.query(
             "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read, n.related_id
@@ -1186,24 +1547,29 @@ impl Database {
              LIMIT $2 OFFSET $3",
             &[&user_id, &(limit as i64), &(offset as i64)],
         )?;
-        Ok(rows.iter().map(|row| Notification {
-            id: row.get(0),
-            user_id: row.get(1),
-            from_user_id: row.get(2),
-            from_username: row.get(3),
-            notif_type: row.get(4),
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-            read: row.get::<_, i32>(6) != 0,
-            related_id: row.get(7),
-        }).collect())
+        Ok(rows
+            .iter()
+            .map(|row| Notification {
+                id: row.get(0),
+                user_id: row.get(1),
+                from_user_id: row.get(2),
+                from_username: row.get(3),
+                notif_type: row.get(4),
+                created_at: row.get::<_, String>(5).parse().unwrap(),
+                read: row.get::<_, i32>(6) != 0,
+                related_id: row.get(7),
+            })
+            .collect())
     }
 
     pub fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
         let mut conn = self.pool.get()?;
-        let count: i64 = conn.query_one(
-            "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = 0",
-            &[&user_id],
-        )?.get(0);
+        let count: i64 = conn
+            .query_one(
+                "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = 0",
+                &[&user_id],
+            )?
+            .get(0);
         Ok(count)
     }
 
@@ -1244,13 +1610,25 @@ impl Database {
         let mut deleted = 0u64;
         for row in &rows {
             let user_id: i64 = row.get(0);
-            conn.execute("DELETE FROM follows WHERE follower_id = $1 OR following_id = $1", &[&user_id])?;
-            conn.execute("DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)", &[&user_id])?;
+            conn.execute(
+                "DELETE FROM follows WHERE follower_id = $1 OR following_id = $1",
+                &[&user_id],
+            )?;
+            conn.execute(
+                "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)",
+                &[&user_id],
+            )?;
             conn.execute("DELETE FROM comments WHERE user_id = $1", &[&user_id])?;
             conn.execute("DELETE FROM post_hashtags WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)", &[&user_id])?;
             conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
-            conn.execute("DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1", &[&user_id])?;
-            conn.execute("DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1", &[&user_id])?;
+            conn.execute(
+                "DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1",
+                &[&user_id],
+            )?;
+            conn.execute(
+                "DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1",
+                &[&user_id],
+            )?;
             conn.execute("DELETE FROM rate_limits WHERE user_id = $1", &[&user_id])?;
             conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
             deleted += 1;
@@ -1260,10 +1638,7 @@ impl Database {
 
     pub fn get_public_key(&self, user_id: i64) -> Result<Option<String>> {
         let mut conn = self.pool.get()?;
-        let row = conn.query_opt(
-            "SELECT public_key FROM users WHERE id = $1",
-            &[&user_id],
-        )?;
+        let row = conn.query_opt("SELECT public_key FROM users WHERE id = $1", &[&user_id])?;
         Ok(row.and_then(|r| {
             let pk: String = r.get(0);
             if pk.is_empty() { None } else { Some(pk) }
@@ -1310,27 +1685,33 @@ impl Database {
             "SELECT id, content, image_path, created_at FROM posts WHERE user_id = $1 ORDER BY created_at DESC",
             &[&user_id],
         )?;
-        let posts: Vec<serde_json::Value> = posts_rows.iter().map(|r| {
-            serde_json::json!({
-                "id": r.get::<_, i64>(0),
-                "content": r.get::<_, String>(1),
-                "image_path": r.get::<_, String>(2),
-                "created_at": r.get::<_, String>(3),
+        let posts: Vec<serde_json::Value> = posts_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, i64>(0),
+                    "content": r.get::<_, String>(1),
+                    "image_path": r.get::<_, String>(2),
+                    "created_at": r.get::<_, String>(3),
+                })
             })
-        }).collect();
+            .collect();
 
         let comments_rows = conn.query(
             "SELECT id, post_id, content, created_at FROM comments WHERE user_id = $1 ORDER BY created_at DESC",
             &[&user_id],
         )?;
-        let comments: Vec<serde_json::Value> = comments_rows.iter().map(|r| {
-            serde_json::json!({
-                "id": r.get::<_, i64>(0),
-                "post_id": r.get::<_, i64>(1),
-                "content": r.get::<_, String>(2),
-                "created_at": r.get::<_, String>(3),
+        let comments: Vec<serde_json::Value> = comments_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, i64>(0),
+                    "post_id": r.get::<_, i64>(1),
+                    "content": r.get::<_, String>(2),
+                    "created_at": r.get::<_, String>(3),
+                })
             })
-        }).collect();
+            .collect();
 
         let msgs_rows = conn.query(
             "SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, u.username as sender_name
@@ -1338,16 +1719,19 @@ impl Database {
              WHERE m.sender_id = $1 OR m.receiver_id = $1 ORDER BY m.created_at ASC",
             &[&user_id],
         )?;
-        let messages: Vec<serde_json::Value> = msgs_rows.iter().map(|r| {
-            serde_json::json!({
-                "id": r.get::<_, i64>(0),
-                "sender_id": r.get::<_, i64>(1),
-                "receiver_id": r.get::<_, i64>(2),
-                "sender_username": r.get::<_, String>(5),
-                "content": r.get::<_, String>(3),
-                "created_at": r.get::<_, String>(4),
+        let messages: Vec<serde_json::Value> = msgs_rows
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id": r.get::<_, i64>(0),
+                    "sender_id": r.get::<_, i64>(1),
+                    "receiver_id": r.get::<_, i64>(2),
+                    "sender_username": r.get::<_, String>(5),
+                    "content": r.get::<_, String>(3),
+                    "created_at": r.get::<_, String>(4),
+                })
             })
-        }).collect();
+            .collect();
 
         let followers_rows = conn.query(
             "SELECT u.username FROM users u JOIN follows f ON f.follower_id = u.id WHERE f.following_id = $1",
@@ -1393,65 +1777,69 @@ impl Database {
 
         // ── 52 Users ────────────────────────────────────────────────────
         let user_defs: [(&str, &str); 52] = [
-            ("alice",     "Alice Rodríguez"),
-            ("bob",       "Bob Martínez"),
-            ("carol",     "Carolina López"),
-            ("dave",      "David Chen"),
-            ("eve",       "Eva García"),
-            ("frank",     "Francisco Torres"),
-            ("grace",     "Gabriela Ramírez"),
-            ("hank",      "Héctor Vargas"),
-            ("iris",      "Isabel Mendoza"),
-            ("jack",      "Javier Castillo"),
-            ("karen",     "Karen Herrera"),
-            ("leo",       "Leonardo Rivas"),
-            ("maria",     "María Fernández"),
-            ("nacho",     "Ignacio Paredes"),
-            ("olivia",    "Olivia Soto"),
-            ("pablo",     "Pablo Núñez"),
-            ("quinn",     "Quintín Delgado"),
-            ("rosa",      "Rosa Guerrero"),
-            ("sam",       "Samuel Ortega"),
-            ("tina",      "Cristina Campos"),
-            ("ulises",    "Ulises Medina"),
-            ("vero",      "Verónica Rojas"),
-            ("will",      "Wilson Aguilar"),
-            ("xena",      "Ximena Peña"),
-            ("yago",      "Yago Fuentes"),
-            ("zoe",       "Zoe Santana"),
-            ("coder42",   "Dev Master"),
+            ("alice", "Alice Rodríguez"),
+            ("bob", "Bob Martínez"),
+            ("carol", "Carolina López"),
+            ("dave", "David Chen"),
+            ("eve", "Eva García"),
+            ("frank", "Francisco Torres"),
+            ("grace", "Gabriela Ramírez"),
+            ("hank", "Héctor Vargas"),
+            ("iris", "Isabel Mendoza"),
+            ("jack", "Javier Castillo"),
+            ("karen", "Karen Herrera"),
+            ("leo", "Leonardo Rivas"),
+            ("maria", "María Fernández"),
+            ("nacho", "Ignacio Paredes"),
+            ("olivia", "Olivia Soto"),
+            ("pablo", "Pablo Núñez"),
+            ("quinn", "Quintín Delgado"),
+            ("rosa", "Rosa Guerrero"),
+            ("sam", "Samuel Ortega"),
+            ("tina", "Cristina Campos"),
+            ("ulises", "Ulises Medina"),
+            ("vero", "Verónica Rojas"),
+            ("will", "Wilson Aguilar"),
+            ("xena", "Ximena Peña"),
+            ("yago", "Yago Fuentes"),
+            ("zoe", "Zoe Santana"),
+            ("coder42", "Dev Master"),
             ("rustacean", "Rust Fanático"),
-            ("linuxero",  "Tux Lover"),
-            ("pythonista","Py Coder"),
-            ("hackerx",   "Sec Ghost"),
-            ("sysadmin",  "Root Admin"),
+            ("linuxero", "Tux Lover"),
+            ("pythonista", "Py Coder"),
+            ("hackerx", "Sec Ghost"),
+            ("sysadmin", "Root Admin"),
             ("neovimmer", "Vim Enjoyer"),
-            ("frontend",  "CSS Fighter"),
-            ("backend",   "API Builder"),
+            ("frontend", "CSS Fighter"),
+            ("backend", "API Builder"),
             ("fullstack", "Jack of All"),
-            ("devops",    "Pipeline Runner"),
-            ("datawiz",   "Data Wizard"),
-            ("mlguru",    "ML Engineer"),
-            ("designer",  "UI Pixel"),
+            ("devops", "Pipeline Runner"),
+            ("datawiz", "Data Wizard"),
+            ("mlguru", "ML Engineer"),
+            ("designer", "UI Pixel"),
             ("scifi_fan", "Scifi Reader"),
-            ("gamer",     "Night Owl"),
-            ("musico",    "Bass Player"),
+            ("gamer", "Night Owl"),
+            ("musico", "Bass Player"),
             ("fotografo", "Lens Hunter"),
-            ("chefcode",  "Code Chef"),
-            ("cyclist",   "Bike Commuter"),
-            ("yogi",      "Zen Coder"),
-            ("writer",    "Doc Author"),
-            ("tester",    "Bug Finder"),
+            ("chefcode", "Code Chef"),
+            ("cyclist", "Bike Commuter"),
+            ("yogi", "Zen Coder"),
+            ("writer", "Doc Author"),
+            ("tester", "Bug Finder"),
             ("architect", "System Dreamer"),
-            ("joker",     "Terminal Joker"),
-            ("newbie",    "Fresh Start"),
+            ("joker", "Terminal Joker"),
+            ("newbie", "Fresh Start"),
         ];
 
         let mut uids: Vec<i64> = Vec::new();
         for (i, (uname, dname)) in user_defs.iter().enumerate() {
             let hash = bcrypt::hash("password123", bcrypt::DEFAULT_COST)
                 .map_err(|e| anyhow::anyhow!("bcrypt failed for {}: {}", uname, e))?;
-            let created = if i >= 48 { ago(60*24*800) } else { ago(60*24*7 + i as i64 * 120) };
+            let created = if i >= 48 {
+                ago(60 * 24 * 800)
+            } else {
+                ago(60 * 24 * 7 + i as i64 * 120)
+            };
             let row = conn.query_opt(
                 "INSERT INTO users (username, password_hash, display_name, created_at, last_login_at, login_count) VALUES ($1, $2, $3, $4, $4, 1) RETURNING id",
                 &[&uname.to_string(), &hash, &dname.to_string(), &created],
@@ -1473,33 +1861,175 @@ impl Database {
 
         // ── Follows (social graph) ────────────────────────────────────
         let follows: Vec<(usize, usize)> = vec![
-            (0,1),(0,2),(0,3),(0,4),(0,6),(0,8),(0,12),(0,15),
-            (1,0),(1,2),(1,5),(1,7),(1,26),(1,28),(1,30),
-            (2,0),(2,1),(2,4),(2,9),(2,13),(2,19),(2,35),
-            (3,0),(3,11),(3,14),(3,16),(3,26),(3,29),(3,33),
-            (4,0),(4,1),(4,3),(4,10),(4,17),(4,24),(4,42),
-            (5,1),(5,6),(5,7),(5,15),(5,22),(5,26),(5,38),
-            (6,0),(6,5),(6,8),(6,18),(6,27),(6,31),(6,40),
-            (7,1),(7,5),(7,9),(7,20),(7,28),(7,32),(7,43),
-            (8,0),(8,6),(8,12),(8,21),(8,29),(8,35),(8,44),
-            (9,2),(9,7),(9,13),(9,22),(9,30),(9,36),(9,45),
-            (10,4),(10,8),(10,14),(10,23),(10,27),(10,37),
-            (11,3),(11,9),(11,15),(11,24),(11,28),(11,38),
-            (12,0),(12,8),(12,16),(12,25),(12,29),(12,39),
-            (13,2),(13,9),(13,17),(13,22),(13,26),(13,40),
-            (14,3),(14,10),(14,18),(14,23),(14,27),(14,41),
-            (15,0),(15,5),(15,19),(15,24),(15,28),(15,42),
-            (26,0),(26,1),(26,2),(26,3),(26,4),(26,27),(26,28),(26,29),
-            (27,26),(27,28),(27,29),(27,30),(27,31),(27,32),
-            (28,1),(28,2),(28,26),(28,27),(28,29),(28,33),
-            (29,3),(29,26),(29,27),(29,28),(29,30),(29,34),
-            (30,5),(30,26),(30,29),(30,31),(30,32),(30,35),
-            (31,27),(31,30),(31,33),(31,36),(31,37),
-            (32,28),(32,29),(32,34),(32,38),(32,39),
-            (33,3),(33,26),(33,31),(33,35),(33,40),
-            (34,29),(34,32),(34,36),(34,41),
-            (35,2),(35,8),(35,31),(35,33),(35,37),(35,42),
-            (36,30),(36,33),(36,34),(36,38),(36,43),
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (0, 6),
+            (0, 8),
+            (0, 12),
+            (0, 15),
+            (1, 0),
+            (1, 2),
+            (1, 5),
+            (1, 7),
+            (1, 26),
+            (1, 28),
+            (1, 30),
+            (2, 0),
+            (2, 1),
+            (2, 4),
+            (2, 9),
+            (2, 13),
+            (2, 19),
+            (2, 35),
+            (3, 0),
+            (3, 11),
+            (3, 14),
+            (3, 16),
+            (3, 26),
+            (3, 29),
+            (3, 33),
+            (4, 0),
+            (4, 1),
+            (4, 3),
+            (4, 10),
+            (4, 17),
+            (4, 24),
+            (4, 42),
+            (5, 1),
+            (5, 6),
+            (5, 7),
+            (5, 15),
+            (5, 22),
+            (5, 26),
+            (5, 38),
+            (6, 0),
+            (6, 5),
+            (6, 8),
+            (6, 18),
+            (6, 27),
+            (6, 31),
+            (6, 40),
+            (7, 1),
+            (7, 5),
+            (7, 9),
+            (7, 20),
+            (7, 28),
+            (7, 32),
+            (7, 43),
+            (8, 0),
+            (8, 6),
+            (8, 12),
+            (8, 21),
+            (8, 29),
+            (8, 35),
+            (8, 44),
+            (9, 2),
+            (9, 7),
+            (9, 13),
+            (9, 22),
+            (9, 30),
+            (9, 36),
+            (9, 45),
+            (10, 4),
+            (10, 8),
+            (10, 14),
+            (10, 23),
+            (10, 27),
+            (10, 37),
+            (11, 3),
+            (11, 9),
+            (11, 15),
+            (11, 24),
+            (11, 28),
+            (11, 38),
+            (12, 0),
+            (12, 8),
+            (12, 16),
+            (12, 25),
+            (12, 29),
+            (12, 39),
+            (13, 2),
+            (13, 9),
+            (13, 17),
+            (13, 22),
+            (13, 26),
+            (13, 40),
+            (14, 3),
+            (14, 10),
+            (14, 18),
+            (14, 23),
+            (14, 27),
+            (14, 41),
+            (15, 0),
+            (15, 5),
+            (15, 19),
+            (15, 24),
+            (15, 28),
+            (15, 42),
+            (26, 0),
+            (26, 1),
+            (26, 2),
+            (26, 3),
+            (26, 4),
+            (26, 27),
+            (26, 28),
+            (26, 29),
+            (27, 26),
+            (27, 28),
+            (27, 29),
+            (27, 30),
+            (27, 31),
+            (27, 32),
+            (28, 1),
+            (28, 2),
+            (28, 26),
+            (28, 27),
+            (28, 29),
+            (28, 33),
+            (29, 3),
+            (29, 26),
+            (29, 27),
+            (29, 28),
+            (29, 30),
+            (29, 34),
+            (30, 5),
+            (30, 26),
+            (30, 29),
+            (30, 31),
+            (30, 32),
+            (30, 35),
+            (31, 27),
+            (31, 30),
+            (31, 33),
+            (31, 36),
+            (31, 37),
+            (32, 28),
+            (32, 29),
+            (32, 34),
+            (32, 38),
+            (32, 39),
+            (33, 3),
+            (33, 26),
+            (33, 31),
+            (33, 35),
+            (33, 40),
+            (34, 29),
+            (34, 32),
+            (34, 36),
+            (34, 41),
+            (35, 2),
+            (35, 8),
+            (35, 31),
+            (35, 33),
+            (35, 37),
+            (35, 42),
+            (36, 30),
+            (36, 33),
+            (36, 34),
+            (36, 38),
+            (36, 43),
         ];
         for (f, t) in &follows {
             conn.execute(
@@ -1510,44 +2040,158 @@ impl Database {
 
         // ── Posts (250+) ───────────────────────────────────────────────
         let templates: [(&str, &[&str]); 38] = [
-            ("Acabo de descubrir #rust y estoy alucinando con el borrow checker", &["rust"]),
-            ("Alguien mas usa #neovim con LSP para desarrollo? Es magia pura", &["neovim"]),
-            ("Hoy compile el kernel de #linux en menos de 5 minutos. Que epoca para estar vivo", &["linux"]),
-            ("El #opensource es lo mejor que le paso a la humanidad. Change my mind", &["opensource"]),
-            ("Buenos dias #gente. Hoy toca deploy a produccion. Deseenme suerte", &["gente"]),
-            ("Recomendaciones de #musica para programar? Necesito focus total", &["musica"]),
-            ("Estoy armando un cluster de Kubernetes en casa. #devops #cloud", &["devops", "cloud"]),
-            ("Lean esto sobre #rust async vs sync. Les vuela la cabeza", &["rust"]),
-            ("El mejor #editor para codigo es el que te deja fluir. Para mi, neovim", &["editor"]),
-            ("Thread sobre #seguridad en aplicaciones web. Abro hilo", &["seguridad"]),
-            ("Quien va a la #rustconf este año? Nos juntamos?", &["rustconf"]),
-            ("Termine mi proyecto en #python. Ahora quiero reescribirlo en rust, es normal?", &["python", "rust"]),
-            ("La documentacion de #postgresql es oro puro. No subestimen la doc oficial", &["postgresql"]),
-            ("Cual es su #terminal favorita? Yo uso alacritty con tmux", &["terminal"]),
-            ("Les presento mi setup de #minimalismo digital. Solo terminal y shell", &["minimalismo"]),
-            ("Acabo de leer un paper sobre #algoritmos distribuidos. Increible", &["algoritmos"]),
-            ("Hoy empece a contribuir a un proyecto #opensource. Que emocion", &["opensource"]),
-            ("Mejor practica para #git: commits atomicos y mensajes claros", &["git"]),
-            ("Reflexion del dia: menos herramientas, mas pensamiento. #filosofia", &["filosofia"]),
-            ("Estoy aprendiendo #golang. Que les parece comparado con rust?", &["golang"]),
-            ("Tip del dia: usa #docker para entornos de desarrollo reproducibles", &["docker"]),
-            ("La #ia esta cambiando como programamos. Opiniones?", &["ia"]),
-            ("Acabo de configurar #nixos y no puedo creer lo limpio que queda todo", &["nixos"]),
-            ("Buenas practicas de #testing: unitarios, integracion y e2e. Los 3 hacen falta", &["testing"]),
-            ("Que monitor usan para programar? Yo tengo uno ultrawide y es gloria", &["hardware"]),
-            ("Los errores de compilacion de #rust son los mejores. Te enseñan en vez de asustarte", &["rust"]),
-            ("Hackathon este fin de semana. Quien se apunta? #hackathon #startup", &["hackathon", "startup"]),
-            ("Mi rutina: cafe, codigo, cafe, deploy, cafe, dormir. #developer #life", &["developer", "life"]),
-            ("Alguien esta usando #htmx? Opiniones sinceras por favor", &["htmx"]),
-            ("La comunidad de #rust es la mas acogedora que conoci en 20 años de carrera", &["rust"]),
-            ("Necesito un libro sobre arquitectura de #software. Recomendaciones?", &["software"]),
-            ("Hoy hice mi primer PR a un proyecto grande. #opensource #achievement", &["opensource", "achievement"]),
-            ("Debate: tabs vs spaces. Yo: tabs para accesibilidad. Ustedes?", &["debate"]),
-            ("Aprendiendo #elixir y el pattern matching me esta volando la cabeza", &["elixir"]),
-            ("Setup minimalista para #productividad: terminal, tmux, neovim, y un buen teclado", &["productividad"]),
-            ("Los que usan #archlinux, como llevan el rolling release? Vale la pena?", &["archlinux"]),
-            ("Hablemos de #backend con rust. Que frameworks recomiendan: axum o actix?", &["backend", "rust"]),
-            ("El #teletrabajo mejoro mi calidad de vida un 300%. No vuelvo a oficina", &["teletrabajo"]),
+            (
+                "Acabo de descubrir #rust y estoy alucinando con el borrow checker",
+                &["rust"],
+            ),
+            (
+                "Alguien mas usa #neovim con LSP para desarrollo? Es magia pura",
+                &["neovim"],
+            ),
+            (
+                "Hoy compile el kernel de #linux en menos de 5 minutos. Que epoca para estar vivo",
+                &["linux"],
+            ),
+            (
+                "El #opensource es lo mejor que le paso a la humanidad. Change my mind",
+                &["opensource"],
+            ),
+            (
+                "Buenos dias #gente. Hoy toca deploy a produccion. Deseenme suerte",
+                &["gente"],
+            ),
+            (
+                "Recomendaciones de #musica para programar? Necesito focus total",
+                &["musica"],
+            ),
+            (
+                "Estoy armando un cluster de Kubernetes en casa. #devops #cloud",
+                &["devops", "cloud"],
+            ),
+            (
+                "Lean esto sobre #rust async vs sync. Les vuela la cabeza",
+                &["rust"],
+            ),
+            (
+                "El mejor #editor para codigo es el que te deja fluir. Para mi, neovim",
+                &["editor"],
+            ),
+            (
+                "Thread sobre #seguridad en aplicaciones web. Abro hilo",
+                &["seguridad"],
+            ),
+            (
+                "Quien va a la #rustconf este año? Nos juntamos?",
+                &["rustconf"],
+            ),
+            (
+                "Termine mi proyecto en #python. Ahora quiero reescribirlo en rust, es normal?",
+                &["python", "rust"],
+            ),
+            (
+                "La documentacion de #postgresql es oro puro. No subestimen la doc oficial",
+                &["postgresql"],
+            ),
+            (
+                "Cual es su #terminal favorita? Yo uso alacritty con tmux",
+                &["terminal"],
+            ),
+            (
+                "Les presento mi setup de #minimalismo digital. Solo terminal y shell",
+                &["minimalismo"],
+            ),
+            (
+                "Acabo de leer un paper sobre #algoritmos distribuidos. Increible",
+                &["algoritmos"],
+            ),
+            (
+                "Hoy empece a contribuir a un proyecto #opensource. Que emocion",
+                &["opensource"],
+            ),
+            (
+                "Mejor practica para #git: commits atomicos y mensajes claros",
+                &["git"],
+            ),
+            (
+                "Reflexion del dia: menos herramientas, mas pensamiento. #filosofia",
+                &["filosofia"],
+            ),
+            (
+                "Estoy aprendiendo #golang. Que les parece comparado con rust?",
+                &["golang"],
+            ),
+            (
+                "Tip del dia: usa #docker para entornos de desarrollo reproducibles",
+                &["docker"],
+            ),
+            (
+                "La #ia esta cambiando como programamos. Opiniones?",
+                &["ia"],
+            ),
+            (
+                "Acabo de configurar #nixos y no puedo creer lo limpio que queda todo",
+                &["nixos"],
+            ),
+            (
+                "Buenas practicas de #testing: unitarios, integracion y e2e. Los 3 hacen falta",
+                &["testing"],
+            ),
+            (
+                "Que monitor usan para programar? Yo tengo uno ultrawide y es gloria",
+                &["hardware"],
+            ),
+            (
+                "Los errores de compilacion de #rust son los mejores. Te enseñan en vez de asustarte",
+                &["rust"],
+            ),
+            (
+                "Hackathon este fin de semana. Quien se apunta? #hackathon #startup",
+                &["hackathon", "startup"],
+            ),
+            (
+                "Mi rutina: cafe, codigo, cafe, deploy, cafe, dormir. #developer #life",
+                &["developer", "life"],
+            ),
+            (
+                "Alguien esta usando #htmx? Opiniones sinceras por favor",
+                &["htmx"],
+            ),
+            (
+                "La comunidad de #rust es la mas acogedora que conoci en 20 años de carrera",
+                &["rust"],
+            ),
+            (
+                "Necesito un libro sobre arquitectura de #software. Recomendaciones?",
+                &["software"],
+            ),
+            (
+                "Hoy hice mi primer PR a un proyecto grande. #opensource #achievement",
+                &["opensource", "achievement"],
+            ),
+            (
+                "Debate: tabs vs spaces. Yo: tabs para accesibilidad. Ustedes?",
+                &["debate"],
+            ),
+            (
+                "Aprendiendo #elixir y el pattern matching me esta volando la cabeza",
+                &["elixir"],
+            ),
+            (
+                "Setup minimalista para #productividad: terminal, tmux, neovim, y un buen teclado",
+                &["productividad"],
+            ),
+            (
+                "Los que usan #archlinux, como llevan el rolling release? Vale la pena?",
+                &["archlinux"],
+            ),
+            (
+                "Hablemos de #backend con rust. Que frameworks recomiendan: axum o actix?",
+                &["backend", "rust"],
+            ),
+            (
+                "El #teletrabajo mejoro mi calidad de vida un 300%. No vuelvo a oficina",
+                &["teletrabajo"],
+            ),
         ];
 
         // Generate ~250 posts spread across users (0..48 active)
@@ -1653,7 +2297,9 @@ impl Database {
         for pair_idx in 0..20 {
             let a_idx = pair_idx % 48;
             let b_idx = (pair_idx * 3 + 7) % 48;
-            if a_idx == b_idx { continue; }
+            if a_idx == b_idx {
+                continue;
+            }
             let a = uids[a_idx];
             let b = uids[b_idx];
 
@@ -1701,13 +2347,13 @@ impl Database {
 #[cfg(test)]
 pub(crate) mod mock_db {
     use anyhow::Result;
-use chrono::{DateTime, Utc};
+    use chrono::Utc;
     use std::collections::HashMap;
     use std::sync::Mutex;
     use std::time::Instant;
 
     use crate::db::{AuthResult, DatabaseOps};
-    use crate::models::{Comment, Message, Notification, Post, User};
+    use crate::models::{Comment, Message, MessagePreview, Notification, Post, User};
 
     pub(crate) struct MockData {
         pub users: Vec<(User, String)>,
@@ -1754,7 +2400,13 @@ use chrono::{DateTime, Utc};
     }
 
     impl DatabaseOps for MockDatabase {
-        fn check_rate_limit(&self, user_id: i64, action: &str, max: usize, window_secs: u64) -> Result<()> {
+        fn check_rate_limit(
+            &self,
+            user_id: i64,
+            action: &str,
+            max: usize,
+            window_secs: u64,
+        ) -> Result<()> {
             let key = format!("{}:{}", user_id, action);
             let now = Instant::now();
             let mut limiter = self.rate_limiter.lock().unwrap();
@@ -1771,7 +2423,13 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn register_user(&self, username: &str, password: &str, display_name: &str) -> Result<User> {
+        fn register_user(
+            &self,
+            username: &str,
+            password: &str,
+            display_name: &str,
+            _invite_code: Option<&str>,
+        ) -> Result<User> {
             let mut data = self.data.lock().unwrap();
             let username_lower = username.trim().to_lowercase();
             if data.users.iter().any(|(u, _)| u.username == username_lower) {
@@ -1795,7 +2453,11 @@ use chrono::{DateTime, Utc};
 
         fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
             let data = self.data.lock().unwrap();
-            if let Some((user, hash)) = data.users.iter().find(|(u, _)| u.username.to_lowercase() == username.to_lowercase()) {
+            if let Some((user, hash)) = data
+                .users
+                .iter()
+                .find(|(u, _)| u.username.to_lowercase() == username.to_lowercase())
+            {
                 if bcrypt::verify(password, hash)? {
                     return Ok(AuthResult::Success(user.clone()));
                 } else {
@@ -1807,24 +2469,40 @@ use chrono::{DateTime, Utc};
 
         fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
             let data = self.data.lock().unwrap();
-            Ok(data.users.iter().find(|(u, _)| u.id == id).map(|(u, _)| u.clone()))
+            Ok(data
+                .users
+                .iter()
+                .find(|(u, _)| u.id == id)
+                .map(|(u, _)| u.clone()))
         }
 
         fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
-            Ok(data.users.iter()
-                .filter(|(u, _)| u.username.to_lowercase().contains(&q) || u.display_name.to_lowercase().contains(&q))
+            Ok(data
+                .users
+                .iter()
+                .filter(|(u, _)| {
+                    u.username.to_lowercase().contains(&q)
+                        || u.display_name.to_lowercase().contains(&q)
+                })
                 .map(|(u, _)| u.clone())
                 .skip(offset as usize)
                 .take(limit as usize)
                 .collect())
         }
 
-        fn create_post(&self, user_id: i64, content: &str, image_path: Option<&str>) -> Result<Post> {
+        fn create_post(
+            &self,
+            user_id: i64,
+            content: &str,
+            image_path: Option<&str>,
+        ) -> Result<Post> {
             self.check_rate_limit(user_id, "post", 5, 60)?;
             let mut data = self.data.lock().unwrap();
-            let username = data.users.iter()
+            let username = data
+                .users
+                .iter()
                 .find(|(u, _)| u.id == user_id)
                 .map(|(u, _)| u.username.clone())
                 .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
@@ -1844,21 +2522,34 @@ use chrono::{DateTime, Utc};
 
         fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
-            let mut posts: Vec<Post> = data.posts.iter()
+            let mut posts: Vec<Post> = data
+                .posts
+                .iter()
                 .filter(|p| {
                     p.user_id == user_id
-                        || data.follows.iter().any(|(f, fol)| *f == user_id && *fol == p.user_id)
+                        || data
+                            .follows
+                            .iter()
+                            .any(|(f, fol)| *f == user_id && *fol == p.user_id)
                 })
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
+            Ok(posts
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
         }
 
         fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
             self.check_rate_limit(follower_id, "follow", 10, 60)?;
             let mut data = self.data.lock().unwrap();
-            if !data.follows.iter().any(|(f, fol)| *f == follower_id && *fol == following_id) {
+            if !data
+                .follows
+                .iter()
+                .any(|(f, fol)| *f == follower_id && *fol == following_id)
+            {
                 data.follows.push((follower_id, following_id));
             }
             Ok(())
@@ -1866,47 +2557,77 @@ use chrono::{DateTime, Utc};
 
         fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
             let mut data = self.data.lock().unwrap();
-            data.follows.retain(|(f, fol)| *f != follower_id || *fol != following_id);
+            data.follows
+                .retain(|(f, fol)| *f != follower_id || *fol != following_id);
             Ok(())
         }
 
         fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool> {
             let data = self.data.lock().unwrap();
-            Ok(data.follows.iter().any(|(f, fol)| *f == follower_id && *fol == following_id))
+            Ok(data
+                .follows
+                .iter()
+                .any(|(f, fol)| *f == follower_id && *fol == following_id))
         }
 
         fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
             let data = self.data.lock().unwrap();
-            Ok(data.follows.iter()
+            Ok(data
+                .follows
+                .iter()
                 .filter(|(_, fol)| *fol == user_id)
-                .filter_map(|(f, _)| data.users.iter().find(|(u, _)| u.id == *f).map(|(u, _)| u.clone()))
+                .filter_map(|(f, _)| {
+                    data.users
+                        .iter()
+                        .find(|(u, _)| u.id == *f)
+                        .map(|(u, _)| u.clone())
+                })
                 .collect())
         }
 
         fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
             let data = self.data.lock().unwrap();
-            Ok(data.follows.iter()
+            Ok(data
+                .follows
+                .iter()
                 .filter(|(f, _)| *f == user_id)
-                .filter_map(|(_, fol)| data.users.iter().find(|(u, _)| u.id == *fol).map(|(u, _)| u.clone()))
+                .filter_map(|(_, fol)| {
+                    data.users
+                        .iter()
+                        .find(|(u, _)| u.id == *fol)
+                        .map(|(u, _)| u.clone())
+                })
                 .collect())
         }
 
-    fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
+        fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
             let data = self.data.lock().unwrap();
             Ok(data.posts.iter().find(|p| p.id == post_id).cloned())
         }
 
-    fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
-            let mut posts: Vec<Post> = data.posts.iter()
+            let mut posts: Vec<Post> = data
+                .posts
+                .iter()
                 .filter(|p| p.user_id == user_id)
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
+            Ok(posts
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
         }
 
-        fn search_posts(&self, query: &str, time_filter: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
+        fn search_posts(
+            &self,
+            query: &str,
+            time_filter: &str,
+            offset: u64,
+            limit: u64,
+        ) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
             let cutoff = match time_filter {
@@ -1916,7 +2637,9 @@ use chrono::{DateTime, Utc};
                 _ => None,
             };
             let now = Utc::now();
-            let mut posts: Vec<Post> = data.posts.iter()
+            let mut posts: Vec<Post> = data
+                .posts
+                .iter()
                 .filter(|p| {
                     let content_match = p.content.to_lowercase().contains(&q);
                     let time_match = match cutoff {
@@ -1928,33 +2651,61 @@ use chrono::{DateTime, Utc};
                 .cloned()
                 .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok(posts.into_iter().skip(offset as usize).take(limit as usize).collect())
+            Ok(posts
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
         }
 
-        fn search_posts_by_user(&self, query: &str, _offset: u64, _limit: u64) -> Result<Vec<Post>> {
+        fn search_posts_by_user(
+            &self,
+            query: &str,
+            _offset: u64,
+            _limit: u64,
+        ) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
-            let mut posts: Vec<Post> = data.posts.iter()
+            let mut posts: Vec<Post> = data
+                .posts
+                .iter()
                 .filter(|p| p.username.to_lowercase().contains(&q))
-                .cloned().collect();
+                .cloned()
+                .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             Ok(posts)
         }
 
-        fn search_posts_by_date(&self, query: &str, _offset: u64, _limit: u64) -> Result<Vec<Post>> {
+        fn search_posts_by_date(
+            &self,
+            query: &str,
+            _offset: u64,
+            _limit: u64,
+        ) -> Result<Vec<Post>> {
             let data = self.data.lock().unwrap();
             let q = query.to_lowercase();
-            let mut posts: Vec<Post> = data.posts.iter()
+            let mut posts: Vec<Post> = data
+                .posts
+                .iter()
                 .filter(|p| p.created_at.to_rfc3339().to_lowercase().contains(&q))
-                .cloned().collect();
+                .cloned()
+                .collect();
             posts.sort_by(|a, b| b.created_at.cmp(&a.created_at));
             Ok(posts)
         }
 
-        fn add_comment(&self, post_id: i64, user_id: i64, content: &str, parent_id: Option<i64>) -> Result<Comment> {
+        fn add_comment(
+            &self,
+            post_id: i64,
+            user_id: i64,
+            content: &str,
+            parent_id: Option<i64>,
+        ) -> Result<Comment> {
             self.check_rate_limit(user_id, "comment", 10, 60)?;
             let mut data = self.data.lock().unwrap();
-            let username = data.users.iter()
+            let username = data
+                .users
+                .iter()
                 .find(|(u, _)| u.id == user_id)
                 .map(|(u, _)| u.username.clone())
                 .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
@@ -1975,7 +2726,9 @@ use chrono::{DateTime, Utc};
 
         fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
             let data = self.data.lock().unwrap();
-            let mut comments: Vec<Comment> = data.comments.iter()
+            let mut comments: Vec<Comment> = data
+                .comments
+                .iter()
                 .filter(|c| c.post_id == post_id)
                 .cloned()
                 .collect();
@@ -1985,7 +2738,9 @@ use chrono::{DateTime, Utc};
 
         fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
             let mut data = self.data.lock().unwrap();
-            let post = data.posts.iter_mut()
+            let post = data
+                .posts
+                .iter_mut()
                 .find(|p| p.id == post_id)
                 .ok_or_else(|| anyhow::anyhow!("Post no encontrado"))?;
             if post.user_id != user_id {
@@ -1997,7 +2752,10 @@ use chrono::{DateTime, Utc};
 
         fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()> {
             let mut data = self.data.lock().unwrap();
-            let idx = data.posts.iter().position(|p| p.id == post_id)
+            let idx = data
+                .posts
+                .iter()
+                .position(|p| p.id == post_id)
                 .ok_or_else(|| anyhow::anyhow!("Post no encontrado"))?;
             if data.posts[idx].user_id != user_id {
                 anyhow::bail!("No tienes permiso para eliminar este post");
@@ -2009,7 +2767,10 @@ use chrono::{DateTime, Utc};
 
         fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()> {
             let mut data = self.data.lock().unwrap();
-            let idx = data.comments.iter().position(|c| c.id == comment_id)
+            let idx = data
+                .comments
+                .iter()
+                .position(|c| c.id == comment_id)
                 .ok_or_else(|| anyhow::anyhow!("Comentario no encontrado"))?;
             if data.comments[idx].user_id != user_id {
                 anyhow::bail!("No tienes permiso para eliminar este comentario");
@@ -2023,16 +2784,27 @@ use chrono::{DateTime, Utc};
             data.users.retain(|(u, _)| u.id != user_id);
             data.posts.retain(|p| p.user_id != user_id);
             data.comments.retain(|c| c.user_id != user_id);
-            data.follows.retain(|(f, fol)| *f != user_id && *fol != user_id);
-            data.messages.retain(|m| m.sender_id != user_id && m.receiver_id != user_id);
-            data.notifications.retain(|n| n.user_id != user_id && n.from_user_id != user_id);
+            data.follows
+                .retain(|(f, fol)| *f != user_id && *fol != user_id);
+            data.messages
+                .retain(|m| m.sender_id != user_id && m.receiver_id != user_id);
+            data.notifications
+                .retain(|n| n.user_id != user_id && n.from_user_id != user_id);
             Ok(())
         }
 
-        fn send_message(&self, sender_id: i64, receiver_id: i64, content: &str, _encrypted: bool) -> Result<Message> {
+        fn send_message(
+            &self,
+            sender_id: i64,
+            receiver_id: i64,
+            content: &str,
+            _encrypted: bool,
+        ) -> Result<Message> {
             self.check_rate_limit(sender_id, "message", 10, 60)?;
             let mut data = self.data.lock().unwrap();
-            let username = data.users.iter()
+            let username = data
+                .users
+                .iter()
                 .find(|(u, _)| u.id == sender_id)
                 .map(|(u, _)| u.username.clone())
                 .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
@@ -2054,21 +2826,37 @@ use chrono::{DateTime, Utc};
 
         fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
             let data = self.data.lock().unwrap();
-            let mut other_ids: Vec<i64> = data.messages.iter()
+            let mut other_ids: Vec<i64> = data
+                .messages
+                .iter()
                 .filter(|m| m.sender_id == user_id || m.receiver_id == user_id)
-                .map(|m| if m.sender_id == user_id { m.receiver_id } else { m.sender_id })
+                .map(|m| {
+                    if m.sender_id == user_id {
+                        m.receiver_id
+                    } else {
+                        m.sender_id
+                    }
+                })
                 .collect();
             other_ids.sort();
             other_ids.dedup();
-            let users: Vec<User> = other_ids.iter()
-                .filter_map(|id| data.users.iter().find(|(u, _)| u.id == *id).map(|(u, _)| u.clone()))
+            let users: Vec<User> = other_ids
+                .iter()
+                .filter_map(|id| {
+                    data.users
+                        .iter()
+                        .find(|(u, _)| u.id == *id)
+                        .map(|(u, _)| u.clone())
+                })
                 .collect();
             Ok(users)
         }
 
         fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
             let data = self.data.lock().unwrap();
-            let mut msgs: Vec<Message> = data.messages.iter()
+            let mut msgs: Vec<Message> = data
+                .messages
+                .iter()
                 .filter(|m| {
                     (m.sender_id == user_id && m.receiver_id == other_id)
                         || (m.sender_id == other_id && m.receiver_id == user_id)
@@ -2079,9 +2867,43 @@ use chrono::{DateTime, Utc};
             Ok(msgs)
         }
 
+        fn get_recent_message_previews(
+            &self,
+            user_id: i64,
+            limit: i64,
+        ) -> Result<Vec<MessagePreview>> {
+            let data = self.data.lock().unwrap();
+            let mut by_sender: HashMap<i64, &Message> = HashMap::new();
+            for message in data.messages.iter().filter(|m| m.receiver_id == user_id) {
+                by_sender
+                    .entry(message.sender_id)
+                    .and_modify(|latest| {
+                        if message.created_at > latest.created_at {
+                            *latest = message;
+                        }
+                    })
+                    .or_insert(message);
+            }
+            let mut previews: Vec<MessagePreview> = by_sender
+                .into_values()
+                .map(|message| MessagePreview {
+                    sender_id: message.sender_id,
+                    sender_username: message.sender_username.clone(),
+                    content: message.content.clone(),
+                    created_at: message.created_at,
+                    unread: !message.read,
+                })
+                .collect();
+            previews.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            previews.truncate(limit.max(0) as usize);
+            Ok(previews)
+        }
+
         fn get_unread_count(&self, user_id: i64) -> Result<i64> {
             let data = self.data.lock().unwrap();
-            Ok(data.messages.iter()
+            Ok(data
+                .messages
+                .iter()
                 .filter(|m| m.receiver_id == user_id && !m.read)
                 .count() as i64)
         }
@@ -2096,7 +2918,13 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn update_profile(&self, user_id: i64, display_name: &str, bio: &str, utc_offset: i32) -> Result<()> {
+        fn update_profile(
+            &self,
+            user_id: i64,
+            display_name: &str,
+            bio: &str,
+            utc_offset: i32,
+        ) -> Result<()> {
             let mut data = self.data.lock().unwrap();
             if let Some((user, _)) = data.users.iter_mut().find(|(u, _)| u.id == user_id) {
                 user.display_name = display_name.to_string();
@@ -2114,9 +2942,17 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn add_notification(&self, user_id: i64, from_user_id: i64, notif_type: &str, related_id: Option<i64>) -> Result<()> {
+        fn add_notification(
+            &self,
+            user_id: i64,
+            from_user_id: i64,
+            notif_type: &str,
+            related_id: Option<i64>,
+        ) -> Result<()> {
             let mut data = self.data.lock().unwrap();
-            let from_username = data.users.iter()
+            let from_username = data
+                .users
+                .iter()
                 .find(|(u, _)| u.id == from_user_id)
                 .map(|(u, _)| u.username.clone())
                 .unwrap_or_default();
@@ -2135,19 +2971,32 @@ use chrono::{DateTime, Utc};
             Ok(())
         }
 
-        fn get_notifications(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Notification>> {
+        fn get_notifications(
+            &self,
+            user_id: i64,
+            offset: u64,
+            limit: u64,
+        ) -> Result<Vec<Notification>> {
             let data = self.data.lock().unwrap();
-            let mut notifs: Vec<Notification> = data.notifications.iter()
+            let mut notifs: Vec<Notification> = data
+                .notifications
+                .iter()
                 .filter(|n| n.user_id == user_id)
                 .cloned()
                 .collect();
             notifs.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-            Ok(notifs.into_iter().skip(offset as usize).take(limit as usize).collect())
+            Ok(notifs
+                .into_iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .collect())
         }
 
         fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
             let data = self.data.lock().unwrap();
-            Ok(data.notifications.iter()
+            Ok(data
+                .notifications
+                .iter()
                 .filter(|n| n.user_id == user_id && !n.read)
                 .count() as i64)
         }
@@ -2174,13 +3023,14 @@ use chrono::{DateTime, Utc};
             let data = self.data.lock().unwrap();
             let tag_binding = tag.to_lowercase();
             let tag_lower = tag_binding.trim_start_matches('#');
-            Ok(data.posts.iter()
+            Ok(data
+                .posts
+                .iter()
                 .filter(|p| {
-                    p.content.split_whitespace()
-                        .any(|w| {
-                            let w_clean = w.to_lowercase();
-                            w_clean.trim_start_matches('#') == tag_lower
-                        })
+                    p.content.split_whitespace().any(|w| {
+                        let w_clean = w.to_lowercase();
+                        w_clean.trim_start_matches('#') == tag_lower
+                    })
                 })
                 .cloned()
                 .collect())
@@ -2188,7 +3038,8 @@ use chrono::{DateTime, Utc};
 
         fn get_trending_hashtags(&self, _limit: u64) -> Result<Vec<(String, i64)>> {
             let data = self.data.lock().unwrap();
-            let mut counts: std::collections::HashMap<String, i64> = std::collections::HashMap::new();
+            let mut counts: std::collections::HashMap<String, i64> =
+                std::collections::HashMap::new();
             for post in &data.posts {
                 for word in post.content.split_whitespace() {
                     if word.starts_with('#') && word.len() > 1 {
@@ -2208,7 +3059,9 @@ use chrono::{DateTime, Utc};
 
         fn get_public_key(&self, _user_id: i64) -> Result<Option<String>> {
             let data = self.data.lock().unwrap();
-            Ok(data.users.iter()
+            Ok(data
+                .users
+                .iter()
                 .find(|(u, _)| u.id == _user_id)
                 .and_then(|(u, _)| u.public_key.clone()))
         }
@@ -2232,8 +3085,9 @@ use chrono::{DateTime, Utc};
 
         fn setup() -> MockDatabase {
             let db = MockDatabase::new();
-            db.register_user("alice", "pass123", "Alice A.").unwrap();
-            db.register_user("bob", "pass456", "Bob B.").unwrap();
+            db.register_user("alice", "pass123", "Alice A.", None)
+                .unwrap();
+            db.register_user("bob", "pass456", "Bob B.", None).unwrap();
             db
         }
 
@@ -2256,7 +3110,7 @@ use chrono::{DateTime, Utc};
         #[test]
         fn test_register_duplicate_username() {
             let db = setup();
-            let result = db.register_user("alice", "otrapass", "Alice Dup");
+            let result = db.register_user("alice", "otrapass", "Alice Dup", None);
             assert!(result.is_err());
         }
 
@@ -2454,7 +3308,9 @@ use chrono::{DateTime, Utc};
         #[test]
         fn test_create_post_with_image() {
             let db = setup();
-            let post = db.create_post(1, "With image", Some("https://example.com/img.jpg")).unwrap();
+            let post = db
+                .create_post(1, "With image", Some("https://example.com/img.jpg"))
+                .unwrap();
             assert!(post.image_path.is_some());
             assert_eq!(post.image_path.unwrap(), "https://example.com/img.jpg");
         }

@@ -35,15 +35,40 @@ pub fn ago(lang: Lang, dt: &DateTime<Utc>, offset_min: i32) -> String {
         (0, s_ago(lang, "now"))
     } else if secs < 3600 {
         let m = secs / 60;
-        (m, if m == 1 { s_ago(lang, "min") } else { s_ago(lang, "mins") })
+        (
+            m,
+            if m == 1 {
+                s_ago(lang, "min")
+            } else {
+                s_ago(lang, "mins")
+            },
+        )
     } else if secs < 86400 {
         let h = secs / 3600;
-        (h, if h == 1 { s_ago(lang, "hour") } else { s_ago(lang, "hours") })
+        (
+            h,
+            if h == 1 {
+                s_ago(lang, "hour")
+            } else {
+                s_ago(lang, "hours")
+            },
+        )
     } else {
         let d = secs / 86400;
-        (d, if d == 1 { s_ago(lang, "day") } else { s_ago(lang, "days") })
+        (
+            d,
+            if d == 1 {
+                s_ago(lang, "day")
+            } else {
+                s_ago(lang, "days")
+            },
+        )
     };
-    if unit.contains("{}") { format(unit, num) } else { unit.to_string() }
+    if unit.contains("{}") {
+        format(unit, num)
+    } else {
+        unit.to_string()
+    }
 }
 
 fn s_ago(lang: Lang, key: &str) -> &'static str {

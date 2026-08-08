@@ -1,20 +1,20 @@
 use anyhow::Result;
 use ratatui::{
+    Frame, Terminal,
     backend::CrosstermBackend,
     crossterm::event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, BorderType, Borders, List, ListItem, ListState, Paragraph, Wrap},
-    Frame, Terminal,
 };
 use std::io::{Stdout, Write};
 use std::panic;
 
 use crate::db::{AuthResult, DatabaseOps};
 use crate::i18n::{self, Lang};
-use crate::t;
 use crate::models::{Comment, Message, Notification, Post, Screen, User};
+use crate::t;
 use crate::theme::AppTheme;
 
 pub fn run_tui(db_conn: &str) -> Result<()> {
@@ -126,7 +126,6 @@ pub struct App {
     pub upload_known_count: usize,
     pub upload_waiting: bool,
     pub upload_new_file: Option<String>,
-    pub upload_client_ip: Option<String>,
     pub upload_watch_count: usize,
     pub e2e_secret: Option<x25519_dalek::StaticSecret>,
 }
@@ -140,7 +139,8 @@ struct CommentNode {
 
 fn build_comment_tree(comments: &[Comment]) -> Vec<CommentNode> {
     let mut roots = Vec::new();
-    let mut comment_map: std::collections::HashMap<i64, Vec<usize>> = std::collections::HashMap::new();
+    let mut comment_map: std::collections::HashMap<i64, Vec<usize>> =
+        std::collections::HashMap::new();
 
     for (i, c) in comments.iter().enumerate() {
         match c.parent_comment_id {
@@ -160,7 +160,12 @@ fn build_comment_tree(comments: &[Comment]) -> Vec<CommentNode> {
     roots
 }
 
-fn build_children(node: &mut CommentNode, comments: &[Comment], map: &std::collections::HashMap<i64, Vec<usize>>, _depth: usize) {
+fn build_children(
+    node: &mut CommentNode,
+    comments: &[Comment],
+    map: &std::collections::HashMap<i64, Vec<usize>>,
+    _depth: usize,
+) {
     if let Some(indices) = map.get(&node.comment.id) {
         for &idx in indices {
             let child = &comments[idx];
@@ -191,7 +196,11 @@ impl App {
         SPINNER[(self.frame_count as usize / 3) % SPINNER.len()]
     }
 
-    pub fn new(db: Box<dyn DatabaseOps>, lang: Lang, plugins: crate::plugins::PluginRegistry) -> Self {
+    pub fn new(
+        db: Box<dyn DatabaseOps>,
+        lang: Lang,
+        plugins: crate::plugins::PluginRegistry,
+    ) -> Self {
         Self {
             db,
             lang,
@@ -254,7 +263,6 @@ impl App {
             upload_known_count: 0,
             upload_waiting: false,
             upload_new_file: None,
-            upload_client_ip: None,
             upload_watch_count: 0,
             e2e_secret: None,
             plugins,
@@ -273,7 +281,8 @@ impl App {
         loop {
             self.frame_count += 1;
 
-            if self.screen == Screen::Radio && !self.radio_paused && !self.radio_hashtags.is_empty() {
+            if self.screen == Screen::Radio && !self.radio_paused && !self.radio_hashtags.is_empty()
+            {
                 if self.frame_count - self.radio_tick_frame > 96 {
                     self.radio_idx = (self.radio_idx + 1) % self.radio_hashtags.len();
                     self.radio_tick_frame = self.frame_count;
@@ -288,9 +297,13 @@ impl App {
                     let username = self.current_user.as_ref().unwrap().username.clone();
                     let current = crate::ssh::list_uploaded_images(&username);
                     if current.len() > self.upload_known_count {
-                        let prev: std::collections::HashSet<String> = self.uploaded_images
-                            .iter().map(|(n, _)| n.clone()).collect();
-                        let new_files: Vec<String> = current.iter()
+                        let prev: std::collections::HashSet<String> = self
+                            .uploaded_images
+                            .iter()
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        let new_files: Vec<String> = current
+                            .iter()
                             .map(|(n, _)| n.clone())
                             .filter(|n| !prev.contains(n))
                             .collect();
@@ -313,9 +326,13 @@ impl App {
                 let current = crate::ssh::list_uploaded_images(&username);
                 if current.len() != self.upload_watch_count {
                     if current.len() > self.upload_watch_count {
-                        let prev: std::collections::HashSet<String> = self.uploaded_images
-                            .iter().map(|(n, _)| n.clone()).collect();
-                        let new_names: Vec<String> = current.iter()
+                        let prev: std::collections::HashSet<String> = self
+                            .uploaded_images
+                            .iter()
+                            .map(|(n, _)| n.clone())
+                            .collect();
+                        let new_names: Vec<String> = current
+                            .iter()
                             .map(|(n, _)| n.clone())
                             .filter(|n| !prev.contains(n))
                             .collect();
@@ -366,7 +383,10 @@ impl App {
                                 Ok(false) => should_break = true,
                                 Ok(true) => {}
                                 Err(err) => {
-                                    tracing::error!("TUI action failed on {:?}: {err}", self.screen);
+                                    tracing::error!(
+                                        "TUI action failed on {:?}: {err}",
+                                        self.screen
+                                    );
                                     self.set_status(format!("Error: {err}"));
                                 }
                             }
@@ -427,10 +447,19 @@ impl App {
             KeyCode::Esc => return Ok(false),
             KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Char(c) => self.input.push(c),
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Tab => {
-                self.screen = Screen::Register;
-                self.input.clear();
+                let registration_closed = std::env::var("REGISTRATION_MODE")
+                    .unwrap_or_else(|_| "open".to_string())
+                    .eq_ignore_ascii_case("closed");
+                if registration_closed {
+                    self.set_status("El registro está cerrado por el administrador.".to_string());
+                } else {
+                    self.screen = Screen::Register;
+                    self.input.clear();
+                }
             }
             KeyCode::Enter => {
                 let parts: Vec<&str> = self.input.splitn(2, ':').collect();
@@ -438,26 +467,31 @@ impl App {
                     let username = parts[0].trim();
                     let password = parts[1].trim();
                     match self.db.authenticate(username, password) {
-                        Ok(result) => match result {
-                            AuthResult::Success(user) => {
-                                self.current_user = Some(user);
-                                let (secret, _) = crate::db::derive_keypair(password, username);
-                                self.e2e_secret = Some(secret);
-                                self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
-                                if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
-                                    crate::ssh::write_scp_user_for_token(&ip, &username);
+                        Ok(result) => {
+                            match result {
+                                AuthResult::Success(user) => {
+                                    self.current_user = Some(user);
+                                    let (secret, _) = crate::db::derive_keypair(password, username);
+                                    self.e2e_secret = Some(secret);
+                                    self.upload_watch_count =
+                                        crate::ssh::list_uploaded_images(&username).len();
+                                    if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
+                                        crate::ssh::write_scp_user_for_token(&ip, &username);
+                                    }
+                                    self.screen = Screen::Timeline;
+                                    self.page = 0;
+                                    self.input.clear();
+                                    if let Err(err) = self.refresh_timeline() {
+                                        tracing::error!("refresh_timeline failed: {err}");
+                                        self.set_status(format!("Error al cargar timeline: {err}"));
+                                    }
                                 }
-                                self.screen = Screen::Timeline;
-                                self.page = 0;
-                                self.input.clear();
-                                if let Err(err) = self.refresh_timeline() {
-                                    tracing::error!("refresh_timeline failed: {err}");
-                                    self.set_status(format!("Error al cargar timeline: {err}"));
-                                }
+                                AuthResult::UserNotFound => self
+                                    .set_status(t!(self, login_error_user_not_found).to_string()),
+                                AuthResult::WrongPassword => self
+                                    .set_status(t!(self, login_error_wrong_password).to_string()),
                             }
-                            AuthResult::UserNotFound => self.set_status(t!(self, login_error_user_not_found).to_string()),
-                            AuthResult::WrongPassword => self.set_status(t!(self, login_error_wrong_password).to_string()),
-                        },
+                        }
                         Err(e) => {
                             tracing::error!("Login authenticate failed: {e}");
                             self.set_status(format!("DB error: {e}"));
@@ -477,17 +511,24 @@ impl App {
             KeyCode::Esc => return Ok(false),
             KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Char(c) => self.input.push(c),
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Tab => {
                 self.screen = Screen::Login;
                 self.input.clear();
             }
             KeyCode::Enter => {
-                let parts: Vec<&str> = self.input.splitn(3, ':').collect();
-                if parts.len() == 3 {
+                let invite_required = std::env::var("REGISTRATION_MODE")
+                    .unwrap_or_else(|_| "open".to_string())
+                    .eq_ignore_ascii_case("invite");
+                let expected_parts = if invite_required { 4 } else { 3 };
+                let parts: Vec<&str> = self.input.splitn(expected_parts, ':').collect();
+                if parts.len() == expected_parts {
                     let username = parts[0].trim();
                     let password = parts[1].trim();
                     let display = parts[2].trim();
+                    let invite_code = invite_required.then(|| parts[3].trim());
                     if username.is_empty() {
                         self.set_status(t!(self, register_error_username_empty).to_string());
                     } else if password.len() < 4 {
@@ -501,12 +542,16 @@ impl App {
                             self.set_status(e.to_string());
                             return Ok(true);
                         }
-                        match self.db.register_user(username, password, display) {
+                        match self
+                            .db
+                            .register_user(username, password, display, invite_code)
+                        {
                             Ok(user) => {
                                 self.current_user = Some(user);
                                 let (secret, _) = crate::db::derive_keypair(password, username);
                                 self.e2e_secret = Some(secret);
-                                self.upload_watch_count = crate::ssh::list_uploaded_images(&username).len();
+                                self.upload_watch_count =
+                                    crate::ssh::list_uploaded_images(&username).len();
                                 if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
                                     crate::ssh::write_scp_user_for_token(&ip, &username);
                                 }
@@ -520,7 +565,10 @@ impl App {
                             }
                             Err(e) => {
                                 let err_str = e.to_string().to_lowercase();
-                                let msg = if err_str.contains("unique") || err_str.contains("duplicate") || err_str.contains("ya existe") {
+                                let msg = if err_str.contains("unique")
+                                    || err_str.contains("duplicate")
+                                    || err_str.contains("ya existe")
+                                {
                                     t!(self, register_error_exists).replace("{}", username)
                                 } else {
                                     format!("{}: {}", t!(self, error), e)
@@ -530,7 +578,12 @@ impl App {
                         }
                     }
                 } else {
-                    self.set_status("Formato: usuario:contraseña:nombre".into());
+                    let format = if invite_required {
+                        "Formato: usuario:contraseña:nombre:invitación"
+                    } else {
+                        "Formato: usuario:contraseña:nombre"
+                    };
+                    self.set_status(format.into());
                 }
             }
             _ => {}
@@ -549,9 +602,12 @@ impl App {
             }
             KeyCode::Char('n') if key.modifiers == KeyModifiers::CONTROL => {
                 self.page = 0;
-                self.notifications = self.db.get_notifications(self.current_user.as_ref().unwrap().id, 0, 50)?;
+                self.notifications =
+                    self.db
+                        .get_notifications(self.current_user.as_ref().unwrap().id, 0, 50)?;
                 self.unread_notifications = 0;
-                self.db.mark_notifications_read(self.current_user.as_ref().unwrap().id)?;
+                self.db
+                    .mark_notifications_read(self.current_user.as_ref().unwrap().id)?;
                 self.screen = Screen::Notifications;
             }
             KeyCode::Char('n') => {
@@ -628,9 +684,10 @@ impl App {
                 }
             }
             KeyCode::Char('i') => {
-                let img = self.list_state.selected().and_then(|i| {
-                    self.timeline.get(i).and_then(|p| p.image_path.clone())
-                });
+                let img = self
+                    .list_state
+                    .selected()
+                    .and_then(|i| self.timeline.get(i).and_then(|p| p.image_path.clone()));
                 if let Some(ref path) = img {
                     Self::view_image_with_chafa(path, self);
                 }
@@ -663,7 +720,8 @@ impl App {
                     if let Some(i) = self.list_state.selected() {
                         if let Some((name, _)) = self.uploaded_images.get(i) {
                             let username = &self.current_user.as_ref().unwrap().username;
-                            let upload_path = format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
+                            let upload_path =
+                                format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
                             self.attached_image = Some(upload_path);
                             self.set_status(format!("Imagen adjuntada: {}", name));
                         }
@@ -691,13 +749,17 @@ impl App {
                     let username = &self.current_user.as_ref().unwrap().username.clone();
                     self.uploaded_images = crate::ssh::list_uploaded_images(&username);
                     self.upload_known_count = self.uploaded_images.len();
-                    self.set_status(format!("Lista actualizada ({} archivos)", self.upload_known_count));
+                    self.set_status(format!(
+                        "Lista actualizada ({} archivos)",
+                        self.upload_known_count
+                    ));
                 }
                 KeyCode::Char('d') => {
                     let username = self.current_user.as_ref().unwrap().username.clone();
                     if let Some(i) = self.list_state.selected() {
                         if let Some((name, _)) = self.uploaded_images.get(i) {
-                            let path = format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
+                            let path =
+                                format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
                             if std::fs::remove_file(&path).is_ok() {
                                 // Clear image reference from posts that used it
                                 let _ = self.db.clear_image_from_posts(&path);
@@ -727,7 +789,9 @@ impl App {
         if self.url_mode {
             match key.code {
                 KeyCode::Char(c) => self.input.push(c),
-                KeyCode::Backspace => { self.input.pop(); }
+                KeyCode::Backspace => {
+                    self.input.pop();
+                }
                 KeyCode::Enter => {
                     let url = self.input.trim().to_string();
                     if url.is_empty() {
@@ -741,7 +805,6 @@ impl App {
                         self.url_mode = false;
                     } else {
                         self.set_status(t!(self, create_post_invalid_url).to_string());
-                        self.input.clear();
                     }
                 }
                 KeyCode::Esc => {
@@ -778,14 +841,16 @@ impl App {
                 self.set_status(format!("📥 ESPERANDO ARCHIVO — {}", cmd));
             }
             KeyCode::Char(c) => self.input.push(c),
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Esc => {
-                    self.page = 0;
-                    self.screen = Screen::Timeline;
-                    self.input.clear();
-                    self.attached_image = None;
-                }
-                KeyCode::Enter => {
+                self.page = 0;
+                self.screen = Screen::Timeline;
+                self.input.clear();
+                self.attached_image = None;
+            }
+            KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let user_id = self.current_user.as_ref().unwrap().id;
                     let content = self.input.trim().to_string();
@@ -797,7 +862,11 @@ impl App {
                     }
                     let img = self.attached_image.clone();
                     self.db.create_post(user_id, &content, img.as_deref())?;
-                    let status = if img.is_some() { t!(self, create_post_published_img) } else { t!(self, create_post_published) };
+                    let status = if img.is_some() {
+                        t!(self, create_post_published_img)
+                    } else {
+                        t!(self, create_post_published)
+                    };
                     self.set_status(status.to_string());
                     self.input.clear();
                     self.attached_image = None;
@@ -819,53 +888,51 @@ impl App {
         if !Self::is_safe_url(url) {
             return false;
         }
-        lower.rsplit_once('.').map(|(_, e)| {
-            let ext = e.split('?').next().unwrap_or("")
-                .split('#').next().unwrap_or("")
-                .split('&').next().unwrap_or("");
-            matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp")
-        }).unwrap_or(false)
+        true
     }
 
     fn is_safe_url(url: &str) -> bool {
-        use std::net::ToSocketAddrs;
-        let host = url.trim_start_matches("http://")
+        let host = url
+            .trim_start_matches("http://")
             .trim_start_matches("https://")
-            .split('/').next()
+            .split('/')
+            .next()
             .and_then(|h| h.split(':').next())
+            .and_then(|h| h.split('@').last())
             .unwrap_or("");
-        if host.is_empty() { return false; }
-        if let Ok(ip) = host.to_lowercase().as_str().parse::<std::net::IpAddr>() {
+        if host.is_empty() {
+            return false;
+        }
+        let host_lower = host.to_lowercase();
+        let local_names = [
+            "localhost",
+            "127.0.0.1",
+            "0.0.0.0",
+            "::1",
+            "[::1]",
+            "local",
+            "internal",
+        ];
+        for name in &local_names {
+            if host_lower == *name || host_lower.ends_with(&format!(".{}", name)) {
+                return false;
+            }
+        }
+        if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
             match ip {
-                std::net::IpAddr::V4(v4) => !v4.is_private() && !v4.is_loopback() && !v4.is_unspecified(),
+                std::net::IpAddr::V4(v4) => {
+                    !v4.is_private() && !v4.is_loopback() && !v4.is_unspecified()
+                }
                 std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
             }
         } else {
-            if let Ok(addrs) = (host, 80).to_socket_addrs() {
-                for addr in addrs {
-                    let ip = addr.ip();
-                    match ip {
-                        std::net::IpAddr::V4(v4) if v4.is_private() || v4.is_loopback() || v4.is_unspecified() => return false,
-                        std::net::IpAddr::V6(v6) if v6.is_loopback() || v6.is_unspecified() => return false,
-                        _ => {}
-                    }
-                }
-                true
-            } else {
-                false
-            }
+            true
         }
     }
 
     fn is_url(s: &str) -> bool {
         s.starts_with("http://") || s.starts_with("https://")
     }
-
-
-
-
-
-
 
     fn format_size(bytes: u64) -> String {
         if bytes < 1024 {
@@ -876,7 +943,6 @@ impl App {
             format!("{:.1} MB", bytes as f64 / (1024.0 * 1024.0))
         }
     }
-
 
     fn view_image(path: &str) -> bool {
         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 40));
@@ -899,7 +965,8 @@ impl App {
                 .args(*args)
                 .stderr(std::process::Stdio::null())
                 .stdout(std::process::Stdio::inherit())
-                .status() {
+                .status()
+            {
                 if status.success() {
                     return true;
                 }
@@ -908,7 +975,11 @@ impl App {
         false
     }
 
-    fn render_content_with_tags(content: &str, hashtag_color: ratatui::style::Color, mention_color: ratatui::style::Color) -> Vec<Span<'static>> {
+    fn render_content_with_tags(
+        content: &str,
+        hashtag_color: ratatui::style::Color,
+        mention_color: ratatui::style::Color,
+    ) -> Vec<Span<'static>> {
         let mut spans = Vec::new();
         let mut current = String::new();
         let mut in_tag: Option<char> = None;
@@ -926,7 +997,11 @@ impl App {
                     current.push(ch);
                 } else {
                     if !current.is_empty() {
-                        let color = if in_tag == Some('#') { hashtag_color } else { mention_color };
+                        let color = if in_tag == Some('#') {
+                            hashtag_color
+                        } else {
+                            mention_color
+                        };
                         spans.push(Span::styled(current.clone(), Style::default().fg(color)));
                         current.clear();
                     }
@@ -940,7 +1015,11 @@ impl App {
 
         if !current.is_empty() {
             if let Some(tag_type) = in_tag {
-                let color = if tag_type == '#' { hashtag_color } else { mention_color };
+                let color = if tag_type == '#' {
+                    hashtag_color
+                } else {
+                    mention_color
+                };
                 spans.push(Span::styled(current, Style::default().fg(color)));
             } else {
                 spans.push(Span::raw(current));
@@ -979,7 +1058,10 @@ impl App {
                 }
             };
             match result {
-                Some(p) => { temp_path = p; &temp_path }
+                Some(p) => {
+                    temp_path = p;
+                    &temp_path
+                }
                 None => {
                     app.set_status("Descarga cancelada (timeout)".to_string());
                     return;
@@ -996,12 +1078,17 @@ impl App {
 
         if !shown {
             println!("{}\n", t!(app, image_no_viewer));
-            if Self::is_url(path) { println!("URL: {}", path); }
-            else { println!("Archivo: {}", actual_path); }
+            if Self::is_url(path) {
+                println!("URL: {}", path);
+            } else {
+                println!("Archivo: {}", actual_path);
+            }
         }
 
         // Bottom bar
-        let bar = format!("\n─────────────────────────────────────────────────────────\n  d: descargar  |  Enter/q/Esc: volver");
+        let bar = format!(
+            "\n─────────────────────────────────────────────────────────\n  d: descargar  |  Enter/q/Esc: volver"
+        );
         println!("{}", bar);
         let _ = std::io::stdout().flush();
 
@@ -1016,7 +1103,7 @@ impl App {
                         if key.kind == KeyEventKind::Press {
                             match key.code {
                                 KeyCode::Char('d') => {
-                                    Self::print_download_instructions(actual_path, app);
+                                    Self::print_download_instructions(actual_path);
                                 }
                                 KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
                                 _ => {}
@@ -1044,9 +1131,18 @@ impl App {
         url.hash(&mut h);
         let url_hash = format!("{:x}", h.finish());
 
-        let ext = url.rsplit_once('.').map(|(_, e)| {
-            e.split('?').next().unwrap_or("jpg").split('#').next().unwrap_or("jpg")
-        }).unwrap_or("jpg").to_string();
+        let ext = url
+            .rsplit_once('.')
+            .map(|(_, e)| {
+                e.split('?')
+                    .next()
+                    .unwrap_or("jpg")
+                    .split('#')
+                    .next()
+                    .unwrap_or("jpg")
+            })
+            .unwrap_or("jpg")
+            .to_string();
 
         let cached_path = format!("{}/{}.{}", cache_dir, url_hash, ext);
         if std::path::Path::new(&cached_path).exists() {
@@ -1056,7 +1152,8 @@ impl App {
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(15))
-            .build() {
+            .build()
+        {
             Ok(c) => c,
             Err(_) => return None,
         };
@@ -1066,8 +1163,19 @@ impl App {
             Err(_) => return None,
         };
 
+        let ct = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !ct.starts_with("image/") {
+            return None;
+        }
+
         if let Some(len) = response.content_length() {
-            if len > MAX_SIZE { return None; }
+            if len > MAX_SIZE {
+                return None;
+            }
         }
 
         let mut buf = Vec::new();
@@ -1078,20 +1186,24 @@ impl App {
                 Ok(0) => break,
                 Ok(n) => {
                     buf.extend_from_slice(&chunk[..n]);
-                    if buf.len() > MAX_SIZE as usize { return None; }
+                    if buf.len() > MAX_SIZE as usize {
+                        return None;
+                    }
                 }
                 Err(_) => return None,
             }
         }
 
-        if buf.is_empty() { return None; }
+        if buf.is_empty() {
+            return None;
+        }
 
         let path = format!("/tmp/opencode_img_{}.{}", url_hash, ext);
         std::fs::write(&path, &buf).ok()?;
         Some(path)
     }
 
-    fn print_download_instructions(path: &str, app: &mut App) {
+    fn print_download_instructions(path: &str) {
         let fname = path.rsplit('/').next().unwrap_or("imagen.jpg");
         let data = match std::fs::read(path) {
             Ok(d) => d,
@@ -1107,7 +1219,11 @@ impl App {
         let _ = std::fs::create_dir_all(crate::ssh::upload_dir());
         std::fs::write(&copy_path, &data).ok();
 
-        println!("\n  📥 Descargar: {} — {}", fname, Self::format_size(data.len() as u64));
+        println!(
+            "\n  📥 Descargar: {} — {}",
+            fname,
+            Self::format_size(data.len() as u64)
+        );
         println!("  scp -P 2222 localhost:{} .\n", copy_name);
         println!("  d: descargar  |  Enter/q/Esc: volver");
         let _ = std::io::stdout().flush();
@@ -1153,18 +1269,28 @@ impl App {
         if self.comment_mode {
             match key.code {
                 KeyCode::Char(c) => self.comment_input.push(c),
-                KeyCode::Backspace => { self.comment_input.pop(); }
+                KeyCode::Backspace => {
+                    self.comment_input.pop();
+                }
                 KeyCode::Enter => {
                     if !self.comment_input.trim().is_empty() {
                         let parent_id = self.reply_to_comment_id.take();
                         if let Some(ref post) = self.viewed_post.clone() {
-                            if let Err(e) = self.plugins.filter_comment(user_id, self.comment_input.trim()) {
+                            if let Err(e) = self
+                                .plugins
+                                .filter_comment(user_id, self.comment_input.trim())
+                            {
                                 self.set_status(e.to_string());
                                 self.comment_mode = false;
                                 self.comment_input.clear();
                                 return Ok(true);
                             }
-                            self.db.add_comment(post.id, user_id, self.comment_input.trim(), parent_id)?;
+                            self.db.add_comment(
+                                post.id,
+                                user_id,
+                                self.comment_input.trim(),
+                                parent_id,
+                            )?;
                             self.post_comments = self.db.get_comments(post.id)?;
                             let tree = build_comment_tree(&self.post_comments);
                             let flat = flatten_tree(&tree);
@@ -1190,12 +1316,18 @@ impl App {
         if self.edit_mode {
             match key.code {
                 KeyCode::Char(c) => self.edit_buffer.push(c),
-                KeyCode::Backspace => { self.edit_buffer.pop(); }
+                KeyCode::Backspace => {
+                    self.edit_buffer.pop();
+                }
                 KeyCode::Enter => {
                     if !self.edit_buffer.trim().is_empty() {
                         if let Some(ref post) = self.viewed_post.clone() {
-                            self.db.update_post(post.id, user_id, self.edit_buffer.trim())?;
-                            self.viewed_post = Some(Post { content: self.edit_buffer.trim().to_string(), ..post.clone() });
+                            self.db
+                                .update_post(post.id, user_id, self.edit_buffer.trim())?;
+                            self.viewed_post = Some(Post {
+                                content: self.edit_buffer.trim().to_string(),
+                                ..post.clone()
+                            });
                             self.set_status(t!(self, post_detail_edited).to_string());
                         }
                     }
@@ -1236,7 +1368,9 @@ impl App {
                 self.set_status("".to_string());
             }
             KeyCode::Char('i') => {
-                let img = self.viewed_post.as_ref()
+                let img = self
+                    .viewed_post
+                    .as_ref()
                     .and_then(|p| p.image_path.clone())
                     .filter(|p| !p.is_empty());
                 if let Some(ref path) = img {
@@ -1322,37 +1456,63 @@ impl App {
                     .split(area);
 
                 let title = if self.show_followers {
-                    t!(self, profile_title_followers).replace("{}", &self.profile_followers.len().to_string())
+                    t!(self, profile_title_followers)
+                        .replace("{}", &self.profile_followers.len().to_string())
                 } else {
-                    t!(self, profile_title_following).replace("{}", &self.profile_following.len().to_string())
+                    t!(self, profile_title_following)
+                        .replace("{}", &self.profile_following.len().to_string())
                 };
-                let list = if self.show_followers { &self.profile_followers } else { &self.profile_following };
+                let list = if self.show_followers {
+                    &self.profile_followers
+                } else {
+                    &self.profile_following
+                };
                 let selected = self.list_state.selected().unwrap_or(0);
                 let total = list.len();
-                let items: Vec<ListItem> = list.iter().enumerate().map(|(i, u)| {
-                    let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(bullet),
-                        Span::styled(format!("@{}", u.username), Style::default().fg(self.theme.accent)),
-                        Span::raw("  "),
-                        Span::raw(&u.display_name),
-                    ]))
-                    .style(self.theme.list_item_style(i))
-                }).collect();
+                let items: Vec<ListItem> = list
+                    .iter()
+                    .enumerate()
+                    .map(|(i, u)| {
+                        let bullet = if total > 0 && i == selected {
+                            "\u{25b6} "
+                        } else {
+                            "  "
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::raw(bullet),
+                            Span::styled(
+                                format!("@{}", u.username),
+                                Style::default().fg(self.theme.accent),
+                            ),
+                            Span::raw("  "),
+                            Span::raw(&u.display_name),
+                        ]))
+                        .style(self.theme.list_item_style(i))
+                    })
+                    .collect();
                 let list_widget = List::new(items)
                     .block(self.theme.default_block(&title))
                     .highlight_style(self.theme.highlight())
                     .highlight_symbol("  ");
                 f.render_stateful_widget(list_widget, chunks[1], &mut self.list_state.clone());
-                let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help_follow_list), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+                let help = Paragraph::new(Line::from(Span::styled(
+                    t!(self, profile_help_follow_list),
+                    Style::default().fg(self.theme.secondary),
+                )))
+                .wrap(Wrap { trim: false });
                 f.render_widget(help, chunks[0]);
                 return;
             }
 
-            let fc = t!(self, profile_followers_count).replace("{}", &self.profile_followers.len().to_string());
-            let fg = t!(self, profile_following_count).replace("{}", &self.profile_following.len().to_string());
-            let pc = t!(self, profile_header_posts).replace("{}", &self.viewed_user_posts.len().to_string());
-            let hf = t!(self, profile_header_fmt).replace("{}", &user.username).replace("{}", &user.display_name);
+            let fc = t!(self, profile_followers_count)
+                .replace("{}", &self.profile_followers.len().to_string());
+            let fg = t!(self, profile_following_count)
+                .replace("{}", &self.profile_following.len().to_string());
+            let pc = t!(self, profile_header_posts)
+                .replace("{}", &self.viewed_user_posts.len().to_string());
+            let hf = t!(self, profile_header_fmt)
+                .replace("{}", &user.username)
+                .replace("{}", &user.display_name);
             let follow_status = if current.id == user.id {
                 format!(" ({})", t!(self, profile_you))
             } else if self.is_following_viewed {
@@ -1362,7 +1522,11 @@ impl App {
             };
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(6), Constraint::Min(1), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Length(6),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
                 .margin(1)
                 .split(area);
 
@@ -1375,29 +1539,52 @@ impl App {
             if self.confirming_delete {
                 let input = Paragraph::new(self.input.chars().map(|_| '*').collect::<String>())
                     .style(Style::default().fg(self.theme.accent))
-                    .block(Block::default().title(" Contraseña ").borders(Borders::ALL).border_type(BorderType::Rounded));
+                    .block(
+                        Block::default()
+                            .title(" Contraseña ")
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded),
+                    );
                 f.render_widget(input, chunks[1]);
                 Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, chunks[1].y + 1);
             } else {
                 let selected = self.list_state.selected().unwrap_or(0);
                 let total = self.viewed_user_posts.len();
                 let items: Vec<ListItem> = self
-                .viewed_user_posts
-                .iter()
-                .enumerate()
-                .map(|(i, p)| {
-                    let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-                    let img = if Self::post_has_image(p) { "  \u{1f4f7}" } else { "" };
-                    let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(bullet),
-                        Span::raw(&p.content),
-                        Span::styled(img, Style::default().fg(self.theme.image_indicator)),
-                        Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
-                    ]))
-                    .style(self.theme.list_item_style(i))
-                })
-                .collect();
+                    .viewed_user_posts
+                    .iter()
+                    .enumerate()
+                    .map(|(i, p)| {
+                        let ago = i18n::ago(
+                            self.lang,
+                            &p.created_at,
+                            self.current_user
+                                .as_ref()
+                                .map(|u| u.utc_offset)
+                                .unwrap_or(0),
+                        );
+                        let img = if Self::post_has_image(p) {
+                            "  \u{1f4f7}"
+                        } else {
+                            ""
+                        };
+                        let bullet = if total > 0 && i == selected {
+                            "\u{25b6} "
+                        } else {
+                            "  "
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::raw(bullet),
+                            Span::raw(&p.content),
+                            Span::styled(img, Style::default().fg(self.theme.image_indicator)),
+                            Span::styled(
+                                format!("  [{}]", ago),
+                                Style::default().fg(self.theme.muted),
+                            ),
+                        ]))
+                        .style(self.theme.list_item_style(i))
+                    })
+                    .collect();
 
                 let title = format!("{}  [{}]", t!(self, profile_title_posts), total);
                 let list = List::new(items)
@@ -1407,7 +1594,11 @@ impl App {
                 f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
             }
 
-            let help = Paragraph::new(Line::from(Span::styled(t!(self, profile_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+            let help = Paragraph::new(Line::from(Span::styled(
+                t!(self, profile_help),
+                Style::default().fg(self.theme.secondary),
+            )))
+            .wrap(Wrap { trim: false });
             f.render_widget(help, chunks[2]);
         }
     }
@@ -1428,10 +1619,7 @@ impl App {
                     .border_type(BorderType::Rounded),
             );
         f.render_widget(input, chunks[0]);
-        f.set_cursor_position((
-            area.x + 2 + self.input.len() as u16,
-            area.y + 2,
-        ));
+        f.set_cursor_position((area.x + 2 + self.input.len() as u16, area.y + 2));
 
         let selected = self.list_state.selected().unwrap_or(0);
         let total = self.search_results.len();
@@ -1440,10 +1628,17 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, u)| {
-                let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(bullet),
-                    Span::styled(format!("@{}", u.username), Style::default().fg(self.theme.accent)),
+                    Span::styled(
+                        format!("@{}", u.username),
+                        Style::default().fg(self.theme.accent),
+                    ),
                     Span::raw("  "),
                     Span::raw(&u.display_name),
                 ]))
@@ -1464,7 +1659,11 @@ impl App {
         let filter_label = FILTERS[self.post_search_filter_idx];
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
             .margin(1)
             .split(area);
 
@@ -1478,13 +1677,14 @@ impl App {
                     .border_type(BorderType::Rounded),
             );
         f.render_widget(input, chunks[0]);
-        f.set_cursor_position((
-            area.x + 2 + self.input.len() as u16,
-            area.y + 2,
-        ));
+        f.set_cursor_position((area.x + 2 + self.input.len() as u16, area.y + 2));
 
         let filter_text = format!("{} [{}]", t!(self, post_search_help), filter_label);
-        let help = Paragraph::new(Line::from(Span::styled(filter_text, Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            filter_text,
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[1]);
 
         let selected = self.list_state.selected().unwrap_or(0);
@@ -1494,16 +1694,37 @@ impl App {
             .iter()
             .enumerate()
             .map(|(i, p)| {
-                let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-                let img = if p.image_path.is_some() { "  \u{1f4f7}" } else { "" };
-                let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
+                let ago = i18n::ago(
+                    self.lang,
+                    &p.created_at,
+                    self.current_user
+                        .as_ref()
+                        .map(|u| u.utc_offset)
+                        .unwrap_or(0),
+                );
+                let img = if p.image_path.is_some() {
+                    "  \u{1f4f7}"
+                } else {
+                    ""
+                };
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
                 ListItem::new(Line::from(vec![
                     Span::raw(bullet),
-                    Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
+                    Span::styled(
+                        format!("@{}", p.username),
+                        Style::default().fg(self.theme.accent),
+                    ),
                     Span::raw(": "),
                     Span::raw(&p.content),
                     Span::styled(img, Style::default().fg(self.theme.image_indicator)),
-                    Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
+                    Span::styled(
+                        format!("  [{}]", ago),
+                        Style::default().fg(self.theme.muted),
+                    ),
                 ]))
                 .style(self.theme.list_item_style(i))
             })
@@ -1520,7 +1741,11 @@ impl App {
     fn render_hashtag_view(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .margin(1)
             .split(area);
 
@@ -1531,22 +1756,54 @@ impl App {
 
         let selected = self.list_state.selected().unwrap_or(0);
         let total = self.hashtag_posts.len();
-        let items: Vec<ListItem> = self.hashtag_posts.iter().enumerate().map(|(i, p)| {
-            let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-            let img = if Self::post_has_image(p) { "  \u{1f4f7}" } else { "" };
-            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-            let content_spans = Self::render_content_with_tags(&p.content, self.theme.accent, self.theme.success);
-            let mut line_spans = vec![
-                Span::raw(bullet),
-                Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
-                Span::raw(": "),
-            ];
-            line_spans.extend(content_spans);
-            line_spans.push(Span::styled(img.to_string(), Style::default().fg(self.theme.image_indicator)));
-            line_spans.push(Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)));
-            ListItem::new(Line::from(line_spans))
-            .style(self.theme.list_item_style(i))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .hashtag_posts
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ago = i18n::ago(
+                    self.lang,
+                    &p.created_at,
+                    self.current_user
+                        .as_ref()
+                        .map(|u| u.utc_offset)
+                        .unwrap_or(0),
+                );
+                let img = if Self::post_has_image(p) {
+                    "  \u{1f4f7}"
+                } else {
+                    ""
+                };
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
+                let content_spans = Self::render_content_with_tags(
+                    &p.content,
+                    self.theme.accent,
+                    self.theme.success,
+                );
+                let mut line_spans = vec![
+                    Span::raw(bullet),
+                    Span::styled(
+                        format!("@{}", p.username),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::raw(": "),
+                ];
+                line_spans.extend(content_spans);
+                line_spans.push(Span::styled(
+                    img.to_string(),
+                    Style::default().fg(self.theme.image_indicator),
+                ));
+                line_spans.push(Span::styled(
+                    format!("  [{}]", ago),
+                    Style::default().fg(self.theme.muted),
+                ));
+                ListItem::new(Line::from(line_spans)).style(self.theme.list_item_style(i))
+            })
+            .collect();
 
         let list = List::new(items)
             .block(self.theme.simple_block())
@@ -1554,14 +1811,22 @@ impl App {
             .highlight_symbol("> ");
         f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, hashtag_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, hashtag_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[2]);
     }
 
     fn render_hashtag_trending(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .margin(1)
             .split(area);
 
@@ -1572,16 +1837,28 @@ impl App {
 
         let selected = self.list_state.selected().unwrap_or(0);
         let total = self.trending_hashtags.len();
-        let items: Vec<ListItem> = self.trending_hashtags.iter().enumerate().map(|(i, (tag, count))| {
-            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-            ListItem::new(Line::from(vec![
-                Span::raw(bullet),
-                Span::styled(format!("#{}", tag), Style::default().fg(self.theme.accent)),
-                Span::raw("  "),
-                Span::styled(format!("{} posts", count), Style::default().fg(self.theme.muted)),
-            ]))
-            .style(self.theme.list_item_style(i))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .trending_hashtags
+            .iter()
+            .enumerate()
+            .map(|(i, (tag, count))| {
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(bullet),
+                    Span::styled(format!("#{}", tag), Style::default().fg(self.theme.accent)),
+                    Span::raw("  "),
+                    Span::styled(
+                        format!("{} posts", count),
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]))
+                .style(self.theme.list_item_style(i))
+            })
+            .collect();
 
         let list = List::new(items)
             .block(self.theme.simple_block())
@@ -1589,31 +1866,47 @@ impl App {
             .highlight_symbol("> ");
         f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, hashtag_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, hashtag_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[2]);
     }
 
     fn handle_profile_key(&mut self, key: event::KeyEvent) -> Result<bool> {
         if self.show_follow_list {
             match key.code {
-            KeyCode::Up | KeyCode::Char('k') => {
-                let list = if self.show_followers { &self.profile_followers } else { &self.profile_following };
-                let len = list.len();
-                if len > 0 {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    self.list_state.select(Some(i.saturating_sub(1)));
+                KeyCode::Up | KeyCode::Char('k') => {
+                    let list = if self.show_followers {
+                        &self.profile_followers
+                    } else {
+                        &self.profile_following
+                    };
+                    let len = list.len();
+                    if len > 0 {
+                        let i = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some(i.saturating_sub(1)));
+                    }
                 }
-            }
-            KeyCode::Down | KeyCode::Char('j') => {
-                let list = if self.show_followers { &self.profile_followers } else { &self.profile_following };
-                let len = list.len();
-                if len > 0 {
-                    let i = self.list_state.selected().unwrap_or(0);
-                    self.list_state.select(Some((i + 1).min(len - 1)));
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let list = if self.show_followers {
+                        &self.profile_followers
+                    } else {
+                        &self.profile_following
+                    };
+                    let len = list.len();
+                    if len > 0 {
+                        let i = self.list_state.selected().unwrap_or(0);
+                        self.list_state.select(Some((i + 1).min(len - 1)));
+                    }
                 }
-            }
                 KeyCode::Enter => {
-                    let list = if self.show_followers { &self.profile_followers.clone() } else { &self.profile_following.clone() };
+                    let list = if self.show_followers {
+                        &self.profile_followers.clone()
+                    } else {
+                        &self.profile_following.clone()
+                    };
                     if let Some(i) = self.list_state.selected() {
                         if let Some(user) = list.get(i) {
                             self.show_follow_list = false;
@@ -1671,7 +1964,9 @@ impl App {
             KeyCode::Char('b') | KeyCode::Esc => {
                 self.page = 0;
                 let offset = self.page as u64 * self.page_size as u64;
-                self.timeline = self.db.get_timeline(user_id, offset, self.page_size as u64 + 1)?;
+                self.timeline = self
+                    .db
+                    .get_timeline(user_id, offset, self.page_size as u64 + 1)?;
                 self.screen = Screen::Timeline;
             }
             KeyCode::Char('w') => {
@@ -1699,10 +1994,14 @@ impl App {
                             self.is_following_viewed = true;
                             let name = viewed_username.unwrap_or_default();
                             self.set_status(t!(self, profile_followed).replace("{}", &name));
-                            let _ = self.db.add_notification(id, user_id, "follow", Some(user_id));
+                            let _ = self
+                                .db
+                                .add_notification(id, user_id, "follow", Some(user_id));
                         }
-                            let offset = self.page as u64 * self.page_size as u64;
-                            self.timeline = self.db.get_timeline(user_id, offset, self.page_size as u64 + 1)?;
+                        let offset = self.page as u64 * self.page_size as u64;
+                        self.timeline =
+                            self.db
+                                .get_timeline(user_id, offset, self.page_size as u64 + 1)?;
                     }
                 }
             }
@@ -1743,7 +2042,10 @@ impl App {
                     }
                     match self.db.export_user_data(&username) {
                         Ok(filename) => {
-                            self.set_status(format!("Exportado: {}. Descarga con: scp -P 2222 localhost:{} .", filename, filename));
+                            self.set_status(format!(
+                                "Exportado: {}. Descarga con: scp -P 2222 localhost:{} .",
+                                filename, filename
+                            ));
                         }
                         Err(e) => {
                             self.set_status(format!("Error exportando: {}", e));
@@ -1805,7 +2107,9 @@ impl App {
                     let query = self.input.trim().to_string();
                     if !query.is_empty() {
                         let offset = self.page as u64 * self.page_size as u64;
-                        self.search_results = self.db.search_users(&query, offset, self.page_size as u64)?;
+                        self.search_results =
+                            self.db
+                                .search_users(&query, offset, self.page_size as u64)?;
                         self.list_state.select(Some(0));
                     }
                 } else if key.modifiers == KeyModifiers::CONTROL && c == 'b' {
@@ -1813,14 +2117,18 @@ impl App {
                     let query = self.input.trim().to_string();
                     if !query.is_empty() {
                         let offset = self.page as u64 * self.page_size as u64;
-                        self.search_results = self.db.search_users(&query, offset, self.page_size as u64)?;
+                        self.search_results =
+                            self.db
+                                .search_users(&query, offset, self.page_size as u64)?;
                         self.list_state.select(Some(0));
                     }
                 } else {
                     self.input.push(c);
                 }
             }
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Enter => {
                 if !self.search_results.is_empty() {
                     if let Some(i) = self.list_state.selected() {
@@ -1835,7 +2143,9 @@ impl App {
                 if !query.is_empty() {
                     self.page = 0;
                     let offset = self.page as u64 * self.page_size as u64;
-                    self.search_results = self.db.search_users(&query, offset, self.page_size as u64)?;
+                    self.search_results =
+                        self.db
+                            .search_users(&query, offset, self.page_size as u64)?;
                     self.list_state.select(Some(0));
                 }
             }
@@ -1888,7 +2198,9 @@ impl App {
                     self.input.push(c);
                 }
             }
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Enter => {
                 if self.list_state.selected().is_some() && !self.post_search_results.is_empty() {
                     if let Some(i) = self.list_state.selected() {
@@ -1914,7 +2226,9 @@ impl App {
 
     fn do_post_search(&mut self) -> Result<()> {
         let query = self.input.trim().to_string();
-        if query.is_empty() { return Ok(()); }
+        if query.is_empty() {
+            return Ok(());
+        }
         let offset = self.page as u64 * self.page_size as u64;
         let limit = self.page_size as u64;
         self.post_search_results = match self.post_search_filter_idx {
@@ -2018,7 +2332,9 @@ impl App {
         if self.radio_hashtags.is_empty() {
             return Ok(());
         }
-        let tag = &self.radio_hashtags[self.radio_idx % self.radio_hashtags.len()].0.clone();
+        let tag = &self.radio_hashtags[self.radio_idx % self.radio_hashtags.len()]
+            .0
+            .clone();
         let posts = self.db.get_posts_by_hashtag(tag, 0, 1)?;
         if let Some(post) = posts.into_iter().next() {
             self.radio_post = Some(post);
@@ -2065,7 +2381,11 @@ impl App {
     fn render_radio(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(3), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(3),
+                Constraint::Min(1),
+            ])
             .margin(1)
             .split(area);
 
@@ -2077,8 +2397,13 @@ impl App {
             return;
         }
 
-        if let Some((tag, count)) = self.radio_hashtags.get(self.radio_idx % self.radio_hashtags.len()) {
-            let title = t!(self, radio_title).replace("{}", tag).replace("{}", &count.to_string());
+        if let Some((tag, count)) = self
+            .radio_hashtags
+            .get(self.radio_idx % self.radio_hashtags.len())
+        {
+            let title = t!(self, radio_title)
+                .replace("{}", tag)
+                .replace("{}", &count.to_string());
             let status = if self.radio_paused { " [PAUSADO]" } else { "" };
             let header = Paragraph::new(Line::from(Span::styled(
                 format!("{}{}", title, status),
@@ -2090,15 +2415,34 @@ impl App {
         }
 
         if let Some(ref post) = self.radio_post {
-            let ago = i18n::ago(self.lang, &post.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-            let content_spans = Self::render_content_with_tags(&post.content, self.theme.accent, self.theme.success);
+            let ago = i18n::ago(
+                self.lang,
+                &post.created_at,
+                self.current_user
+                    .as_ref()
+                    .map(|u| u.utc_offset)
+                    .unwrap_or(0),
+            );
+            let content_spans = Self::render_content_with_tags(
+                &post.content,
+                self.theme.accent,
+                self.theme.success,
+            );
             let mut line_spans = vec![
-                Span::styled(format!("@{}", post.username), Style::default().fg(self.theme.accent).add_modifier(Modifier::BOLD)),
+                Span::styled(
+                    format!("@{}", post.username),
+                    Style::default()
+                        .fg(self.theme.accent)
+                        .add_modifier(Modifier::BOLD),
+                ),
                 Span::raw("\n\n"),
             ];
             line_spans.extend(content_spans);
             line_spans.push(Span::raw("\n\n"));
-            line_spans.push(Span::styled(format!("[{}]", ago), Style::default().fg(self.theme.muted)));
+            line_spans.push(Span::styled(
+                format!("[{}]", ago),
+                Style::default().fg(self.theme.muted),
+            ));
 
             let post_par = Paragraph::new(Line::from(line_spans))
                 .block(self.theme.simple_block())
@@ -2106,15 +2450,20 @@ impl App {
             f.render_widget(post_par, chunks[1]);
         }
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, radio_help), Style::default().fg(self.theme.secondary))))
-            .wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, radio_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[2]);
     }
 
     fn refresh_timeline(&mut self) -> Result<()> {
         let user_id = self.current_user.as_ref().unwrap().id;
         let offset = self.page as u64 * self.page_size as u64;
-        self.timeline = self.db.get_timeline(user_id, offset, self.page_size as u64 + 1)?;
+        self.timeline = self
+            .db
+            .get_timeline(user_id, offset, self.page_size as u64 + 1)?;
         self.unread_count = self.db.get_unread_count(user_id)?;
         self.unread_notifications = self.db.get_unread_notifications_count(user_id)?;
         Ok(())
@@ -2132,9 +2481,14 @@ impl App {
     }
 
     fn load_profile(&mut self, profile_id: i64) -> Result<()> {
-        let user = self.db.get_user_by_id(profile_id)?.ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
+        let user = self
+            .db
+            .get_user_by_id(profile_id)?
+            .ok_or_else(|| anyhow::anyhow!("Usuario no encontrado"))?;
         let offset = self.page as u64 * self.page_size as u64;
-        let posts = self.db.get_posts_by_user(profile_id, offset, self.page_size as u64 + 1)?;
+        let posts = self
+            .db
+            .get_posts_by_user(profile_id, offset, self.page_size as u64 + 1)?;
         let current_id = self.current_user.as_ref().unwrap().id;
         let following = self.db.is_following(current_id, profile_id)?;
         self.viewed_user = Some(user);
@@ -2159,7 +2513,10 @@ impl App {
             let bytes = s.to_bytes();
             x25519_dalek::StaticSecret::from(bytes)
         });
-        let partner_pk = self.chat_partner.as_ref().and_then(|p| p.public_key.clone());
+        let partner_pk = self
+            .chat_partner
+            .as_ref()
+            .and_then(|p| p.public_key.clone());
         for msg in &mut self.chat_messages {
             if msg.encrypted {
                 if let (Some(secret), Some(pk)) = (&secret, &partner_pk) {
@@ -2225,22 +2582,29 @@ impl App {
         self.chat_messages = self.db.get_messages(user_id, partner_id)?;
         self.unread_count = self.db.get_unread_count(user_id)?;
         match key.code {
+            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Char(c) => self.input.push(c),
-            KeyCode::Backspace => { self.input.pop(); }
+            KeyCode::Backspace => {
+                self.input.pop();
+            }
             KeyCode::Enter => {
                 if !self.input.trim().is_empty() {
                     let partner_id = self.chat_partner.as_ref().map(|u| u.id).unwrap_or(0);
-                    if let Err(e) = self.plugins.filter_message(user_id, partner_id, self.input.trim()) {
+                    if let Err(e) =
+                        self.plugins
+                            .filter_message(user_id, partner_id, self.input.trim())
+                    {
                         self.set_status(e.to_string());
                         return Ok(true);
                     }
-                    let msg = self.db.send_message(user_id, partner_id, self.input.trim(), false)?;
+                    let msg =
+                        self.db
+                            .send_message(user_id, partner_id, self.input.trim(), false)?;
                     self.chat_messages.push(msg);
                     self.input.clear();
                     self.unread_count = self.db.get_unread_count(user_id)?;
                 }
             }
-            KeyCode::Char('q') if key.modifiers == KeyModifiers::CONTROL => return Ok(false),
             KeyCode::Esc => {
                 self.load_conversations()?;
                 self.screen = Screen::Messages;
@@ -2289,7 +2653,12 @@ impl App {
                 if self.profile_display_name.trim().is_empty() {
                     self.set_status(t!(self, profile_empty_name).to_string());
                 } else {
-                    self.db.update_profile(user_id, self.profile_display_name.trim(), self.profile_bio.trim(), utc_offset)?;
+                    self.db.update_profile(
+                        user_id,
+                        self.profile_display_name.trim(),
+                        self.profile_bio.trim(),
+                        utc_offset,
+                    )?;
                     self.set_status(t!(self, profile_updated).to_string());
                     if let Some(ref mut u) = self.viewed_user {
                         u.display_name = self.profile_display_name.trim().to_string();
@@ -2365,31 +2734,46 @@ impl App {
         let user = self.current_user.as_ref().unwrap();
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Min(1), Constraint::Length(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Min(1),
+                Constraint::Length(1),
+            ])
             .margin(1)
             .split(area);
 
-            let header_text: String = if self.conversations.is_empty() {
-                t!(self, messages_empty).to_string()
-            } else {
-                t!(self, messages_title).replace("{}", &user.username)
-            };
-        let header = Paragraph::new(header_text)
-            .style(self.theme.header_style);
+        let header_text: String = if self.conversations.is_empty() {
+            t!(self, messages_empty).to_string()
+        } else {
+            t!(self, messages_title).replace("{}", &user.username)
+        };
+        let header = Paragraph::new(header_text).style(self.theme.header_style);
         f.render_widget(header, chunks[0]);
 
         let selected = self.list_state.selected().unwrap_or(0);
         let total = self.conversations.len();
-        let items: Vec<ListItem> = self.conversations.iter().enumerate().map(|(i, u)| {
-            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-            ListItem::new(Line::from(vec![
-                Span::raw(bullet),
-                Span::styled(format!("@{}", u.username), Style::default().fg(self.theme.accent)),
-                Span::raw(" \u{2014} "),
-                Span::styled(&u.display_name, Style::default().fg(self.theme.secondary)),
-            ]))
-            .style(self.theme.list_item_style(i))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .conversations
+            .iter()
+            .enumerate()
+            .map(|(i, u)| {
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
+                ListItem::new(Line::from(vec![
+                    Span::raw(bullet),
+                    Span::styled(
+                        format!("@{}", u.username),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::raw(" \u{2014} "),
+                    Span::styled(&u.display_name, Style::default().fg(self.theme.secondary)),
+                ]))
+                .style(self.theme.list_item_style(i))
+            })
+            .collect();
 
         let title = format!("{}  [{}]", t!(self, messages_conversations), total);
         let list = List::new(items)
@@ -2398,7 +2782,11 @@ impl App {
             .highlight_symbol("  ");
         f.render_stateful_widget(list, chunks[1], &mut self.list_state.clone());
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, messages_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, messages_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[2]);
     }
 
@@ -2409,8 +2797,7 @@ impl App {
             .margin(1)
             .split(area);
 
-        let header = Paragraph::new(t!(self, notifications_title))
-            .style(self.theme.header_style);
+        let header = Paragraph::new(t!(self, notifications_title)).style(self.theme.header_style);
         f.render_widget(header, chunks[0]);
 
         if self.notifications.is_empty() {
@@ -2418,24 +2805,44 @@ impl App {
                 .style(Style::default().fg(self.theme.muted));
             f.render_widget(empty, chunks[1]);
         } else {
-            let offset = self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0);
-            let items: Vec<ListItem> = self.notifications.iter().enumerate().map(|(i, n)| {
-                let msg = match n.notif_type.as_str() {
-                    "follow" => t!(self, follow_notif).replace("{}", &n.from_username),
-                    "mention" => t!(self, mention_notif).replace("{}", &n.from_username),
-                    _ => format!("@{}: {}", n.from_username, n.notif_type),
-                };
-                let ago = i18n::ago(self.lang, &n.created_at, offset);
-                let style = if n.read { Style::default().fg(self.theme.muted) } else { Style::default().fg(self.theme.text) };
-                let unread = if !n.read { "\u{25cf} " } else { "  " };
-                ListItem::new(Line::from(vec![
-                    Span::styled(unread, Style::default().fg(self.theme.accent)),
-                    Span::styled(msg, style),
-                    Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
-                ]))
-                .style(self.theme.list_item_style(i))
-            }).collect();
-            let title = format!("{}  [{}]", t!(self, notifications_title), self.notifications.len());
+            let offset = self
+                .current_user
+                .as_ref()
+                .map(|u| u.utc_offset)
+                .unwrap_or(0);
+            let items: Vec<ListItem> = self
+                .notifications
+                .iter()
+                .enumerate()
+                .map(|(i, n)| {
+                    let msg = match n.notif_type.as_str() {
+                        "follow" => t!(self, follow_notif).replace("{}", &n.from_username),
+                        "mention" => t!(self, mention_notif).replace("{}", &n.from_username),
+                        _ => format!("@{}: {}", n.from_username, n.notif_type),
+                    };
+                    let ago = i18n::ago(self.lang, &n.created_at, offset);
+                    let style = if n.read {
+                        Style::default().fg(self.theme.muted)
+                    } else {
+                        Style::default().fg(self.theme.text)
+                    };
+                    let unread = if !n.read { "\u{25cf} " } else { "  " };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(unread, Style::default().fg(self.theme.accent)),
+                        Span::styled(msg, style),
+                        Span::styled(
+                            format!("  [{}]", ago),
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]))
+                    .style(self.theme.list_item_style(i))
+                })
+                .collect();
+            let title = format!(
+                "{}  [{}]",
+                t!(self, notifications_title),
+                self.notifications.len()
+            );
             let list = List::new(items)
                 .block(self.theme.default_block(&title))
                 .highlight_style(self.theme.highlight())
@@ -2446,7 +2853,11 @@ impl App {
 
     fn render_edit_profile(&self, f: &mut Frame, area: Rect) {
         let user = self.current_user.as_ref().unwrap();
-        let tz_offset = self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0);
+        let tz_offset = self
+            .current_user
+            .as_ref()
+            .map(|u| u.utc_offset)
+            .unwrap_or(0);
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2471,10 +2882,19 @@ impl App {
         };
         let name_input = Paragraph::new(self.profile_display_name.as_str())
             .style(name_style)
-            .block(Block::default().title(t!(self, edit_profile_name)).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(t!(self, edit_profile_name))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(name_input, chunks[1]);
         if self.edit_profile_focus == 0 {
-            Self::set_cursor_clamped(f, chunks[1].x + 2 + self.profile_display_name.len() as u16, chunks[1].y + 1);
+            Self::set_cursor_clamped(
+                f,
+                chunks[1].x + 2 + self.profile_display_name.len() as u16,
+                chunks[1].y + 1,
+            );
         }
 
         let bio_style = if self.edit_profile_focus == 1 {
@@ -2484,13 +2904,29 @@ impl App {
         };
         let bio_input = Paragraph::new(self.profile_bio.as_str())
             .style(bio_style)
-            .block(Block::default().title(t!(self, edit_profile_bio)).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(t!(self, edit_profile_bio))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(bio_input, chunks[2]);
         if self.edit_profile_focus == 1 {
-            Self::set_cursor_clamped(f, chunks[2].x + 2 + self.profile_bio.len() as u16, chunks[2].y + 1);
+            Self::set_cursor_clamped(
+                f,
+                chunks[2].x + 2 + self.profile_bio.len() as u16,
+                chunks[2].y + 1,
+            );
         }
 
-        let tz_title = t!(self, edit_profile_tz).replace("{}", &if tz_offset >= 0 { format!("+{}", tz_offset / 60) } else { format!("{}", tz_offset / 60) });
+        let tz_title = t!(self, edit_profile_tz).replace(
+            "{}",
+            &if tz_offset >= 0 {
+                format!("+{}", tz_offset / 60)
+            } else {
+                format!("{}", tz_offset / 60)
+            },
+        );
         let tz_style = if self.edit_profile_focus == 2 {
             Style::default().fg(self.theme.accent)
         } else {
@@ -2498,16 +2934,29 @@ impl App {
         };
         let tz_input = Paragraph::new(format!("{:+.1}", tz_offset as f64 / 60.0))
             .style(tz_style)
-            .block(Block::default().title(tz_title).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(tz_title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(tz_input, chunks[3]);
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, edit_profile_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, edit_profile_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[4]);
     }
 
     fn render_chat(&self, f: &mut Frame, area: Rect) {
         let user = self.current_user.as_ref().unwrap();
-        let partner = self.chat_partner.as_ref().map(|u| u.username.as_str()).unwrap_or("...");
+        let partner = self
+            .chat_partner
+            .as_ref()
+            .map(|u| u.username.as_str())
+            .unwrap_or("...");
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -2523,33 +2972,56 @@ impl App {
             .style(self.theme.header_style);
         f.render_widget(header, chunks[0]);
 
-        let offset = self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0);
-        let messages: Vec<ListItem> = self.chat_messages.iter().enumerate().map(|(i, m)| {
-            let style = if m.sender_id == user.id {
-                Style::default().fg(self.theme.success)
-            } else {
-                Style::default().fg(self.theme.text)
-            };
-            let ago = i18n::ago(self.lang, &m.created_at, offset);
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("@{}: ", m.sender_username), Style::default().fg(self.theme.accent)),
-                Span::styled(&m.content, style),
-                Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
-            ]))
-            .style(self.theme.list_item_style(i))
-        }).collect();
+        let offset = self
+            .current_user
+            .as_ref()
+            .map(|u| u.utc_offset)
+            .unwrap_or(0);
+        let messages: Vec<ListItem> = self
+            .chat_messages
+            .iter()
+            .enumerate()
+            .map(|(i, m)| {
+                let style = if m.sender_id == user.id {
+                    Style::default().fg(self.theme.success)
+                } else {
+                    Style::default().fg(self.theme.text)
+                };
+                let ago = i18n::ago(self.lang, &m.created_at, offset);
+                ListItem::new(Line::from(vec![
+                    Span::styled(
+                        format!("@{}: ", m.sender_username),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::styled(&m.content, style),
+                    Span::styled(
+                        format!("  [{}]", ago),
+                        Style::default().fg(self.theme.muted),
+                    ),
+                ]))
+                .style(self.theme.list_item_style(i))
+            })
+            .collect();
 
-        let list = List::new(messages)
-            .block(self.theme.simple_block());
+        let list = List::new(messages).block(self.theme.simple_block());
         f.render_widget(list, chunks[1]);
 
         let input = Paragraph::new(self.input.as_str())
             .style(Style::default().fg(self.theme.text))
-            .block(Block::default().title(t!(self, chat_input_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(t!(self, chat_input_title))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(input, chunks[2]);
         Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, chunks[2].y + 1);
 
-        let help = Paragraph::new(Line::from(Span::styled("Enter: enviar  Esc: volver  Ctrl+q: salir", Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            "Enter: enviar  Esc: volver  Ctrl+q: salir",
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[3]);
     }
 
@@ -2640,7 +3112,10 @@ impl App {
         let bar = Paragraph::new(Line::from(vec![
             Span::styled(left, Style::default().fg(t.secondary)),
             Span::raw("  "),
-            Span::styled(right, Style::default().fg(t.accent).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                right,
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
         ]))
         .style(t.status_bar())
         .alignment(Alignment::Left);
@@ -2650,58 +3125,92 @@ impl App {
     fn render_login(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
             .margin(2)
             .split(area);
 
         let input = Paragraph::new(self.input.as_str())
             .style(Style::default().fg(self.theme.text))
-            .block(Block::default().title(t!(self, login_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(t!(self, login_title))
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(input, chunks[0]);
         Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, area.y + 3);
 
         if let Some(ref msg) = self.status_message {
-            let status = Paragraph::new(msg.as_str())
-                .style(Style::default().fg(self.theme.error));
+            let status = Paragraph::new(msg.as_str()).style(Style::default().fg(self.theme.error));
             f.render_widget(status, chunks[1]);
         }
 
         if let Some(ref debug) = self.debug_message {
-            let debug_par = Paragraph::new(debug.as_str())
-                .style(Style::default().fg(self.theme.muted));
+            let debug_par =
+                Paragraph::new(debug.as_str()).style(Style::default().fg(self.theme.muted));
             f.render_widget(debug_par, chunks[2]);
         }
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, login_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, login_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[3]);
     }
 
     fn render_register(&self, f: &mut Frame, area: Rect) {
         let chunks = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)])
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(1),
+                Constraint::Length(1),
+                Constraint::Min(1),
+            ])
             .margin(2)
             .split(area);
 
+        let invite_required = std::env::var("REGISTRATION_MODE")
+            .unwrap_or_else(|_| "open".to_string())
+            .eq_ignore_ascii_case("invite");
+        let title = if invite_required {
+            " Registro (usuario:contraseña:nombre:invitación) "
+        } else {
+            t!(self, register_title)
+        };
         let input = Paragraph::new(self.input.as_str())
             .style(Style::default().fg(self.theme.text))
-            .block(Block::default().title(t!(self, register_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(input, chunks[0]);
         Self::set_cursor_clamped(f, area.x + 2 + self.input.len() as u16, area.y + 3);
 
         if let Some(ref msg) = self.status_message {
-            let status = Paragraph::new(msg.as_str())
-                .style(Style::default().fg(self.theme.error));
+            let status = Paragraph::new(msg.as_str()).style(Style::default().fg(self.theme.error));
             f.render_widget(status, chunks[1]);
         }
 
         if let Some(ref debug) = self.debug_message {
-            let debug_par = Paragraph::new(debug.as_str())
-                .style(Style::default().fg(self.theme.muted));
+            let debug_par =
+                Paragraph::new(debug.as_str()).style(Style::default().fg(self.theme.muted));
             f.render_widget(debug_par, chunks[2]);
         }
 
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, register_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, register_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[3]);
     }
 
@@ -2734,8 +3243,16 @@ impl App {
         } else {
             String::new()
         };
-        let count_info = format!("  [{} {}]", self.timeline.len(), t!(self, status_bar_timeline));
-        let header_str = format!("{} {}", &t!(self, timeline_title).replace("{}", &user.username), notif_indicator);
+        let count_info = format!(
+            "  [{} {}]",
+            self.timeline.len(),
+            t!(self, status_bar_timeline)
+        );
+        let header_str = format!(
+            "{} {}",
+            &t!(self, timeline_title).replace("{}", &user.username),
+            notif_indicator
+        );
         let header = Paragraph::new(Line::from(vec![
             Span::styled(header_str, self.theme.header_style),
             Span::styled(count_info, Style::default().fg(self.theme.muted)),
@@ -2744,29 +3261,61 @@ impl App {
         f.render_widget(header, chunks[0]);
 
         if let Some(ref msg) = self.status_message {
-            let status = Paragraph::new(msg.as_str())
-                .style(Style::default().fg(self.theme.success));
+            let status =
+                Paragraph::new(msg.as_str()).style(Style::default().fg(self.theme.success));
             f.render_widget(status, chunks[1]);
         }
 
         let selected = self.list_state.selected().unwrap_or(0);
         let total = self.timeline.len();
-        let items: Vec<ListItem> = self.timeline.iter().enumerate().map(|(i, p)| {
-            let ago = i18n::ago(self.lang, &p.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-            let img = if Self::post_has_image(p) { "  \u{1f4f7}" } else { "" };
-            let bullet = if total > 0 && i == selected { "\u{25b6} " } else { "  " };
-            let content_spans = Self::render_content_with_tags(&p.content, self.theme.accent, self.theme.success);
-            let mut line_spans = vec![
-                Span::raw(bullet),
-                Span::styled(format!("@{}", p.username), Style::default().fg(self.theme.accent)),
-                Span::raw(": "),
-            ];
-            line_spans.extend(content_spans);
-            line_spans.push(Span::styled(img.to_string(), Style::default().fg(self.theme.image_indicator)));
-            line_spans.push(Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)));
-            ListItem::new(Line::from(line_spans))
-            .style(self.theme.list_item_style(i))
-        }).collect();
+        let items: Vec<ListItem> = self
+            .timeline
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let ago = i18n::ago(
+                    self.lang,
+                    &p.created_at,
+                    self.current_user
+                        .as_ref()
+                        .map(|u| u.utc_offset)
+                        .unwrap_or(0),
+                );
+                let img = if Self::post_has_image(p) {
+                    "  \u{1f4f7}"
+                } else {
+                    ""
+                };
+                let bullet = if total > 0 && i == selected {
+                    "\u{25b6} "
+                } else {
+                    "  "
+                };
+                let content_spans = Self::render_content_with_tags(
+                    &p.content,
+                    self.theme.accent,
+                    self.theme.success,
+                );
+                let mut line_spans = vec![
+                    Span::raw(bullet),
+                    Span::styled(
+                        format!("@{}", p.username),
+                        Style::default().fg(self.theme.accent),
+                    ),
+                    Span::raw(": "),
+                ];
+                line_spans.extend(content_spans);
+                line_spans.push(Span::styled(
+                    img.to_string(),
+                    Style::default().fg(self.theme.image_indicator),
+                ));
+                line_spans.push(Span::styled(
+                    format!("  [{}]", ago),
+                    Style::default().fg(self.theme.muted),
+                ));
+                ListItem::new(Line::from(line_spans)).style(self.theme.list_item_style(i))
+            })
+            .collect();
 
         let timeline_chunk = 2;
         let list = List::new(items)
@@ -2776,7 +3325,11 @@ impl App {
         f.render_stateful_widget(list, chunks[timeline_chunk], &mut self.list_state.clone());
 
         let help_idx = chunks.len() - 1;
-        let help = Paragraph::new(Line::from(Span::styled(t!(self, timeline_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+        let help = Paragraph::new(Line::from(Span::styled(
+            t!(self, timeline_help),
+            Style::default().fg(self.theme.secondary),
+        )))
+        .wrap(Wrap { trim: false });
         f.render_widget(help, chunks[help_idx]);
     }
 
@@ -2797,19 +3350,41 @@ impl App {
         if self.upload_mode {
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Length(3), Constraint::Length(1), Constraint::Min(1), Constraint::Length(1)])
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(1),
+                ])
                 .margin(1)
                 .split(area);
 
-            let spinner = if self.upload_waiting { self.spinner_char().to_string() } else { "✓".into() };
+            let spinner = if self.upload_waiting {
+                self.spinner_char().to_string()
+            } else {
+                "✓".into()
+            };
             let header_text = format!(" 📷 Imágenes — escuchando {}  ", spinner);
-            let header = Paragraph::new(Line::from(Span::styled(header_text, self.theme.header_style)))
-                .block(self.theme.simple_block());
+            let header = Paragraph::new(Line::from(Span::styled(
+                header_text,
+                self.theme.header_style,
+            )))
+            .block(self.theme.simple_block());
             f.render_widget(header, chunks[0]);
 
-            let username = self.current_user.as_ref().map(|u| u.username.as_str()).unwrap_or("usuario");
-            let hint = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg  [↑↓: elegir  Enter: seleccionar  d: borrar  Esc: volver]", username);
-            let hint_par = Paragraph::new(Line::from(Span::styled(hint, Style::default().fg(self.theme.secondary))));
+            let username = self
+                .current_user
+                .as_ref()
+                .map(|u| u.username.as_str())
+                .unwrap_or("usuario");
+            let hint = format!(
+                "scp -P 2222 archivo.jpg localhost:{}/archivo.jpg  [↑↓: elegir  Enter: seleccionar  d: borrar  Esc: volver]",
+                username
+            );
+            let hint_par = Paragraph::new(Line::from(Span::styled(
+                hint,
+                Style::default().fg(self.theme.secondary),
+            )));
             f.render_widget(hint_par, chunks[1]);
 
             if self.uploaded_images.is_empty() {
@@ -2819,23 +3394,34 @@ impl App {
             } else {
                 let selected = self.list_state.selected().unwrap_or(0);
                 let total = self.uploaded_images.len();
-                let items: Vec<ListItem> = self.uploaded_images.iter().enumerate().map(|(i, (name, size))| {
-                    let bullet = if total > 0 && i == selected { "▶ " } else { "  " };
-                    let is_new = self.upload_new_file.as_ref().map_or(false, |n| n == name);
-                    let name_style = if is_new {
-                        Style::default().fg(self.theme.success).add_modifier(Modifier::BOLD)
-                    } else {
-                        Style::default().fg(self.theme.accent)
-                    };
-                    let prefix = if is_new { "🆕 " } else { "" };
-                    ListItem::new(Line::from(vec![
-                        Span::raw(bullet),
-                        Span::styled(format!("{}{}", prefix, name), name_style),
-                        Span::raw("  "),
-                        Span::styled(size, Style::default().fg(self.theme.muted)),
-                    ]))
-                    .style(self.theme.list_item_style(i))
-                }).collect();
+                let items: Vec<ListItem> = self
+                    .uploaded_images
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (name, size))| {
+                        let bullet = if total > 0 && i == selected {
+                            "▶ "
+                        } else {
+                            "  "
+                        };
+                        let is_new = self.upload_new_file.as_ref().map_or(false, |n| n == name);
+                        let name_style = if is_new {
+                            Style::default()
+                                .fg(self.theme.success)
+                                .add_modifier(Modifier::BOLD)
+                        } else {
+                            Style::default().fg(self.theme.accent)
+                        };
+                        let prefix = if is_new { "🆕 " } else { "" };
+                        ListItem::new(Line::from(vec![
+                            Span::raw(bullet),
+                            Span::styled(format!("{}{}", prefix, name), name_style),
+                            Span::raw("  "),
+                            Span::styled(size, Style::default().fg(self.theme.muted)),
+                        ]))
+                        .style(self.theme.list_item_style(i))
+                    })
+                    .collect();
 
                 let list = List::new(items)
                     .block(self.theme.simple_block())
@@ -2845,21 +3431,34 @@ impl App {
             }
 
             let help_text = if self.upload_waiting {
-                format!("{} Esperando archivo... (r: refrescar  Esc: cancelar)", self.spinner_char())
+                format!(
+                    "{} Esperando archivo... (r: refrescar  Esc: cancelar)",
+                    self.spinner_char()
+                )
             } else {
                 "✅ Archivo listo — Enter para seleccionar  Esc: cancelar".to_string()
             };
-            let help = Paragraph::new(Line::from(Span::styled(help_text, Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false });
+            let help = Paragraph::new(Line::from(Span::styled(
+                help_text,
+                Style::default().fg(self.theme.secondary),
+            )))
+            .wrap(Wrap { trim: false });
             f.render_widget(help, chunks[3]);
             return;
         }
 
-        let title = if self.url_mode { t!(self, create_post_url_title) } else { t!(self, create_post_title) };
+        let title = if self.url_mode {
+            t!(self, create_post_url_title)
+        } else {
+            t!(self, create_post_title)
+        };
+        let status_h = if self.status_message.is_some() { 1 } else { 0 };
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3),
                 Constraint::Length(img_height),
+                Constraint::Length(status_h),
                 Constraint::Min(3),
             ])
             .margin(2)
@@ -2867,9 +3466,18 @@ impl App {
 
         let input = Paragraph::new(self.input.as_str())
             .style(Style::default().fg(self.theme.text))
-            .block(Block::default().title(title).borders(Borders::ALL).border_type(BorderType::Rounded));
+            .block(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_type(BorderType::Rounded),
+            );
         f.render_widget(input, chunks[0]);
-        Self::set_cursor_clamped(f, chunks[0].x + 2 + self.input.len() as u16, chunks[0].y + 1);
+        Self::set_cursor_clamped(
+            f,
+            chunks[0].x + 2 + self.input.len() as u16,
+            chunks[0].y + 1,
+        );
 
         if !img_text.is_empty() {
             let img_para = Paragraph::new(img_text.as_str())
@@ -2877,10 +3485,24 @@ impl App {
             f.render_widget(img_para, chunks[1]);
         }
 
+        if let Some(ref msg) = self.status_message {
+            let status =
+                Paragraph::new(msg.as_str()).style(Style::default().fg(self.theme.success));
+            f.render_widget(status, chunks[2]);
+        }
+
         let help = if self.url_mode {
-            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help_url), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
+            Paragraph::new(Line::from(Span::styled(
+                t!(self, create_post_help_url),
+                Style::default().fg(self.theme.secondary),
+            )))
+            .wrap(Wrap { trim: false })
         } else {
-            Paragraph::new(Line::from(Span::styled(t!(self, create_post_help), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
+            Paragraph::new(Line::from(Span::styled(
+                t!(self, create_post_help),
+                Style::default().fg(self.theme.secondary),
+            )))
+            .wrap(Wrap { trim: false })
         };
         f.render_widget(help, chunks[chunks.len() - 1]);
     }
@@ -2900,8 +3522,19 @@ impl App {
                 .margin(1)
                 .split(area);
 
-            let ago = i18n::ago(self.lang, &post.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-            let img_indicator = if Self::post_has_image(post) { "  \u{1f4f7}" } else { "" };
+            let ago = i18n::ago(
+                self.lang,
+                &post.created_at,
+                self.current_user
+                    .as_ref()
+                    .map(|u| u.utc_offset)
+                    .unwrap_or(0),
+            );
+            let img_indicator = if Self::post_has_image(post) {
+                "  \u{1f4f7}"
+            } else {
+                ""
+            };
             let header = Paragraph::new(format!("@{}  [{}]{}", post.username, ago, img_indicator))
                 .style(self.theme.header_style)
                 .block(self.theme.simple_block());
@@ -2913,8 +3546,7 @@ impl App {
                 } else {
                     self.status_message.clone().unwrap_or_default()
                 };
-                let st = Paragraph::new(status)
-                    .style(Style::default().fg(self.theme.error));
+                let st = Paragraph::new(status).style(Style::default().fg(self.theme.error));
                 f.render_widget(st, chunks[1]);
             }
 
@@ -2922,16 +3554,16 @@ impl App {
             let help_idx = 3;
 
             let mut inner = vec![
-                Constraint::Length(1),  // post text
+                Constraint::Length(1), // post text
             ];
             if Self::post_has_image(post) {
-                inner.push(Constraint::Length(5));  // image placeholder
+                inner.push(Constraint::Length(5)); // image placeholder
             }
-            inner.push(Constraint::Min(1));  // comments
+            inner.push(Constraint::Min(1)); // comments
             if self.comment_mode {
-                inner.push(Constraint::Length(3));  // input
+                inner.push(Constraint::Length(3)); // input
             } else if self.edit_mode {
-                inner.push(Constraint::Length(3));  // edit input
+                inner.push(Constraint::Length(3)); // edit input
             }
 
             let post_chunks = Layout::default()
@@ -2941,9 +3573,10 @@ impl App {
                 .split(chunks[content_idx]);
 
             let mut idx = 0;
-            let text = Paragraph::new(post.content.as_str())
-                .style(Style::default().fg(self.theme.text));
-            f.render_widget(text, post_chunks[idx]); idx += 1;
+            let text =
+                Paragraph::new(post.content.as_str()).style(Style::default().fg(self.theme.text));
+            f.render_widget(text, post_chunks[idx]);
+            idx += 1;
 
             if Self::post_has_image(post) {
                 let img_block = Block::default()
@@ -2962,49 +3595,96 @@ impl App {
 
             let tree = build_comment_tree(&self.post_comments);
             let flat: Vec<&CommentNode> = flatten_tree(&tree);
-            let comments: Vec<ListItem> = flat.iter().enumerate().map(|(i, node)| {
-                let c = &node.comment;
-                let indent = "  ".repeat(node.depth);
-                let ago = i18n::ago(self.lang, &c.created_at, self.current_user.as_ref().map(|u| u.utc_offset).unwrap_or(0));
-                let prefix = if node.depth > 0 { format!("{}└─ ", indent) } else { String::new() };
-                ListItem::new(Line::from(vec![
-                    Span::raw(prefix),
-                    Span::styled(format!("@{}", c.username), Style::default().fg(self.theme.accent)),
-                    Span::raw(" "),
-                    Span::raw(&c.content),
-                    Span::styled(format!("  [{}]", ago), Style::default().fg(self.theme.muted)),
-                ]))
-                .style(self.theme.list_item_style(i))
-            }).collect();
+            let comments: Vec<ListItem> = flat
+                .iter()
+                .enumerate()
+                .map(|(i, node)| {
+                    let c = &node.comment;
+                    let indent = "  ".repeat(node.depth);
+                    let ago = i18n::ago(
+                        self.lang,
+                        &c.created_at,
+                        self.current_user
+                            .as_ref()
+                            .map(|u| u.utc_offset)
+                            .unwrap_or(0),
+                    );
+                    let prefix = if node.depth > 0 {
+                        format!("{}└─ ", indent)
+                    } else {
+                        String::new()
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::raw(prefix),
+                        Span::styled(
+                            format!("@{}", c.username),
+                            Style::default().fg(self.theme.accent),
+                        ),
+                        Span::raw(" "),
+                        Span::raw(&c.content),
+                        Span::styled(
+                            format!("  [{}]", ago),
+                            Style::default().fg(self.theme.muted),
+                        ),
+                    ]))
+                    .style(self.theme.list_item_style(i))
+                })
+                .collect();
 
             let comments_list = List::new(if comments.is_empty() {
-                vec![ListItem::new(Line::from(Span::styled(t!(self, post_detail_no_comments), Style::default().fg(self.theme.muted))))]
+                vec![ListItem::new(Line::from(Span::styled(
+                    t!(self, post_detail_no_comments),
+                    Style::default().fg(self.theme.muted),
+                )))]
             } else {
                 comments
             })
-                .block(self.theme.default_block(t!(self, post_detail_comments)))
-                .highlight_style(self.theme.highlight().add_modifier(Modifier::BOLD));
+            .block(self.theme.default_block(t!(self, post_detail_comments)))
+            .highlight_style(self.theme.highlight().add_modifier(Modifier::BOLD));
             let mut cs = self.comment_list_state.clone();
-            f.render_stateful_widget(comments_list, post_chunks[idx], &mut cs); idx += 1;
+            f.render_stateful_widget(comments_list, post_chunks[idx], &mut cs);
+            idx += 1;
 
             if self.edit_mode {
                 let input = Paragraph::new(self.edit_buffer.as_str())
                     .style(Style::default().fg(self.theme.text))
-                    .block(Block::default().title(t!(self, post_detail_edit_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
+                    .block(
+                        Block::default()
+                            .title(t!(self, post_detail_edit_title))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded),
+                    );
                 f.render_widget(input, post_chunks[idx]);
             } else if self.comment_mode {
                 let input = Paragraph::new(self.comment_input.as_str())
                     .style(Style::default().fg(self.theme.text))
-                    .block(Block::default().title(t!(self, post_detail_comment_title)).borders(Borders::ALL).border_type(BorderType::Rounded));
+                    .block(
+                        Block::default()
+                            .title(t!(self, post_detail_comment_title))
+                            .borders(Borders::ALL)
+                            .border_type(BorderType::Rounded),
+                    );
                 f.render_widget(input, post_chunks[idx]);
             }
 
             let help = if self.edit_mode {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_edit), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
+                Paragraph::new(Line::from(Span::styled(
+                    t!(self, post_detail_help_edit),
+                    Style::default().fg(self.theme.secondary),
+                )))
+                .wrap(Wrap { trim: false })
             } else if self.comment_mode {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_comment), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
+                Paragraph::new(Line::from(Span::styled(
+                    t!(self, post_detail_help_comment),
+                    Style::default().fg(self.theme.secondary),
+                )))
+                .wrap(Wrap { trim: false })
             } else {
-                Paragraph::new(Line::from(Span::styled(t!(self, post_detail_help_view), Style::default().fg(self.theme.secondary)))).wrap(Wrap { trim: false })
+                Paragraph::new(Line::from(Span::styled(
+                    t!(self, post_detail_help_view),
+                    Style::default().fg(self.theme.secondary),
+                )))
+                .wrap(Wrap { trim: false })
             };
             f.render_widget(help, chunks[help_idx]);
         }

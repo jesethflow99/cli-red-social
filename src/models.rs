@@ -65,6 +65,15 @@ pub struct Message {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MessagePreview {
+    pub sender_id: i64,
+    pub sender_username: String,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+    pub unread: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Notification {
     pub id: i64,
     pub user_id: i64,

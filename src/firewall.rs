@@ -8,7 +8,14 @@ pub fn allow_scp(ip: &str) -> bool {
         return true;
     }
     let result = Command::new("nft")
-        .args(["add", "element", "inet", TABLE, SET, &format!("{{ {} }}", ip)])
+        .args([
+            "add",
+            "element",
+            "inet",
+            TABLE,
+            SET,
+            &format!("{{ {} }}", ip),
+        ])
         .output();
     match result {
         Ok(o) if o.status.success() => {
@@ -17,7 +24,11 @@ pub fn allow_scp(ip: &str) -> bool {
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!("[firewall] Failed to allow SCP for {}: {}", ip, stderr.trim());
+            tracing::warn!(
+                "[firewall] Failed to allow SCP for {}: {}",
+                ip,
+                stderr.trim()
+            );
             false
         }
         Err(e) => {
@@ -32,7 +43,14 @@ pub fn revoke_scp(ip: &str) -> bool {
         return true;
     }
     let result = Command::new("nft")
-        .args(["delete", "element", "inet", TABLE, SET, &format!("{{ {} }}", ip)])
+        .args([
+            "delete",
+            "element",
+            "inet",
+            TABLE,
+            SET,
+            &format!("{{ {} }}", ip),
+        ])
         .output();
     match result {
         Ok(o) if o.status.success() => {
@@ -41,7 +59,11 @@ pub fn revoke_scp(ip: &str) -> bool {
         }
         Ok(o) => {
             let stderr = String::from_utf8_lossy(&o.stderr);
-            tracing::warn!("[firewall] Failed to revoke SCP for {}: {}", ip, stderr.trim());
+            tracing::warn!(
+                "[firewall] Failed to revoke SCP for {}: {}",
+                ip,
+                stderr.trim()
+            );
             false
         }
         Err(e) => {

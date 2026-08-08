@@ -32,18 +32,16 @@ Red social en terminal accesible vía SSH. Sin navegador, sin JavaScript, sin co
      └──┬────┬────┬─┘
         │    │    │
    ┌────▼┐ ┌▼──┐ ┌▼────┐
-   │agora│ │2  │ │agora│   (N instancias Rust)
+   │agora│ │2  │ │agora│   (N instancias Rust, forkpty por sesión)
    └──┬──┘ └┬──┘ └──┬──┘
-      │ forkpty    │
-      ▼            ▼
-   ┌──────┐    ┌──────┐
-   │ TUI  │    │ TUI  │    (ratatui + crossterm)
-   └──┬───┘    └──┬───┘
-      └──────────┘
-            │
-      ┌─────▼─────┐
-      │ PostgreSQL │        (r2d2 pool 25 conexiones)
-      └───────────┘
+      │     │       │        cada proceso hijo sirve:
+      │     │       │        · si AGORA_OPENTUI_ENTRY existe: AGORA OpenTUI
+      │     │       │          (proceso Node/React) → rpc JSONL → agora --rpc
+      │     │       │        · si no: TUI nativa (Ratatui) en el mismo proceso
+      └──────┼───────┘
+          ┌──▼──┐
+          │ DB  │          (PostgreSQL, r2d2 pool 25 conexiones)
+          └─────┘
 ```
 
 ### Componentes
@@ -52,7 +50,9 @@ Red social en terminal accesible vía SSH. Sin navegador, sin JavaScript, sin co
 |---|---|---|
 | Proxy | nginx `stream` | Balanceo TCP capa 4, hash por IP |
 | Transporte | `russh` 0.46 + `russh-sftp` 2.1 | Servidor SSH + subsistema SFTP |
-| Terminal | `ratatui` 0.29 + `crossterm` 0.28 | Interfaz TUI (14 pantallas) |
+| Terminal (nativa) | `ratatui` 0.29 + `crossterm` 0.28 | Interfaz TUI en el mismo proceso (14 pantallas) |
+| Terminal (OpenTUI) | `@opentui/react` 0.4 + React 19 (`ui-opentui/`) | Interfaz alternativa, proceso Node separado por sesión |
+| RPC local | `src/rpc.rs` (`agora --rpc`) | Protocolo JSONL sobre stdin/stdout que consume AGORA OpenTUI |
 | Base de datos | PostgreSQL 17 + `r2d2` pool (25) | Persistencia con conexiones reciclables |
 | Imágenes | `image` crate 0.25 + `chafa`/`kitten`/`viu` | Procesamiento y visualización |
 | Concurrencia | `forkpty` (nix) | 1 proceso hijo por sesión SSH |
@@ -63,10 +63,17 @@ Red social en terminal accesible vía SSH. Sin navegador, sin JavaScript, sin co
 2. Servidor `russh` autentica con contraseña compartida (`SSH_PASSWORD`)
 3. Abre canal: `channel_open_session` → `shell_request`
 4. `forkpty()` crea proceso hijo con pseudo-terminal
-5. Hijo ejecuta `run_tui()` con Ratatui (loop de render + eventos)
+5. El hijo revisa `AGORA_OPENTUI_ENTRY`:
+   - Si apunta a un archivo existente, lanza `node --experimental-ffi --import tsx <entry>` (AGORA OpenTUI), que a su vez ejecuta `agora --rpc` como subproceso y le habla por JSONL (`src/rpc.rs`)
+   - Si no, ejecuta `run_tui()` con Ratatui en el propio proceso hijo
 6. Variables `SSH_CLIENT_IP` y `SSH_SESSION_TOKEN` se inyectan en el hijo
 7. Padre reenvía datos bidireccionalmente entre PTY y canal SSH
 8. Al cerrar: `waitpid`, `PtyMaster` cierra fd automáticamente
+
+En el despliegue Docker (`docker-compose.yml`), `AGORA_OPENTUI_ENTRY` está
+seteada en las tres instancias, así que AGORA OpenTUI es la interfaz servida
+por defecto. Ver [`ui-opentui/README.md`](ui-opentui/README.md) para su
+navegación y detalles de implementación.
 
 ---
 
@@ -185,8 +192,9 @@ Ejecutado cada 24h por hilo en segundo plano. Las cuentas inactivas se borran en
 ```bash
 ./setup-keys.sh
 
-export DB_PASSWORD=clave_segura
-export SSH_PASSWORD=otra_clave
+cp .env.example .env
+# Editar .env y reemplazar SSH_PASSWORD y DB_PASSWORD (Docker Compose no
+# arranca sin ellos)
 
 docker compose up -d
 docker compose exec agora1 agora --seed   # datos de prueba
@@ -199,8 +207,8 @@ ssh localhost -p 2222 -t
 ```bash
 docker compose up -d db          # solo PostgreSQL
 cargo run -- --seed              # datos de prueba
-cargo run -- --tui               # TUI directo
-cargo run -- --port 2222         # servidor SSH
+cargo run -- --tui               # TUI nativa directo (sin OpenTUI)
+cargo run -- --port 2222         # servidor SSH (TUI nativa si no hay AGORA_OPENTUI_ENTRY)
 cargo run -- --port 2222 --log agora.log  # con logs
 ```
 
@@ -208,15 +216,22 @@ cargo run -- --port 2222 --log agora.log  # con logs
 
 | Comando | Descripción |
 |---|---|
-| `agora --tui` | TUI directo (sin SSH) |
+| `agora --tui` | TUI nativa directo (sin SSH) |
 | `agora --port 2222` | Servidor SSH |
 | `agora --seed` | Insertar datos de prueba |
 | `agora --export --user <u>` | Exportar datos como JSON |
+| `agora --invite-create [--invite-days N]` | Crea una invitación de un solo uso (`REGISTRATION_MODE=invite`) |
+| `agora --invite-list` | Lista invitaciones sin revelar códigos |
+| `agora --invite-revoke <código>` | Revoca una invitación pendiente |
+| `agora --rpc` | Backend JSONL usado internamente por AGORA OpenTUI (flag oculto) |
 | `agora --log <archivo>` | Logs a archivo |
 
 ---
 
 ## 6. Guía de uso
+
+Atajos de la **TUI nativa** (Ratatui). Para AGORA OpenTUI, ver
+[`ui-opentui/README.md`](ui-opentui/README.md#navegación).
 
 ### 6.1 Timeline
 
@@ -225,8 +240,8 @@ cargo run -- --port 2222 --log agora.log  # con logs
 | `j`/`k` o ↑/↓ | Navegar posts |
 | `Enter` | Ver detalle |
 | `n` | Nuevo post |
-| `Ctrl+U` | Subir imagen (modo recepción SCP) |
-| `Ctrl+L` | Adjuntar desde URL |
+| `Ctrl+P` | Subir imagen (modo recepción SCP) |
+| `Ctrl+U` | Adjuntar desde URL |
 | `/` | Buscar posts |
 | `#` | Trending hashtags |
 | `R` | Modo Radio (ticker automático) |
@@ -251,7 +266,7 @@ cargo run -- --port 2222 --log agora.log  # con logs
 
 | Tecla | Acción |
 |---|---|
-| `Ctrl+U` | Entrar en modo recepción |
+| `Ctrl+P` | Entrar en modo recepción |
 | `↑/↓` | Navegar archivos |
 | `Enter` | Adjuntar imagen seleccionada |
 | `d` | Borrar imagen |
@@ -296,7 +311,11 @@ src/
 ├── i18n.rs         # Internacionalización (es/en) + macro t!()
 ├── theme.rs        # Paleta oscura + estilos
 ├── plugins.rs      # Sistema de middleware: SpamFilter, ProfanityFilter, LinkFilter
+├── rpc.rs          # Backend JSONL (agora --rpc) consumido por AGORA OpenTUI
 └── firewall.rs     # nftables dinámico (allow_scp / revoke_scp)
+
+ui-opentui/
+└── src/            # Interfaz AGORA OpenTUI (React + @opentui/react, TypeScript)
 ```
 
 ### 7.1 Pantallas (Screen enum)
@@ -384,7 +403,7 @@ post_hashtags (post_id BIGINT FK, tag TEXT, PK compuesta, INDEX on tag)
 ```
 Usuario TUI          Terminal externa        Servidor
 ─────┬─────              ─────┬─────          ───┬───
-     │ Ctrl+U                 │                  │
+     │ Ctrl+P                 │                  │
      ├── "Modo recepción" ──► │                  │
      │                        │ scp file.jpg     │
      │                        │ localhost:        │

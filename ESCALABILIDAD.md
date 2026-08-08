@@ -10,13 +10,20 @@ Cómo AGORA soporta cientos de usuarios simultáneos con recursos mínimos.
 |---|---|---|
 | Pool PostgreSQL | 25 conexiones | ~500-1000 usuarios simultáneos |
 | Procesos (forkpty) | ~500 antes de ulimit | Unas decenas sin problema |
-| RAM | ~5 MB por sesión TUI | 100 usuarios = 500 MB |
+| RAM | ~5 MB/sesión (TUI nativa) o ~40-80 MB/sesión (AGORA OpenTUI, proceso Node) | 100 usuarios = 500 MB–8 GB según interfaz |
 | nftables | 10 conexiones/minuto por IP | Rate-limit a nivel firewall |
 | nginx (stream) | I/O bound, virtualmente ilimitado | Balancea entre instancias |
 
 **Capacidad realista**: 300-500 usuarios simultáneos en un VPS de 4 GB RAM / 2 vCPU.
 
 Con 3 instancias + nginx: ~1500 usuarios.
+
+> Estas cifras se calcularon para la TUI nativa (Ratatui, ~5 MB/sesión). El
+> despliegue Docker actual sirve **AGORA OpenTUI** por defecto (un proceso
+> Node por sesión, bastante más pesado — ver [Interfaces en el
+> README](README.md#interfaces)), así que la capacidad real con la
+> configuración por defecto es menor a la de esta sección. Faltan mediciones
+> de RAM/CPU reales de AGORA OpenTUI bajo carga.
 
 ---
 
