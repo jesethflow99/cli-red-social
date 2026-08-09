@@ -157,13 +157,24 @@ fn sanitize_path(path: &str) -> Option<std::path::PathBuf> {
 }
 
 fn sanitize_path_for_user(path: &str, user: &str) -> Option<std::path::PathBuf> {
+    sanitize_within(path, user, &std::path::PathBuf::from(upload_dir()))
+}
+
+/// Resuelve `path` dentro de `upload_base`, sin depender del `upload_dir()`
+/// global, para que la lógica de sanitizado se pueda probar con un
+/// directorio temporal.
+fn sanitize_within(
+    path: &str,
+    user: &str,
+    upload_base: &std::path::Path,
+) -> Option<std::path::PathBuf> {
     let mut path = path.trim_start_matches('/');
     // Clients (notably OpenSSH's SFTP-based scp when the destination arg is
     // omitted) send targets like "./file.jpg" instead of a bare filename.
     while let Some(rest) = path.strip_prefix("./") {
         path = rest;
     }
-    let upload_base = std::path::PathBuf::from(upload_dir());
+    let upload_base = upload_base.to_path_buf();
 
     if path.is_empty() || path == "." {
         let _ = std::fs::create_dir_all(&upload_base);
@@ -326,9 +337,11 @@ impl russh_sftp::server::Handler for SftpSession {
         let write = pflags.contains(OpenFlags::WRITE);
         let read = pflags.contains(OpenFlags::READ);
         let p = if write {
-            self.user_path(&filename).ok_or(StatusCode::PermissionDenied)?
+            self.user_path(&filename)
+                .ok_or(StatusCode::PermissionDenied)?
         } else {
-            self.read_path(&filename).ok_or(StatusCode::PermissionDenied)?
+            self.read_path(&filename)
+                .ok_or(StatusCode::PermissionDenied)?
         };
 
         let file = if write {
@@ -904,5 +917,91 @@ impl Handler for SshSession {
             session.channel_failure(channel_id);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod sanitize_path_tests {
+    use super::sanitize_within;
+    use std::path::PathBuf;
+
+    // Un directorio temporal real por test: `sanitize_within` hace
+    // `canonicalize()`, que necesita rutas que existan en disco.
+    fn temp_base(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "agora_ssh_test_{}_{}_{:?}",
+            name,
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn bare_filename_uses_session_user() {
+        let base = temp_base("bare");
+        let result = sanitize_within("test.jpg", "alice", &base).unwrap();
+        assert_eq!(result, base.join("alice").join("test.jpg"));
+    }
+
+    #[test]
+    fn matching_user_prefix_is_allowed() {
+        let base = temp_base("match");
+        let result = sanitize_within("alice/test.jpg", "alice", &base).unwrap();
+        assert_eq!(result, base.join("alice").join("test.jpg"));
+    }
+
+    #[test]
+    fn mismatched_user_prefix_is_rejected() {
+        let base = temp_base("mismatch");
+        assert!(sanitize_within("bob/test.jpg", "alice", &base).is_none());
+    }
+
+    #[test]
+    fn dot_slash_prefix_behaves_like_bare_filename() {
+        // Regresión: el scp basado en SFTP de OpenSSH manda "./archivo" en
+        // vez de un nombre simple cuando se omite el destino, y esto se
+        // rechazaba porque "." no era igual al usuario de la sesión.
+        let base = temp_base("dotslash");
+        let result = sanitize_within("./test.jpg", "alice", &base).unwrap();
+        assert_eq!(result, base.join("alice").join("test.jpg"));
+    }
+
+    #[test]
+    fn empty_or_dot_path_returns_base_dir() {
+        let base = temp_base("dot");
+        assert_eq!(sanitize_within("", "alice", &base).unwrap(), base);
+        assert_eq!(sanitize_within(".", "alice", &base).unwrap(), base);
+    }
+
+    #[test]
+    fn permissive_mode_allows_any_owner() {
+        // Usado para lecturas: las imágenes son adjuntos de posts públicos,
+        // así que cualquier sesión autenticada puede leer las de cualquiera.
+        let base = temp_base("permissive");
+        let result = sanitize_within("bob/test.jpg", "", &base).unwrap();
+        assert_eq!(result, base.join("bob").join("test.jpg"));
+    }
+
+    #[test]
+    fn path_traversal_outside_owner_dir_is_rejected() {
+        let base = temp_base("traversal1");
+        std::fs::create_dir_all(base.join("bob")).unwrap();
+        std::fs::write(base.join("bob").join("secret.jpg"), b"secret").unwrap();
+        assert!(sanitize_within("alice/../bob/secret.jpg", "alice", &base).is_none());
+    }
+
+    #[test]
+    fn path_traversal_outside_upload_base_is_rejected() {
+        let base = temp_base("traversal2");
+        let outside = temp_base("traversal2_outside");
+        std::fs::write(outside.join("secret.jpg"), b"secret").unwrap();
+        let escape = format!(
+            "alice/../../{}/secret.jpg",
+            outside.file_name().unwrap().to_str().unwrap()
+        );
+        assert!(sanitize_within(&escape, "alice", &base).is_none());
     }
 }
