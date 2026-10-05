@@ -2,6 +2,18 @@
 
 Red social en terminal accesible vía SSH. Sin navegador, sin JavaScript, sin cookies, sin rastreo.
 
+## ¿Qué es AGORA?
+
+AGORA es una red social *terminal-first*: todo el producto — registro, login,
+timeline, hashtags, mensajes directos, notificaciones, imágenes y moderación —
+vive detrás de un servidor SSH. No existe una página web; el cliente es
+cualquier terminal con un cliente SSH (incluso en un teléfono con Termux, o a
+través de Tor).
+
+Este manual describe la **implementación técnica**: arquitectura, seguridad,
+modelo de datos, subida de imágenes, plugins de moderación y escalabilidad. Si
+buscás cómo usar la aplicación, ver [`MANUAL_USUARIO.md`](MANUAL_USUARIO.md).
+
 ---
 
 ## Índice
@@ -28,52 +40,39 @@ Red social en terminal accesible vía SSH. Sin navegador, sin JavaScript, sin co
      └──────┬───────┘
             │ TCP :2222
      ┌──────▼──────┐
-     │ nginx stream │  (balanceo TCP, hash por IP)
-     └──┬────┬────┬─┘
-        │    │    │
-   ┌────▼┐ ┌▼──┐ ┌▼────┐
-   │agora│ │2  │ │agora│   (N instancias Rust, forkpty por sesión)
-   └──┬──┘ └┬──┘ └──┬──┘
-      │     │       │        cada proceso hijo sirve:
-      │     │       │        · si AGORA_OPENTUI_ENTRY existe: AGORA OpenTUI
-      │     │       │          (proceso Node/React) → rpc JSONL → agora --rpc
-      │     │       │        · si no: TUI nativa (Ratatui) en el mismo proceso
-      └──────┼───────┘
-          ┌──▼──┐
-          │ DB  │          (PostgreSQL, r2d2 pool 25 conexiones)
-          └─────┘
+     │   agora      │   (1 instancia Rust, forkpty por sesión)
+     └──────┬───────┘
+            │        cada proceso hijo sirve la TUI nativa
+            │        (Ratatui) en el mismo proceso, con
+            │        llamadas directas a SQLite
+            │
+     ┌──────▼───────┐
+     │  SQLite (WAL)│  agora.db (+ agora-N.db en modo mesh)
+     └──────────────┘
 ```
 
 ### Componentes
 
 | Capa | Tecnología | Rol |
 |---|---|---|
-| Proxy | nginx `stream` | Balanceo TCP capa 4, hash por IP |
 | Transporte | `russh` 0.46 + `russh-sftp` 2.1 | Servidor SSH + subsistema SFTP |
-| Terminal (nativa) | `ratatui` 0.29 + `crossterm` 0.28 | Interfaz TUI en el mismo proceso (14 pantallas) |
-| Terminal (OpenTUI) | `@opentui/react` 0.4 + React 19 (`ui-opentui/`) | Interfaz alternativa, proceso Node separado por sesión |
-| RPC local | `src/rpc.rs` (`agora --rpc`) | Protocolo JSONL sobre stdin/stdout que consume AGORA OpenTUI |
-| Base de datos | PostgreSQL 17 + `r2d2` pool (25) | Persistencia con conexiones reciclables |
+| Terminal | `ratatui` 0.29 + `crossterm` 0.28 | Interfaz TUI nativa en el proceso hijo (15 pantallas) |
+| Base de datos | SQLite embebido (`rusqlite`, WAL) | 1 archivo único o mesh de N shards |
+| Mesh | `src/shard.rs` (`ShardManager`) | Reparte usuarios por hash y hace fan-out cross-shard |
 | Imágenes | `image` crate 0.25 + `chafa`/`kitten`/`viu` | Procesamiento y visualización |
 | Concurrencia | `forkpty` (nix) | 1 proceso hijo por sesión SSH |
 
 ### Flujo de conexión
 
-1. Cliente SSH conecta al puerto 2222 → nginx reenvía a una instancia (`hash $remote_addr consistent`)
+1. Cliente SSH conecta al puerto 2222
 2. Servidor `russh` autentica con contraseña compartida (`SSH_PASSWORD`)
 3. Abre canal: `channel_open_session` → `shell_request`
 4. `forkpty()` crea proceso hijo con pseudo-terminal
-5. El hijo revisa `AGORA_OPENTUI_ENTRY`:
-   - Si apunta a un archivo existente, lanza `node --experimental-ffi --import tsx <entry>` (AGORA OpenTUI), que a su vez ejecuta `agora --rpc` como subproceso y le habla por JSONL (`src/rpc.rs`)
-   - Si no, ejecuta `run_tui()` con Ratatui en el propio proceso hijo
+5. El hijo ejecuta `run_tui()` (Ratatui) en el propio proceso, con llamadas
+   directas a SQLite (`db::Database`, WAL) o al mesh (`shard::ShardManager`)
 6. Variables `SSH_CLIENT_IP` y `SSH_SESSION_TOKEN` se inyectan en el hijo
 7. Padre reenvía datos bidireccionalmente entre PTY y canal SSH
 8. Al cerrar: `waitpid`, `PtyMaster` cierra fd automáticamente
-
-En el despliegue Docker (`docker-compose.yml`), `AGORA_OPENTUI_ENTRY` está
-seteada en las tres instancias, así que AGORA OpenTUI es la interfaz servida
-por defecto. Ver [`ui-opentui/README.md`](ui-opentui/README.md) para su
-navegación y detalles de implementación.
 
 ---
 
@@ -170,34 +169,33 @@ Ejecutado cada 24h por hilo en segundo plano. Las cuentas inactivas se borran en
 
 | Recurso | Valor |
 |---|---|
-| RAM | 256 MB + ~5 MB por sesión |
+| RAM | 256 MB + ~8 MB por sesión |
 | CPU | 1 núcleo |
-| Disco | 1 GB + imágenes |
+| Disco | 100 MB + imágenes + DB |
 | SO | Linux con nftables |
 
-### Recomendados (3 instancias + nginx)
+### Recomendados (despliegue real)
 
 | Recurso | Valor |
 |---|---|
 | RAM | 4 GB |
-| CPU | 4 núcleos |
+| CPU | 2 núcleos |
 | Disco | 20 GB SSD |
 
 ---
 
 ## 5. Instalación y despliegue
 
-### 5.1 Docker (multi-instancia)
+### 5.1 Docker (instancia única)
 
 ```bash
 ./setup-keys.sh
 
 cp .env.example .env
-# Editar .env y reemplazar SSH_PASSWORD y DB_PASSWORD (Docker Compose no
-# arranca sin ellos)
+# Editar .env y reemplazar SSH_PASSWORD (Docker Compose no arranca sin él)
 
 docker compose up -d
-docker compose exec agora1 agora --seed   # datos de prueba
+docker compose exec agora agora --seed   # datos de prueba
 
 ssh localhost -p 2222 -t
 ```
@@ -205,11 +203,12 @@ ssh localhost -p 2222 -t
 ### 5.2 Desarrollo local
 
 ```bash
-docker compose up -d db          # solo PostgreSQL
 cargo run -- --seed              # datos de prueba
-cargo run -- --tui               # TUI nativa directo (sin OpenTUI)
-cargo run -- --port 2222         # servidor SSH (TUI nativa si no hay AGORA_OPENTUI_ENTRY)
+cargo run -- --tui               # TUI nativa directo (sin SSH)
+cargo run -- --port 2222         # servidor SSH (sirve la TUI nativa)
 cargo run -- --port 2222 --log agora.log  # con logs
+AGORA_DB_SHARDS=4 cargo run -- --port 2222  # mesh de 4 archivos
+AGORA_DB_SHARDS=4 cargo run -- --condense   # fusionar el mesh en uno
 ```
 
 ### 5.3 Comandos CLI
@@ -223,15 +222,14 @@ cargo run -- --port 2222 --log agora.log  # con logs
 | `agora --invite-create [--invite-days N]` | Crea una invitación de un solo uso (`REGISTRATION_MODE=invite`) |
 | `agora --invite-list` | Lista invitaciones sin revelar códigos |
 | `agora --invite-revoke <código>` | Revoca una invitación pendiente |
-| `agora --rpc` | Backend JSONL usado internamente por AGORA OpenTUI (flag oculto) |
+| `agora --condense` | Fusiona todos los shards del mesh en un único archivo |
 | `agora --log <archivo>` | Logs a archivo |
 
 ---
 
 ## 6. Guía de uso
 
-Atajos de la **TUI nativa** (Ratatui). Para AGORA OpenTUI, ver
-[`ui-opentui/README.md`](ui-opentui/README.md#navegación).
+Atajos de la **TUI nativa** (Ratatui).
 
 ### 6.1 Timeline
 
@@ -304,18 +302,15 @@ Atajos de la **TUI nativa** (Ratatui). Para AGORA OpenTUI, ver
 ```
 src/
 ├── main.rs         # Entry point, CLI, logging, cleanup thread
-├── app.rs          # TUI: App struct, 14 renderers, key handlers (~3000 líneas)
-├── db.rs           # DatabaseOps trait + Database impl + MockDatabase + seed
+├── app.rs          # TUI: App struct, 15 renderers, key handlers (~4000 líneas)
+├── db.rs           # DatabaseOps trait + Database SQLite + MockDatabase + seed
+├── shard.rs        # ShardManager: mesh de archivos .db, routing y condensación
 ├── models.rs       # User, Post, Comment, Message, Notification, Screen
 ├── ssh.rs          # SSH server + SFTP handler + process_image + upload_dir
 ├── i18n.rs         # Internacionalización (es/en) + macro t!()
 ├── theme.rs        # Paleta oscura + estilos
 ├── plugins.rs      # Sistema de middleware: SpamFilter, ProfanityFilter, LinkFilter
-├── rpc.rs          # Backend JSONL (agora --rpc) consumido por AGORA OpenTUI
 └── firewall.rs     # nftables dinámico (allow_scp / revoke_scp)
-
-ui-opentui/
-└── src/            # Interfaz AGORA OpenTUI (React + @opentui/react, TypeScript)
 ```
 
 ### 7.1 Pantallas (Screen enum)
@@ -332,11 +327,12 @@ ui-opentui/
 
 ### 7.3 db.rs
 
-- **`DatabaseOps` trait**: 59 métodos (CRUD, búsqueda, follows, mensajes, notificaciones, rate limiting, export, hashtags)
-- **`Database`**: PostgreSQL via `r2d2` pool, rate limiter en memoria + DB
-- **`MockDatabase`**: En memoria para 32 tests unitarios
-- **Schema**: 8 tablas con migración automática y ALTER incremental
-- **Seed**: 52 usuarios, 250+ posts, 160 comentarios, 120 mensajes, 170 follows
+- **`DatabaseOps` trait**: 47 métodos (CRUD, búsqueda, follows, mensajes, notificaciones, rate limiting, export, hashtags, invitaciones)
+- **`Database`**: SQLite embebido (`rusqlite`) con WAL y `busy_timeout`; ids globales por shard
+- **`ShardManager`** (`shard.rs`): implementa `DatabaseOps`, reparte usuarios por hash y hace fan-out cross-shard; `--condense` fusiona el mesh
+- **`MockDatabase`**: En memoria para los tests unitarios
+- **Schema**: 9 tablas (más `meta` para los ids globales), creado idempotentemente
+- **Seed**: 52 usuarios, 250+ posts, 160 comentarios, 120 mensajes, 169 follows
 
 ### 7.4 ssh.rs
 
@@ -353,29 +349,39 @@ ui-opentui/
 ### Esquema
 
 ```sql
-users         (id BIGSERIAL PK, username TEXT UNIQUE, password_hash TEXT,
+users         (id INTEGER PK, username TEXT UNIQUE, password_hash TEXT,
                display_name TEXT, bio TEXT, utc_offset INT,
-               created_at TEXT, last_login_at TEXT, login_count INT)
+               created_at TEXT, last_login_at TEXT, login_count INT,
+               public_key TEXT)
 
-posts         (id BIGSERIAL PK, user_id BIGINT FK, content TEXT,
+posts         (id INTEGER PK, user_id INT FK, content TEXT,
                image_path TEXT, created_at TEXT)
 
-follows       (follower_id BIGINT FK, following_id BIGINT FK, PK compuesta)
+follows       (follower_id INT FK, following_id INT FK, PK compuesta)
 
-comments      (id BIGSERIAL PK, post_id BIGINT FK, user_id BIGINT FK,
-               content TEXT, created_at TEXT, parent_comment_id BIGINT)
+comments      (id INTEGER PK, post_id INT FK, user_id INT FK,
+               content TEXT, created_at TEXT, parent_comment_id INT)
 
-messages      (id BIGSERIAL PK, sender_id BIGINT FK, receiver_id BIGINT FK,
-               content TEXT, created_at TEXT, read INT)
+messages      (id INTEGER PK, sender_id INT FK, receiver_id INT FK,
+               content TEXT, created_at TEXT, read INT, encrypted INT)
 
-notifications (id BIGSERIAL PK, user_id BIGINT FK, from_user_id BIGINT FK,
-               type TEXT, created_at TEXT, read INT, related_id BIGINT)
+notifications (id INTEGER PK, user_id INT FK, from_user_id INT FK,
+               type TEXT, created_at TEXT, read INT, related_id INT)
 
-rate_limits   (user_id BIGINT, action TEXT, window_start TEXT,
+rate_limits   (user_id INT, action TEXT, window_start TEXT,
                count INT, banned_until TEXT, PK compuesta)
 
-post_hashtags (post_id BIGINT FK, tag TEXT, PK compuesta, INDEX on tag)
+post_hashtags (post_id INT FK, tag TEXT, PK compuesta, INDEX on tag)
+
+invitations   (id INTEGER PK, code_hash TEXT UNIQUE, created_at TEXT,
+               expires_at TEXT, used_at TEXT, used_by INT FK)
+
+meta          (k TEXT PK, v INT)   -- contador de ids globales por shard
 ```
+
+> Los `id` son enteros **globales** por shard: `id = shard_idx * 10.000.000 + local`.
+> Eso permite enrutar cualquier id a su shard (`id / 10.000.000`) y fusionar
+> shards sin colisiones.
 
 ### Operaciones principales
 
@@ -386,9 +392,9 @@ post_hashtags (post_id BIGINT FK, tag TEXT, PK compuesta, INDEX on tag)
 | `create_post` | INSERT + extract hashtags + extract mentions + notify |
 | `get_timeline` | JOIN follows, ORDER BY created_at DESC, LIMIT/OFFSET |
 | `get_trending_hashtags` | GROUP BY tag, COUNT, ORDER BY cnt DESC |
-| `get_posts_by_hashtag` | JOIN post_hashtags, WHERE tag = $1 |
-| `search_posts` | ILIKE con filtro temporal opcional (24h/7d/30d) |
-| `search_posts_by_user` | JOIN users, ILIKE username |
+| `get_posts_by_hashtag` | JOIN post_hashtags, WHERE tag = ? |
+| `search_posts` | LIKE con filtro temporal opcional (24h/7d/30d) |
+| `search_posts_by_user` | JOIN users, LIKE username |
 | `export_user_data` | SELECT agregado de toda la actividad, JSON |
 | `cleanup_old_data` | DELETE mensajes y notificaciones > 90 días |
 | `cleanup_inactive_users` | DELETE usuarios sin login > 2 años (cascada) |
@@ -472,15 +478,15 @@ Resumen:
 
 | Configuración | Usuarios simultáneos |
 |---|---|
-| 1 instancia | ~500 |
-| 3 instancias + nginx | ~1500 |
-| 10 instancias | ~5000+ |
+| Archivo único SQLite | ~500-1000 |
+| Mesh de 4 shards | ~2000+ |
 
 Factores clave:
 - **Procesos independientes** (forkpty): sin contención de locks entre usuarios
-- **Pool de conexiones** (r2d2): consultas milisegundos, conexiones reciclables
-- **Sin estado compartido** entre instancias (solo PostgreSQL)
-- **Escalado horizontal** trivial: más instancias → más capacidad
+- **SQLite WAL**: lecturas concurrentes ilimitadas, un escritor encolado
+- **Mesh opcional** (`AGORA_DB_SHARDS`): reparte escrituras en N archivos
+- **Condensación** (`--condense`): vuelve a un único archivo cuando baja la carga
+- **Sin dependencias externas**: un binario de ~12 MB lo corre todo
 
 ---
 

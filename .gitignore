@@ -1,5 +1,4 @@
 /target
-node_modules/
 data/
 host_key
 .env
@@ -7,6 +6,9 @@ host_key
 export_*.json
 backups/
 social.db
+*.db
+*.db-wal
+*.db-shm
 uploads/
 keys/*_host_key*
 

@@ -20,18 +20,3 @@ jobs:
       # Keep Clippy visible while the existing advisory backlog is reduced.
       - run: cargo clippy --all-targets
       - run: cargo test --all-targets
-
-  opentui:
-    runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: ui-opentui
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: ui-opentui/package-lock.json
-      - run: npm ci
-      - run: npm run typecheck

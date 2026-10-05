@@ -2,17 +2,25 @@
 
 Red social minimalista orientada a privacidad. Sin navegador, sin JavaScript, sin cookies: solo tu terminal, SSH y texto.
 
+AGORA es una red social completa — timeline, hashtags, mensajes directos cifrados,
+notificaciones, imágenes y moderación — que se usa íntegramente desde un cliente
+SSH. El backend está escrito en **Rust** y cada usuario conectado recibe un
+proceso independiente con su propia pseudo-terminal (`forkpty`), de modo que una
+sesión cuesta ~8 MB de RAM. No hay página web, no hay rastreo, no hay publicidad:
+el feed es cronológico inverso y los datos pertenecen al usuario.
+
+La persistencia es **SQLite embebido**: un solo binario self-contained, sin
+servidor de base de datos. Cuando la concurrencia crece, AGORA puede repartir los
+datos en varios archivos `.db` (un *mesh* de shards) y condensarlos de nuevo en
+uno solo cuando la carga baja.
+
 ```
 ssh agora.social -t          # o vía Tor: torsocks ssh agora.onion -t
 ```
 
-Al conectar, el servidor sirve una de dos interfaces según cómo esté desplegado
-(ver [Interfaces](#interfaces)):
-
-- **AGORA OpenTUI** (React + [OpenTUI](https://github.com/sst/opentui)): la que
-  corre en el despliegue Docker por defecto.
-- **TUI nativa** (Rust + Ratatui): fallback usado en desarrollo local o cuando
-  no hay interfaz OpenTUI disponible.
+Al conectar, el servidor sirve la **TUI nativa** (Rust + Ratatui): una interfaz
+de terminal completa con timeline, mensajes, notificaciones y más, que corre en
+un proceso independiente por sesión.
 
 ---
 
@@ -21,14 +29,14 @@ Al conectar, el servidor sirve una de dos interfaces según cómo esté desplega
 ```bash
 git clone <repo> && cd cli-red-social
 
-# Generar keys de host (para multi-instancia)
+# Generar key de host
 ./setup-keys.sh
 
-# Configurar secretos (Docker Compose no arranca sin ellos)
+# Configurar secretos (Docker Compose no arranca sin SSH_PASSWORD)
 cp .env.example .env
-# Editá .env y reemplazá ambos secretos antes de continuar
+# Editá .env y reemplazá SSH_PASSWORD antes de continuar
 
-# Levantar (nginx + 3 instancias + PostgreSQL)
+# Levantar (una instancia + SQLite embebido)
 docker compose up -d
 
 # Conectarse
@@ -38,49 +46,27 @@ ssh localhost -p 2222 -t
 ## Desarrollo local
 
 ```bash
-# Solo PostgreSQL en Docker
-docker compose up -d db
-
 # Seed de datos (52 usuarios, 250+ posts)
 cargo run -- --seed
 
 # TUI nativa directo (sin SSH)
 cargo run -- --tui
 
-# Servidor SSH completo (sirve OpenTUI si AGORA_OPENTUI_ENTRY apunta a un
-# archivo válido; si no, cae a la TUI nativa)
+# Servidor SSH completo (sirve la TUI nativa a cada cliente SSH)
 cargo run -- --port 2222
 
 # Con logs a archivo
 cargo run -- --port 2222 --log agora.log
 ```
 
-## Interfaces
-
-AGORA tiene dos interfaces de terminal que hablan con el mismo backend Rust y
-la misma base de datos:
-
-| | TUI nativa | AGORA OpenTUI |
-|---|---|---|
-| Código | `src/app.rs` (Ratatui) | `ui-opentui/` (React + OpenTUI, TypeScript) |
-| Cuándo se usa | Siempre con `--tui`, o en SSH si `AGORA_OPENTUI_ENTRY` no está seteada | En SSH cuando `AGORA_OPENTUI_ENTRY` apunta a `ui-opentui/src/index.tsx` (así viene configurado en `docker-compose.yml`) |
-| Comunicación con el backend | Llamadas directas a `db::Database` en el mismo proceso | Protocolo JSONL sobre stdin/stdout contra `agora --rpc` (`src/rpc.rs`) |
-
-En cada conexión SSH, `src/ssh.rs` crea un pseudo-terminal (`forkpty`) y decide
-cuál de las dos lanzar. Por eso, en el despliegue Docker (el del "Inicio
-rápido") lo que ve el cliente SSH es **AGORA OpenTUI**, no la TUI nativa.
-
-Para correr o desarrollar la interfaz OpenTUI de forma standalone, ver
-[`ui-opentui/README.md`](ui-opentui/README.md).
-
 ## Variables de entorno
 
 | Variable | Default | Descripción |
 |---|---|---|
-| `DATABASE_URL` | `postgres://social:agora@localhost/social` | Conexión PostgreSQL |
+| `DATABASE_URL` | `agora.db` | Ruta del archivo SQLite embebido |
+| `AGORA_DB_SHARDS` | `1` | Número de archivos `.db` del mesh (1 = archivo único) |
 | `SSH_PASSWORD` | `agora` | Contraseña SSH compartida |
 | `SSH_PORT` | `2222` | Puerto público |
-| `DB_PASSWORD` | `agora` | Contraseña PostgreSQL (Docker) |
 | `RUST_LOG` | `info` | Nivel de logging |
 | `LANG` | `es` | Idioma (`es` o `en`) |
 | `AGORA_UPLOAD_DIR` | `./uploads` o `/data/uploads` | Directorio de imágenes |
@@ -88,7 +74,6 @@ Para correr o desarrollar la interfaz OpenTUI de forma standalone, ver
 | `REGISTRATION_MODE` | `open` | `open`, `invite` o `closed` (ver [Registro privado e invitaciones](#registro-privado-e-invitaciones)) |
 | `AGORA_PUBLIC_HOST` | `localhost` | Host/IP público mostrado en el comando `scp` asistido |
 | `AGORA_PUBLIC_SSH_PORT` | `2222` | Puerto público mostrado en el comando `scp` asistido |
-| `AGORA_OPENTUI_ENTRY` | — | Ruta a `ui-opentui/src/index.tsx`; si apunta a un archivo existente, la sesión SSH sirve AGORA OpenTUI en vez de la TUI nativa |
 | `SSH_CLIENT_IP` | — | IP del cliente (seteada por el servidor) |
 
 ## Uso
@@ -100,8 +85,7 @@ Para correr o desarrollar la interfaz OpenTUI de forma standalone, ver
 
 ### Atajos principales
 
-Estos son los de la **TUI nativa** (Ratatui). Si tu conexión sirve **AGORA
-OpenTUI**, ver los atajos propios en [`ui-opentui/README.md`](ui-opentui/README.md#navegación).
+Atajos de la **TUI nativa** (Ratatui):
 
 | Tecla | Acción |
 |---|---|
@@ -160,31 +144,50 @@ Genera `export_jeseth_20260520_120000.json` con posts, comentarios, mensajes, se
 
 ```bash
 # Crear una invitación válida durante 7 días
-docker compose exec agora1 agora --invite-create --invite-days 7
+docker compose exec agora agora --invite-create --invite-days 7
 
 # Consultar estado sin revelar códigos
-docker compose exec agora1 agora --invite-list
+docker compose exec agora agora --invite-list
 
 # Revocar un código todavía no utilizado
-docker compose exec agora1 agora --invite-revoke CODIGO
+docker compose exec agora agora --invite-revoke CODIGO
 ```
 
 En modo `invite`, el registro usa el formato
 `usuario:contraseña:nombre:invitación`. Los códigos se guardan como hashes y se
 consumen atómicamente al crear la cuenta.
 
+### Mesh de shards (opcional)
+
+Cuando la concurrencia crece, se puede repartir la base en varios archivos
+`.db`. Cada usuario se asigna a un shard por hash de su nombre y las consultas
+que cruzan usuarios (timeline, búsqueda, trending) hacen fan-out y combinan los
+resultados.
+
+```bash
+# Repartir en 4 archivos: agora.db, agora-1.db, agora-2.db, agora-3.db
+AGORA_DB_SHARDS=4 cargo run -- --port 2222
+
+# Cuando baja la carga, fusionar todo en un único archivo
+AGORA_DB_SHARDS=4 cargo run -- --condense
+```
+
+`--condense` deja todos los datos en `agora.db` y elimina los shards
+secundarios. El archivo único es el modo recomendado para la mayoría de
+despliegues; el mesh es para picos de escritura sostenidos.
+
 ### Respaldo y restauración
 
 ```bash
-# PostgreSQL, imágenes y sumas SHA-256
+# Copia el archivo SQLite, las imágenes y sumas SHA-256
 ./scripts/backup.sh
 
 # Reemplaza la base actual; requiere confirmación explícita
 ./scripts/restore.sh backups/agora-AAAAMMDDTHHMMSSZ --yes
 ```
 
-La restauración detiene temporalmente las tres instancias de Agora. Conserva los
-respaldos fuera del servidor y prueba periódicamente que puedan restaurarse.
+Conserva los respaldos fuera del servidor y prueba periódicamente que puedan
+restaurarse. Si usás el mesh, condensá antes de respaldar.
 
 ### Plugins de moderación
 
@@ -199,22 +202,21 @@ AGORA_MODERATION_PLUGINS=spam,profanity,link cargo run -- --port 2222
 ## Producción
 
 ```bash
-# 1. Generar claves
+# 1. Generar clave de host
 ./setup-keys.sh
 
 # 2. Firewall
 sudo ./firewall.sh
 
-# 3. Contraseñas seguras en un archivo local no versionado
+# 3. Contraseña SSH segura en un archivo local no versionado
 cp .env.example .env
 sed -i "s|replace-with-a-long-random-secret|$(openssl rand -base64 32)|" .env
-sed -i "s|replace-with-a-different-long-random-secret|$(openssl rand -base64 32)|" .env
 
-# 4. Desplegar (nginx + 3 instancias + PostgreSQL)
+# 4. Desplegar (instancia única + SQLite embebido)
 docker compose up -d
 
-# 5. Seed de datos
-docker compose exec agora1 agora --seed
+# 5. Seed de datos (opcional)
+docker compose exec agora agora --seed
 ```
 
 ## Arquitectura
@@ -225,27 +227,27 @@ docker compose exec agora1 agora --seed
      └──────┬───────┘
             │
      ┌──────▼──────┐
-     │ nginx:2222   │  (TCP stream proxy)
-     └──┬────┬────┬─┘
-        │    │    │
-   ┌────▼┐ ┌▼──┐ ┌▼────┐
-   │ago1 │ │2  │ │ago3 │   (3 instancias, forkpty por sesión)
-   └──┬──┘ └┬──┘ └──┬──┘
-      │     │       │        cada sesión sirve:
-      │     │       │        · AGORA OpenTUI (Node/React) → rpc JSONL → agora --rpc
-      │     │       │        · ó TUI nativa (Ratatui, llamadas directas)
-      └──────┼───────┘
-          ┌──▼──┐
-          │ DB  │          (PostgreSQL)
-          └─────┘
+     │   agora      │  (una instancia, forkpty por sesión)
+     └──────┬───────┘
+            │        cada sesión sirve la TUI nativa
+            │        (Ratatui, llamadas directas a SQLite)
+            │
+     ┌──────▼───────┐
+     │ SQLite (WAL) │  agora.db  (+ agora-N.db en modo mesh)
+     └──────────────┘
 ```
+
+- **Un proceso por sesión** (`forkpty`): sin locks compartidos, ~8 MB de RAM.
+- **SQLite en WAL**: lecturas concurrentes ilimitadas, un escritor encolado.
+- **Mesh opcional**: varios `.db` con fan-out para picos de concurrencia.
+- **Sin dependencias externas**: un binario de ~12 MB lo corre todo.
 
 ## Documentación
 
 | Documento | Contenido |
 |---|---|
 | `MANUAL_TECNICO.md` | Arquitectura, seguridad, código, API |
-| `ui-opentui/README.md` | Interfaz AGORA OpenTUI: cómo correrla y sus atajos |
+| `MANUAL_USUARIO.md` | Guía de uso de la TUI nativa, pantalla por pantalla |
 | `ESCALABILIDAD.md` | Cómo soporta 500-1500 usuarios simultáneos |
 | `SECURITY.md` | Política de reporte de vulnerabilidades y manejo de secretos |
 | `plan.txt` | Filosofía y concepto original |

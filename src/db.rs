@@ -1,8 +1,6 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use postgres::NoTls;
-use r2d2::Pool;
-use r2d2_postgres::PostgresConnectionManager;
+use rusqlite::{Connection, OptionalExtension};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -125,7 +123,7 @@ fn aes_decrypt(key: &[u8; 32], nonce: &[u8], ciphertext: &[u8]) -> Result<Vec<u8
 }
 
 #[allow(dead_code)]
-pub trait DatabaseOps: Send {
+pub trait DatabaseOps: Send + Sync {
     fn register_user(
         &self,
         username: &str,
@@ -212,6 +210,10 @@ pub trait DatabaseOps: Send {
     fn export_user_data(&self, username: &str) -> Result<String>;
     fn clear_image_from_posts(&self, path: &str) -> Result<u64>;
     fn get_public_key(&self, user_id: i64) -> Result<Option<String>>;
+    fn create_invitation(&self, valid_days: i64) -> Result<String>;
+    fn list_invitations(&self) -> Result<Vec<(i64, String, String, bool, Option<String>)>>;
+    fn revoke_invitation(&self, code: &str) -> Result<bool>;
+    fn seed_data(&self) -> Result<()>;
 }
 
 impl DatabaseOps for Database {
@@ -391,41 +393,70 @@ impl DatabaseOps for Database {
     fn get_public_key(&self, user_id: i64) -> Result<Option<String>> {
         Database::get_public_key(self, user_id)
     }
+    fn create_invitation(&self, valid_days: i64) -> Result<String> {
+        Database::create_invitation(self, valid_days)
+    }
+    fn list_invitations(&self) -> Result<Vec<(i64, String, String, bool, Option<String>)>> {
+        Database::list_invitations(self)
+    }
+    fn revoke_invitation(&self, code: &str) -> Result<bool> {
+        Database::revoke_invitation(self, code)
+    }
+    fn seed_data(&self) -> Result<()> {
+        Database::seed_data(self)
+    }
+}
+pub struct Database {
+    conn: Mutex<Connection>,
+    rate_limiter: Mutex<HashMap<String, Vec<Instant>>>,
+    id_base: i64,
 }
 
-pub struct Database {
-    pool: Pool<PostgresConnectionManager<NoTls>>,
-    rate_limiter: Mutex<HashMap<String, Vec<Instant>>>,
-}
+pub const MAX_USER_ID_PER_SHARD: i64 = 10_000_000;
 
 impl Database {
-    pub fn new(conn_str: &str) -> Result<Self> {
-        let manager = PostgresConnectionManager::new(conn_str.parse()?, NoTls);
-        let pool = Pool::builder()
-            .max_size(25)
-            .min_idle(Some(0))
-            .connection_timeout(Duration::from_secs(3))
-            .build(manager)?;
+    pub fn new(db_path: &str) -> Result<Self> {
+        Self::with_id_base(db_path, 0)
+    }
+
+    pub fn with_id_base(db_path: &str, id_base: i64) -> Result<Self> {
+        let conn = Connection::open(db_path)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
         let db = Self {
-            pool,
+            conn: Mutex::new(conn),
             rate_limiter: Mutex::new(HashMap::new()),
+            id_base,
         };
-        let mut last_err = anyhow::anyhow!("could not connect to database");
-        for i in 0..12 {
-            match db.init_schema() {
-                Ok(()) => return Ok(db),
-                Err(e) => {
-                    last_err = e;
-                    eprintln!(
-                        "[agora] DB connection attempt {} failed, retrying in {}s...",
-                        i + 1,
-                        i + 1
-                    );
-                    std::thread::sleep(std::time::Duration::from_secs(i as u64 + 1));
-                }
-            }
-        }
-        Err(last_err)
+        db.init_schema()?;
+        db.init_meta()?;
+        Ok(db)
+    }
+
+    pub fn id_base(&self) -> i64 {
+        self.id_base
+    }
+
+    fn init_meta(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v INTEGER NOT NULL);
+             INSERT OR IGNORE INTO meta (k, v) VALUES ('next_id', 0);",
+        )?;
+        Ok(())
+    }
+
+    /// Reserva un id global único: `id_base + n` local por shard.
+    fn alloc_id(&self) -> Result<i64> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute("UPDATE meta SET v = v + 1 WHERE k = 'next_id'", [])?;
+        let local: i64 = conn.query_row(
+            "SELECT v FROM meta WHERE k = 'next_id'",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(self.id_base + local)
     }
 
     pub fn check_register_rate_limit(&self) -> Result<()> {
@@ -448,21 +479,21 @@ impl Database {
         max: usize,
         window_secs: u64,
     ) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now();
         let window_start = now - chrono::Duration::seconds(window_secs as i64);
         let window_start_str = window_start.to_rfc3339();
         let now_str = now.to_rfc3339();
 
-        let rows = conn.query(
-            "SELECT count, banned_until FROM rate_limits WHERE user_id = $1 AND action = $2 AND window_start > $3 ORDER BY window_start DESC LIMIT 1",
-            &[&user_id, &action, &window_start_str],
-        )?;
+        let existing: Option<(i32, String)> = conn
+            .query_row(
+                "SELECT count, banned_until FROM rate_limits WHERE user_id = ?1 AND action = ?2 AND window_start > ?3 ORDER BY window_start DESC LIMIT 1",
+                rusqlite::params![user_id, action, window_start_str],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
 
-        if let Some(row) = rows.into_iter().next() {
-            let count: i32 = row.get(0);
-            let banned_until: String = row.get(1);
-
+        if let Some((count, banned_until)) = existing {
             if !banned_until.is_empty() {
                 if let Ok(ban_time) = banned_until.parse::<DateTime<Utc>>() {
                     if now < ban_time {
@@ -487,21 +518,21 @@ impl Database {
                 let ban_until_str = ban_until.to_rfc3339();
 
                 conn.execute(
-                    "UPDATE rate_limits SET banned_until = $1 WHERE user_id = $2 AND action = $3 AND window_start > $4",
-                    &[&ban_until_str, &user_id, &action, &window_start_str],
+                    "UPDATE rate_limits SET banned_until = ?1 WHERE user_id = ?2 AND action = ?3 AND window_start > ?4",
+                    rusqlite::params![ban_until_str, user_id, action, window_start_str],
                 )?;
 
                 anyhow::bail!("Demasiadas solicitudes. Espera {} segundos.", ban_duration);
             }
 
             conn.execute(
-                "UPDATE rate_limits SET count = count + 1 WHERE user_id = $1 AND action = $2 AND window_start > $3",
-                &[&user_id, &action, &window_start_str],
+                "UPDATE rate_limits SET count = count + 1 WHERE user_id = ?1 AND action = ?2 AND window_start > ?3",
+                rusqlite::params![user_id, action, window_start_str],
             )?;
         } else {
             conn.execute(
-                "INSERT INTO rate_limits (user_id, action, window_start, count) VALUES ($1, $2, $3, 1)",
-                &[&user_id, &action, &now_str],
+                "INSERT INTO rate_limits (user_id, action, window_start, count) VALUES (?1, ?2, ?3, 1)",
+                rusqlite::params![user_id, action, now_str],
             )?;
         }
 
@@ -509,11 +540,10 @@ impl Database {
     }
 
     fn init_schema(&self) -> Result<()> {
-        let mut conn = self.pool.get()?;
-        conn.batch_execute(
-            "SET client_min_messages TO warning;
-            CREATE TABLE IF NOT EXISTS users (
-                id BIGSERIAL PRIMARY KEY,
+        let conn = self.conn.lock().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
                 password_hash TEXT NOT NULL,
                 display_name TEXT NOT NULL DEFAULT '',
@@ -521,49 +551,49 @@ impl Database {
                 utc_offset INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 last_login_at TEXT NOT NULL DEFAULT '',
-                login_count INTEGER NOT NULL DEFAULT 0
+                login_count INTEGER NOT NULL DEFAULT 0,
+                public_key TEXT NOT NULL DEFAULT ''
             );
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at TEXT NOT NULL DEFAULT '';
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS login_count INTEGER NOT NULL DEFAULT 0;
-            ALTER TABLE users ADD COLUMN IF NOT EXISTS public_key TEXT NOT NULL DEFAULT '';
             CREATE TABLE IF NOT EXISTS posts (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(id),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 image_path TEXT NOT NULL DEFAULT '',
                 created_at TEXT NOT NULL
             );
             CREATE TABLE IF NOT EXISTS follows (
-                follower_id BIGINT NOT NULL REFERENCES users(id),
-                following_id BIGINT NOT NULL REFERENCES users(id),
+                follower_id INTEGER NOT NULL,
+                following_id INTEGER NOT NULL,
                 PRIMARY KEY (follower_id, following_id)
             );
             CREATE TABLE IF NOT EXISTS comments (
-                id BIGSERIAL PRIMARY KEY,
-                post_id BIGINT NOT NULL REFERENCES posts(id),
-                user_id BIGINT NOT NULL REFERENCES users(id),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                post_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                parent_comment_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS messages (
-                id BIGSERIAL PRIMARY KEY,
-                sender_id BIGINT NOT NULL REFERENCES users(id),
-                receiver_id BIGINT NOT NULL REFERENCES users(id),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sender_id INTEGER NOT NULL,
+                receiver_id INTEGER NOT NULL,
                 content TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                read INTEGER NOT NULL DEFAULT 0
+                read INTEGER NOT NULL DEFAULT 0,
+                encrypted INTEGER NOT NULL DEFAULT 0
             );
-            ALTER TABLE messages ADD COLUMN IF NOT EXISTS encrypted INTEGER NOT NULL DEFAULT 0;
             CREATE TABLE IF NOT EXISTS notifications (
-                id BIGSERIAL PRIMARY KEY,
-                user_id BIGINT NOT NULL REFERENCES users(id),
-                from_user_id BIGINT NOT NULL REFERENCES users(id),
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                from_user_id INTEGER NOT NULL,
                 type TEXT NOT NULL,
                 created_at TEXT NOT NULL,
-                read INTEGER NOT NULL DEFAULT 0
+                read INTEGER NOT NULL DEFAULT 0,
+                related_id INTEGER
             );
             CREATE TABLE IF NOT EXISTS rate_limits (
-                user_id BIGINT NOT NULL,
+                user_id INTEGER NOT NULL,
                 action TEXT NOT NULL,
                 window_start TEXT NOT NULL,
                 count INTEGER NOT NULL DEFAULT 1,
@@ -571,40 +601,27 @@ impl Database {
                 PRIMARY KEY (user_id, action, window_start)
             );
             CREATE TABLE IF NOT EXISTS post_hashtags (
-                post_id BIGINT NOT NULL REFERENCES posts(id),
+                post_id INTEGER NOT NULL,
                 tag TEXT NOT NULL,
                 PRIMARY KEY (post_id, tag)
             );
             CREATE TABLE IF NOT EXISTS invitations (
-                id BIGSERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 code_hash TEXT UNIQUE NOT NULL,
                 created_at TEXT NOT NULL,
                 expires_at TEXT NOT NULL,
                 used_at TEXT NOT NULL DEFAULT '',
-                used_by BIGINT REFERENCES users(id) ON DELETE SET NULL
+                used_by INTEGER
             );
-            CREATE INDEX IF NOT EXISTS idx_post_hashtags_tag ON post_hashtags(tag);",
+            CREATE INDEX IF NOT EXISTS idx_post_hashtags_tag ON post_hashtags(tag);
+            CREATE INDEX IF NOT EXISTS idx_posts_created_at ON posts(created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_posts_user ON posts(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_comments_post ON comments(post_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_sender ON messages(sender_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_messages_receiver ON messages(receiver_id, read, created_at);
+            CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
+            CREATE INDEX IF NOT EXISTS idx_rate_limits_user ON rate_limits(user_id, action);",
         )?;
-        // Migrate existing SERIAL/INTEGER columns to BIGINT if they exist
-        conn.batch_execute(
-            "ALTER TABLE users ALTER COLUMN id TYPE BIGINT;
-             ALTER TABLE posts ALTER COLUMN id TYPE BIGINT;
-             ALTER TABLE posts ALTER COLUMN user_id TYPE BIGINT;
-             ALTER TABLE follows ALTER COLUMN follower_id TYPE BIGINT;
-             ALTER TABLE follows ALTER COLUMN following_id TYPE BIGINT;
-             ALTER TABLE comments ALTER COLUMN id TYPE BIGINT;
-             ALTER TABLE comments ALTER COLUMN post_id TYPE BIGINT;
-             ALTER TABLE comments ALTER COLUMN user_id TYPE BIGINT;
-             ALTER TABLE messages ALTER COLUMN id TYPE BIGINT;
-             ALTER TABLE messages ALTER COLUMN sender_id TYPE BIGINT;
-             ALTER TABLE messages ALTER COLUMN receiver_id TYPE BIGINT;
-             ALTER TABLE notifications ALTER COLUMN id TYPE BIGINT;
-             ALTER TABLE notifications ALTER COLUMN user_id TYPE BIGINT;
-             ALTER TABLE notifications ALTER COLUMN from_user_id TYPE BIGINT;
-             ALTER TABLE notifications ADD COLUMN IF NOT EXISTS related_id BIGINT DEFAULT NULL;
-             ALTER TABLE comments ADD COLUMN IF NOT EXISTS parent_comment_id BIGINT DEFAULT NULL;",
-        )
-        .ok();
         Ok(())
     }
 
@@ -615,7 +632,6 @@ impl Database {
         display_name: &str,
         invite_code: Option<&str>,
     ) -> Result<User> {
-        let mut conn = self.pool.get()?;
         let registration_mode = std::env::var("REGISTRATION_MODE")
             .unwrap_or_else(|_| "open".to_string())
             .to_lowercase();
@@ -627,20 +643,22 @@ impl Database {
         }
 
         let username_lower = username.trim().to_lowercase();
-        let mut tx = conn.transaction()?;
         let invitation_id = if registration_mode == "invite" {
             let code = invite_code
                 .map(str::trim)
                 .filter(|code| !code.is_empty())
                 .ok_or_else(|| anyhow::anyhow!("Se requiere un código de invitación."))?;
             let code_hash = invitation_hash(code);
-            let row = tx.query_opt(
-                "SELECT id, expires_at, used_at FROM invitations WHERE code_hash = $1 FOR UPDATE",
-                &[&code_hash],
-            )?;
-            let row = row.ok_or_else(|| anyhow::anyhow!("Código de invitación inválido."))?;
-            let expires_at: String = row.get(1);
-            let used_at: String = row.get(2);
+            let conn = self.conn.lock().unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT id, expires_at, used_at FROM invitations WHERE code_hash = ?1",
+                    rusqlite::params![code_hash],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?)),
+                )
+                .optional()?
+                .ok_or_else(|| anyhow::anyhow!("Código de invitación inválido."))?;
+            let (inv_id, expires_at, used_at) = row;
             if !used_at.is_empty() {
                 anyhow::bail!("Este código de invitación ya fue utilizado.");
             }
@@ -648,7 +666,7 @@ impl Database {
             if Utc::now() >= expiry {
                 anyhow::bail!("Este código de invitación expiró.");
             }
-            Some(row.get::<_, i64>(0))
+            Some(inv_id)
         } else {
             None
         };
@@ -663,15 +681,17 @@ impl Database {
             public_key.as_bytes(),
         );
 
-        let rows = tx.query(
-            "INSERT INTO users (username, password_hash, display_name, utc_offset, created_at, public_key) VALUES ($1, $2, $3, 0, $4, $5) RETURNING id",
-            &[&username_lower, &hash, &display_name, &now, &pk_b64],
+        let id = self.alloc_id()?;
+        let mut conn = self.conn.lock().unwrap();
+        let tx = conn.transaction()?;
+        tx.execute(
+            "INSERT INTO users (id, username, password_hash, display_name, utc_offset, created_at, public_key) VALUES (?1, ?2, ?3, ?4, 0, ?5, ?6)",
+            rusqlite::params![id, username_lower, hash, display_name, now, pk_b64],
         )?;
-        let id: i64 = rows[0].get(0);
         if let Some(invitation_id) = invitation_id {
             tx.execute(
-                "UPDATE invitations SET used_at = $1, used_by = $2 WHERE id = $3",
-                &[&now, &id, &invitation_id],
+                "UPDATE invitations SET used_at = ?1, used_by = ?2 WHERE id = ?3",
+                rusqlite::params![now, id, invitation_id],
             )?;
         }
         tx.commit()?;
@@ -697,63 +717,79 @@ impl Database {
         let code_hash = invitation_hash(&code);
         let now = Utc::now();
         let expires_at = now + chrono::Duration::days(valid_days);
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO invitations (code_hash, created_at, expires_at) VALUES ($1, $2, $3)",
-            &[&code_hash, &now.to_rfc3339(), &expires_at.to_rfc3339()],
+            "INSERT INTO invitations (code_hash, created_at, expires_at) VALUES (?1, ?2, ?3)",
+            rusqlite::params![code_hash, now.to_rfc3339(), expires_at.to_rfc3339()],
         )?;
         Ok(code)
     }
 
     pub fn list_invitations(&self) -> Result<Vec<(i64, String, String, bool, Option<String>)>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT i.id, i.created_at, i.expires_at, i.used_at <> '', u.username
              FROM invitations i LEFT JOIN users u ON u.id = i.used_by ORDER BY i.id DESC",
-            &[],
         )?;
-        Ok(rows
-            .into_iter()
-            .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
-            .collect())
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn revoke_invitation(&self, code: &str) -> Result<bool> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let deleted = conn.execute(
-            "DELETE FROM invitations WHERE code_hash = $1 AND used_at = ''",
-            &[&invitation_hash(code.trim())],
+            "DELETE FROM invitations WHERE code_hash = ?1 AND used_at = ''",
+            rusqlite::params![invitation_hash(code.trim())],
         )?;
         Ok(deleted == 1)
     }
 
     pub fn authenticate(&self, username: &str, password: &str) -> Result<AuthResult> {
-        let conn = self
-            .pool
-            .get()
-            .map_err(|e| anyhow::anyhow!("pool.get failed: {e}"))?;
-        let mut conn = conn;
-        let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash, public_key FROM users WHERE LOWER(username) = LOWER($1)",
-            &[&username],
-        ).map_err(|e| anyhow::anyhow!("query failed: {e}"))?;
-        if let Some(row) = rows.into_iter().next() {
-            let hash: String = row.get(6);
-            if bcrypt::verify(password, &hash).map_err(|e| anyhow::anyhow!("bcrypt failed: {e}"))? {
-                let id: i64 = row.get(0);
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, username, display_name, bio, utc_offset, created_at, password_hash, public_key FROM users WHERE LOWER(username) = LOWER(?1)",
+                rusqlite::params![username],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i32>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                    ))
+                },
+            )
+            .optional()?;
+
+        if let Some((id, uname, dname, bio, utc_offset, created_at, hash, pk)) = row {
+            if bcrypt::verify(password, &hash)
+                .map_err(|e| anyhow::anyhow!("bcrypt failed: {e}"))?
+            {
                 let now = Utc::now().to_rfc3339();
                 conn.execute(
-                    "UPDATE users SET last_login_at = $1, login_count = login_count + 1 WHERE id = $2",
-                    &[&now, &id],
-                ).map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
-                let pk: String = row.get(7);
+                    "UPDATE users SET last_login_at = ?1, login_count = login_count + 1 WHERE id = ?2",
+                    rusqlite::params![now, id],
+                )
+                .map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
                 return Ok(AuthResult::Success(User {
-                    id: row.get(0),
-                    username: row.get(1),
-                    display_name: row.get(2),
-                    bio: row.get(3),
-                    utc_offset: row.get(4),
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
+                    id,
+                    username: uname,
+                    display_name: dname,
+                    bio,
+                    utc_offset,
+                    created_at: created_at.parse().unwrap(),
                     public_key: if pk.is_empty() { None } else { Some(pk) },
                 }));
             } else {
@@ -764,47 +800,59 @@ impl Database {
     }
 
     pub fn get_user_by_id(&self, id: i64) -> Result<Option<User>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE id = $1",
-            &[&id],
-        )?;
-        Ok(rows.into_iter().next().map(|row| User {
-            id: row.get(0),
-            username: row.get(1),
-            display_name: row.get(2),
-            bio: row.get(3),
-            utc_offset: row.get(4),
-            public_key: {
-                let pk: String = row.get(6);
-                if pk.is_empty() { None } else { Some(pk) }
-            },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE id = ?1",
+                rusqlite::params![id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i32>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(|(id, username, display_name, bio, utc_offset, created_at, pk)| User {
+            id,
+            username,
+            display_name,
+            bio,
+            utc_offset,
+            public_key: if pk.is_empty() { None } else { Some(pk) },
+            created_at: created_at.parse().unwrap(),
         }))
     }
 
     pub fn search_users(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<User>> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query);
-        let rows = conn.query(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE username ILIKE $1 OR display_name ILIKE $1 ORDER BY username LIMIT $2 OFFSET $3",
-            &[&pattern, &(limit as i64), &(offset as i64)],
+        let mut stmt = conn.prepare(
+            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE LOWER(username) LIKE LOWER(?1) OR LOWER(display_name) LIKE LOWER(?1) ORDER BY username LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| User {
-                id: row.get(0),
-                username: row.get(1),
-                display_name: row.get(2),
-                bio: row.get(3),
-                utc_offset: row.get(4),
-                public_key: {
-                    let pk: String = row.get(6);
-                    if pk.is_empty() { None } else { Some(pk) }
-                },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-            })
-            .collect())
+        let rows = stmt.query_map(
+            rusqlite::params![pattern, limit as i64, offset as i64],
+            |row| {
+                Ok(User {
+                    id: row.get(0)?,
+                    username: row.get(1)?,
+                    display_name: row.get(2)?,
+                    bio: row.get(3)?,
+                    utc_offset: row.get(4)?,
+                    public_key: {
+                        let pk: String = row.get(6)?;
+                        if pk.is_empty() { None } else { Some(pk) }
+                    },
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn create_post(
@@ -820,39 +868,44 @@ impl Database {
             anyhow::bail!("El post no puede estar vacío");
         }
         self.check_rate_limit(user_id, "post", 5, 60)?;
-        let mut conn = self.pool.get()?;
+        let id = self.alloc_id()?;
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         let img = image_path.unwrap_or("");
-        let rows = conn.query(
-            "INSERT INTO posts (user_id, content, image_path, created_at) VALUES ($1, $2, $3, $4) RETURNING id",
-            &[&user_id, &content, &img, &now],
+        conn.execute(
+            "INSERT INTO posts (id, user_id, content, image_path, created_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![id, user_id, content, img, now],
         )?;
-        let id: i64 = rows[0].get(0);
-        let username: String = conn
-            .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])?
-            .get(0);
+        let username: String = conn.query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )?;
 
         let hashtags = Self::extract_hashtags(content);
         for tag in &hashtags {
             conn.execute(
-                "INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                &[&id, &tag],
+                "INSERT INTO post_hashtags (post_id, tag) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                rusqlite::params![id, tag],
             )?;
         }
 
         let mentioned = Self::extract_mentions(content);
         for mentioned_username in &mentioned {
-            let rows = conn.query(
-                "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
-                &[mentioned_username],
-            )?;
-            if let Some(row) = rows.into_iter().next() {
-                let mentioned_id: i64 = row.get(0);
+            let mentioned_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM users WHERE LOWER(username) = LOWER(?1)",
+                    rusqlite::params![mentioned_username],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(mentioned_id) = mentioned_id {
                 if mentioned_id != user_id {
                     conn.execute(
-                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
-                        &[&mentioned_id, &user_id, &now, &id],
-                    ).ok();
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'mention', ?3, ?4)",
+                        rusqlite::params![mentioned_id, user_id, now, id],
+                    )
+                    .ok();
                 }
             }
         }
@@ -868,44 +921,46 @@ impl Database {
     }
 
     pub fn get_posts_by_hashtag(&self, tag: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let tag_lower = tag.to_lowercase().trim_start_matches('#').to_string();
-        let rows = conn.query(
+        let mut stmt = conn.prepare(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p
              JOIN users u ON u.id = p.user_id
              JOIN post_hashtags ph ON ph.post_id = p.id
-             WHERE LOWER(ph.tag) = $1
+             WHERE LOWER(ph.tag) = ?1
              ORDER BY p.created_at DESC
-             LIMIT $2 OFFSET $3",
-            &[&tag_lower, &(limit as i64), &(offset as i64)],
+             LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
+        let rows = stmt.query_map(
+            rusqlite::params![tag_lower, limit as i64, offset as i64],
+            |row| {
+                let img: String = row.get(4)?;
+                Ok(Post {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    content: row.get(3)?,
                     image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
-            })
-            .collect())
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_trending_hashtags(&self, limit: u64) -> Result<Vec<(String, i64)>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT tag, COUNT(*) as cnt FROM post_hashtags
              GROUP BY tag
              ORDER BY cnt DESC
-             LIMIT $1",
-            &[&(limit as i64)],
+             LIMIT ?1",
         )?;
-        Ok(rows.iter().map(|row| (row.get(0), row.get(1))).collect())
+        let rows = stmt.query_map(rusqlite::params![limit as i64], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     fn extract_hashtags(content: &str) -> Vec<String> {
@@ -969,110 +1024,161 @@ impl Database {
     }
 
     pub fn get_timeline(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p
              JOIN users u ON u.id = p.user_id
-             LEFT JOIN follows f ON f.following_id = p.user_id AND f.follower_id = $1
-             WHERE p.user_id = $1 OR f.follower_id = $1
+             LEFT JOIN follows f ON f.following_id = p.user_id AND f.follower_id = ?1
+             WHERE p.user_id = ?1 OR f.follower_id = ?1
              ORDER BY p.created_at DESC
-             LIMIT $2 OFFSET $3",
-            &[&user_id, &(limit as i64), &(offset as i64)],
+             LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
+        let rows = stmt.query_map(
+            rusqlite::params![user_id, limit as i64, offset as i64],
+            |row| {
+                let img: String = row.get(4)?;
+                Ok(Post {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    content: row.get(3)?,
                     image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
-            })
-            .collect())
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn follow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
         self.check_rate_limit(follower_id, "follow", 10, 60)?;
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-            &[&follower_id, &following_id],
+            "INSERT INTO follows (follower_id, following_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+            rusqlite::params![follower_id, following_id],
         )?;
         Ok(())
     }
 
     pub fn unfollow_user(&self, follower_id: i64, following_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM follows WHERE follower_id = $1 AND following_id = $2",
-            &[&follower_id, &following_id],
+            "DELETE FROM follows WHERE follower_id = ?1 AND following_id = ?2",
+            rusqlite::params![follower_id, following_id],
         )?;
         Ok(())
     }
 
     pub fn is_following(&self, follower_id: i64, following_id: i64) -> Result<bool> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
-            "SELECT 1 FROM follows WHERE follower_id = $1 AND following_id = $2",
-            &[&follower_id, &following_id],
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM follows WHERE follower_id = ?1 AND following_id = ?2",
+            rusqlite::params![follower_id, following_id],
+            |row| row.get(0),
         )?;
-        Ok(!rows.is_empty())
+        Ok(count > 0)
     }
 
     pub fn get_followers(&self, user_id: i64) -> Result<Vec<User>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              JOIN follows f ON f.follower_id = u.id
-             WHERE f.following_id = $1",
-            &[&user_id],
+             WHERE f.following_id = ?1",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| User {
-                id: row.get(0),
-                username: row.get(1),
-                display_name: row.get(2),
-                bio: row.get(3),
-                utc_offset: row.get(4),
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                display_name: row.get(2)?,
+                bio: row.get(3)?,
+                utc_offset: row.get(4)?,
                 public_key: {
-                    let pk: String = row.get(6);
+                    let pk: String = row.get(6)?;
                     if pk.is_empty() { None } else { Some(pk) }
                 },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_posts_by_user(&self, user_id: i64, offset: u64, limit: u64) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
-             WHERE p.user_id = $1
-             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
-            &[&user_id, &(limit as i64), &(offset as i64)],
+             WHERE p.user_id = ?1
+             ORDER BY p.created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
+        let rows = stmt.query_map(
+            rusqlite::params![user_id, limit as i64, offset as i64],
+            |row| {
+                let img: String = row.get(4)?;
+                Ok(Post {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    content: row.get(3)?,
                     image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Busca posts de varios usuarios a la vez (para timeline cross-shard).
+    pub fn get_posts_by_users(&self, user_ids: &[i64], offset: u64, limit: u64) -> Result<Vec<Post>> {
+        if user_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let placeholders: Vec<String> =
+            (1..=user_ids.len()).map(|i| format!("?{}", i)).collect();
+        let sql = format!(
+            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+             FROM posts p JOIN users u ON u.id = p.user_id
+             WHERE p.user_id IN ({})
+             ORDER BY p.created_at DESC LIMIT ?{} OFFSET ?{}",
+            placeholders.join(", "),
+            user_ids.len() + 1,
+            user_ids.len() + 2,
+        );
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(&sql)?;
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(user_ids.len() + 2);
+        for id in user_ids {
+            params.push(id);
+        }
+        let limit_i = limit as i64;
+        let offset_i = offset as i64;
+        params.push(&limit_i);
+        params.push(&offset_i);
+        let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            let img: String = row.get(4)?;
+            Ok(Post {
+                id: row.get(0)?,
+                user_id: row.get(1)?,
+                username: row.get(2)?,
+                content: row.get(3)?,
+                image_path: if img.is_empty() { None } else { Some(img) },
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// ¿Existe un usuario con este nombre en este shard?
+    pub fn user_exists(&self, username: &str) -> Result<bool> {
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM users WHERE LOWER(username) = LOWER(?1)",
+            rusqlite::params![username],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
     }
 
     pub fn search_posts(
@@ -1082,121 +1188,143 @@ impl Database {
         offset: u64,
         limit: u64,
     ) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
-        let interval = match time_filter {
-            "24h" => Some("24 hours"),
-            "7d" => Some("7 days"),
-            "30d" => Some("30 days"),
+        let conn = self.conn.lock().unwrap();
+        let cutoff = match time_filter {
+            "24h" => Some((Utc::now() - chrono::Duration::hours(24)).to_rfc3339()),
+            "7d" => Some((Utc::now() - chrono::Duration::days(7)).to_rfc3339()),
+            "30d" => Some((Utc::now() - chrono::Duration::days(30)).to_rfc3339()),
             _ => None,
         };
-        let has_interval = interval.is_some();
-        let sql = if has_interval {
-            format!(
+        let pattern = format!("%{}%", query);
+        let rows = if let Some(cutoff) = cutoff {
+            let mut stmt = conn.prepare(
                 "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
                  FROM posts p JOIN users u ON u.id = p.user_id
-                 WHERE p.content ILIKE $1 AND p.created_at::timestamptz > NOW() - $2::interval
-                 ORDER BY p.created_at DESC LIMIT $3 OFFSET $4"
-            )
+                 WHERE LOWER(p.content) LIKE LOWER(?1) AND p.created_at > ?2
+                 ORDER BY p.created_at DESC LIMIT ?3 OFFSET ?4",
+            )?;
+            stmt.query_map(
+                rusqlite::params![pattern, cutoff, limit as i64, offset as i64],
+                |row| {
+                    let img: String = row.get(4)?;
+                    Ok(Post {
+                        id: row.get(0)?,
+                        user_id: row.get(1)?,
+                        username: row.get(2)?,
+                        content: row.get(3)?,
+                        image_path: if img.is_empty() { None } else { Some(img) },
+                        created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         } else {
-            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
-             FROM posts p JOIN users u ON u.id = p.user_id
-             WHERE p.content ILIKE $1
-             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3"
-                .to_string()
+            let mut stmt = conn.prepare(
+                "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+                 FROM posts p JOIN users u ON u.id = p.user_id
+                 WHERE LOWER(p.content) LIKE LOWER(?1)
+                 ORDER BY p.created_at DESC LIMIT ?2 OFFSET ?3",
+            )?;
+            stmt.query_map(
+                rusqlite::params![pattern, limit as i64, offset as i64],
+                |row| {
+                    let img: String = row.get(4)?;
+                    Ok(Post {
+                        id: row.get(0)?,
+                        user_id: row.get(1)?,
+                        username: row.get(2)?,
+                        content: row.get(3)?,
+                        image_path: if img.is_empty() { None } else { Some(img) },
+                        created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                    })
+                },
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?
         };
-        let pattern = format!("%{}%", query);
-        let rows = if let Some(iv) = interval {
-            conn.query(&sql, &[&pattern, &iv, &(limit as i64), &(offset as i64)])?
-        } else {
-            conn.query(&sql, &[&pattern, &(limit as i64), &(offset as i64)])?
-        };
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
-                    image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
-            })
-            .collect())
+        Ok(rows)
     }
 
     pub fn search_posts_by_user(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query);
-        let rows = conn.query(
+        let mut stmt = conn.prepare(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
-             WHERE LOWER(u.username) LIKE LOWER($1)
-             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
-            &[&pattern, &(limit as i64), &(offset as i64)],
+             WHERE LOWER(u.username) LIKE LOWER(?1)
+             ORDER BY p.created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
+        let rows = stmt.query_map(
+            rusqlite::params![pattern, limit as i64, offset as i64],
+            |row| {
+                let img: String = row.get(4)?;
+                Ok(Post {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    content: row.get(3)?,
                     image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
-            })
-            .collect())
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn search_posts_by_date(&self, query: &str, offset: u64, limit: u64) -> Result<Vec<Post>> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let pattern = format!("%{}%", query);
-        let rows = conn.query(
+        let mut stmt = conn.prepare(
             "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
              FROM posts p JOIN users u ON u.id = p.user_id
-             WHERE p.created_at ILIKE $1
-             ORDER BY p.created_at DESC LIMIT $2 OFFSET $3",
-            &[&pattern, &(limit as i64), &(offset as i64)],
+             WHERE p.created_at LIKE ?1
+             ORDER BY p.created_at DESC LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| {
-                let img: String = row.get(4);
-                Post {
-                    id: row.get(0),
-                    user_id: row.get(1),
-                    username: row.get(2),
-                    content: row.get(3),
+        let rows = stmt.query_map(
+            rusqlite::params![pattern, limit as i64, offset as i64],
+            |row| {
+                let img: String = row.get(4)?;
+                Ok(Post {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    username: row.get(2)?,
+                    content: row.get(3)?,
                     image_path: if img.is_empty() { None } else { Some(img) },
-                    created_at: row.get::<_, String>(5).parse().unwrap(),
-                }
-            })
-            .collect())
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_post_by_id(&self, post_id: i64) -> Result<Option<Post>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
-            "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
-             FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = $1",
-            &[&post_id],
-        )?;
-        Ok(rows.iter().next().map(|row| Post {
-            id: row.get(0),
-            user_id: row.get(1),
-            username: row.get(2),
-            content: row.get(3),
-            image_path: if let Some(img) = row.get::<_, Option<String>>(4) {
-                if img.is_empty() { None } else { Some(img) }
-            } else {
-                None
+        let conn = self.conn.lock().unwrap();
+        let row = conn
+            .query_row(
+                "SELECT p.id, p.user_id, u.username, p.content, p.image_path, p.created_at
+                 FROM posts p JOIN users u ON u.id = p.user_id WHERE p.id = ?1",
+                rusqlite::params![post_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, String>(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        Ok(row.map(
+            |(id, user_id, username, content, img, created_at)| Post {
+                id,
+                user_id,
+                username,
+                content,
+                image_path: img.filter(|s| !s.is_empty()),
+                created_at: created_at.parse().unwrap(),
             },
-            created_at: row.get::<_, String>(5).parse().unwrap(),
-        }))
+        ))
     }
 
     pub fn add_comment(
@@ -1207,30 +1335,35 @@ impl Database {
         parent_id: Option<i64>,
     ) -> Result<Comment> {
         self.check_rate_limit(user_id, "comment", 10, 60)?;
-        let mut conn = self.pool.get()?;
+        let id = self.alloc_id()?;
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
-        let rows = conn.query(
-            "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            &[&post_id, &user_id, &content, &now, &parent_id],
+        conn.execute(
+            "INSERT INTO comments (id, post_id, user_id, content, created_at, parent_comment_id) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, post_id, user_id, content, now, parent_id],
         )?;
-        let id: i64 = rows[0].get(0);
-        let username: String = conn
-            .query_one("SELECT username FROM users WHERE id = $1", &[&user_id])?
-            .get(0);
+        let username: String = conn.query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )?;
 
         let mentioned = Self::extract_mentions(content);
         for mentioned_username in &mentioned {
-            let rows = conn.query(
-                "SELECT id FROM users WHERE LOWER(username) = LOWER($1)",
-                &[mentioned_username],
-            )?;
-            if let Some(row) = rows.into_iter().next() {
-                let mentioned_id: i64 = row.get(0);
+            let mentioned_id: Option<i64> = conn
+                .query_row(
+                    "SELECT id FROM users WHERE LOWER(username) = LOWER(?1)",
+                    rusqlite::params![mentioned_username],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(mentioned_id) = mentioned_id {
                 if mentioned_id != user_id {
                     conn.execute(
-                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
-                        &[&mentioned_id, &user_id, &now, &post_id],
-                    ).ok();
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'mention', ?3, ?4)",
+                        rusqlite::params![mentioned_id, user_id, now, post_id],
+                    )
+                    .ok();
                 }
             }
         }
@@ -1247,34 +1380,33 @@ impl Database {
     }
 
     pub fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT c.id, c.post_id, c.user_id, u.username, c.content, c.created_at, c.parent_comment_id
              FROM comments c
              JOIN users u ON u.id = c.user_id
-             WHERE c.post_id = $1
+             WHERE c.post_id = ?1
              ORDER BY c.created_at ASC",
-            &[&post_id],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| Comment {
-                id: row.get(0),
-                post_id: row.get(1),
-                user_id: row.get(2),
-                username: row.get(3),
-                content: row.get(4),
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-                parent_comment_id: row.get(6),
+        let rows = stmt.query_map(rusqlite::params![post_id], |row| {
+            Ok(Comment {
+                id: row.get(0)?,
+                post_id: row.get(1)?,
+                user_id: row.get(2)?,
+                username: row.get(3)?,
+                content: row.get(4)?,
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                parent_comment_id: row.get(6)?,
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn update_post(&self, post_id: i64, user_id: i64, content: &str) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "UPDATE posts SET content = $1 WHERE id = $2 AND user_id = $3",
-            &[&content, &post_id, &user_id],
+            "UPDATE posts SET content = ?1 WHERE id = ?2 AND user_id = ?3",
+            rusqlite::params![content, post_id, user_id],
         )?;
         if rows == 0 {
             anyhow::bail!("No tienes permiso para editar este post o no existe");
@@ -1283,11 +1415,15 @@ impl Database {
     }
 
     pub fn delete_post(&self, post_id: i64, user_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
-        conn.execute("DELETE FROM comments WHERE post_id = $1", &[&post_id])?;
+        let conn = self.conn.lock().unwrap();
+        conn.execute("DELETE FROM comments WHERE post_id = ?1", rusqlite::params![post_id])?;
+        conn.execute(
+            "DELETE FROM post_hashtags WHERE post_id = ?1",
+            rusqlite::params![post_id],
+        )?;
         let rows = conn.execute(
-            "DELETE FROM posts WHERE id = $1 AND user_id = $2",
-            &[&post_id, &user_id],
+            "DELETE FROM posts WHERE id = ?1 AND user_id = ?2",
+            rusqlite::params![post_id, user_id],
         )?;
         if rows == 0 {
             anyhow::bail!("No tienes permiso para eliminar este post o no existe");
@@ -1296,10 +1432,10 @@ impl Database {
     }
 
     pub fn delete_comment(&self, comment_id: i64, user_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let rows = conn.execute(
-            "DELETE FROM comments WHERE id = $1 AND user_id = $2",
-            &[&comment_id, &user_id],
+            "DELETE FROM comments WHERE id = ?1 AND user_id = ?2",
+            rusqlite::params![comment_id, user_id],
         )?;
         if rows == 0 {
             anyhow::bail!("No tienes permiso para eliminar este comentario o no existe");
@@ -1308,52 +1444,91 @@ impl Database {
     }
 
     pub fn delete_user(&self, user_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "DELETE FROM follows WHERE follower_id = $1 OR following_id = $1",
-            &[&user_id],
+            "DELETE FROM follows WHERE follower_id = ?1 OR following_id = ?1",
+            rusqlite::params![user_id],
         )?;
         conn.execute(
-            "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)",
-            &[&user_id],
-        )?;
-        conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
-        conn.execute(
-            "DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1",
-            &[&user_id],
+            "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?1)",
+            rusqlite::params![user_id],
         )?;
         conn.execute(
-            "DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1",
-            &[&user_id],
+            "DELETE FROM post_hashtags WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?1)",
+            rusqlite::params![user_id],
         )?;
-        conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
+        conn.execute("DELETE FROM posts WHERE user_id = ?1", rusqlite::params![user_id])?;
+        conn.execute(
+            "DELETE FROM messages WHERE sender_id = ?1 OR receiver_id = ?1",
+            rusqlite::params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM notifications WHERE user_id = ?1 OR from_user_id = ?1",
+            rusqlite::params![user_id],
+        )?;
+        conn.execute(
+            "DELETE FROM rate_limits WHERE user_id = ?1",
+            rusqlite::params![user_id],
+        )?;
+        conn.execute("DELETE FROM users WHERE id = ?1", rusqlite::params![user_id])?;
         Ok(())
     }
 
     pub fn get_following(&self, user_id: i64) -> Result<Vec<User>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              JOIN follows f ON f.following_id = u.id
-             WHERE f.follower_id = $1",
-            &[&user_id],
+             WHERE f.follower_id = ?1",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| User {
-                id: row.get(0),
-                username: row.get(1),
-                display_name: row.get(2),
-                bio: row.get(3),
-                utc_offset: row.get(4),
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                display_name: row.get(2)?,
+                bio: row.get(3)?,
+                utc_offset: row.get(4)?,
                 public_key: {
-                    let pk: String = row.get(6);
+                    let pk: String = row.get(6)?;
                     if pk.is_empty() { None } else { Some(pk) }
                 },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Solo los ids de los usuarios que sigo (sin JOIN, para cross-shard).
+    pub fn get_following_ids(&self, user_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT following_id FROM follows WHERE follower_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Solo los ids de mis seguidores (sin JOIN, para cross-shard).
+    pub fn get_follower_ids(&self, user_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT follower_id FROM follows WHERE following_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// Ids de los interlocutores de una conversación (sin JOIN cross-shard).
+    pub fn get_conversation_partner_ids(&self, user_id: i64) -> Result<Vec<i64>> {
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT CASE WHEN sender_id = ?1 THEN receiver_id ELSE sender_id END
+             FROM messages
+             WHERE sender_id = ?1 OR receiver_id = ?1",
+        )?;
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn send_message(
@@ -1364,16 +1539,18 @@ impl Database {
         encrypted: bool,
     ) -> Result<Message> {
         self.check_rate_limit(sender_id, "message", 10, 60)?;
-        let mut conn = self.pool.get()?;
+        let id = self.alloc_id()?;
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
-        let rows = conn.query(
-            "INSERT INTO messages (sender_id, receiver_id, content, created_at, encrypted) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-            &[&sender_id, &receiver_id, &content, &now, &(encrypted as i32)],
+        conn.execute(
+            "INSERT INTO messages (id, sender_id, receiver_id, content, created_at, encrypted) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![id, sender_id, receiver_id, content, now, encrypted as i32],
         )?;
-        let id: i64 = rows[0].get(0);
-        let username: String = conn
-            .query_one("SELECT username FROM users WHERE id = $1", &[&sender_id])?
-            .get(0);
+        let username: String = conn.query_row(
+            "SELECT username FROM users WHERE id = ?1",
+            rusqlite::params![sender_id],
+            |row| row.get(0),
+        )?;
         Ok(Message {
             id,
             sender_id,
@@ -1387,68 +1564,65 @@ impl Database {
     }
 
     pub fn get_conversations(&self, user_id: i64) -> Result<Vec<User>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT u.id, u.username, u.display_name, u.bio, u.utc_offset, u.created_at, u.public_key
              FROM users u
              WHERE u.id IN (
-                 SELECT DISTINCT CASE WHEN sender_id = $1 THEN receiver_id ELSE sender_id END
+                 SELECT DISTINCT CASE WHEN sender_id = ?1 THEN receiver_id ELSE sender_id END
                  FROM messages
-                 WHERE sender_id = $1 OR receiver_id = $1
+                 WHERE sender_id = ?1 OR receiver_id = ?1
              )
              ORDER BY u.username",
-            &[&user_id],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| User {
-                id: row.get(0),
-                username: row.get(1),
-                display_name: row.get(2),
-                bio: row.get(3),
-                utc_offset: row.get(4),
+        let rows = stmt.query_map(rusqlite::params![user_id], |row| {
+            Ok(User {
+                id: row.get(0)?,
+                username: row.get(1)?,
+                display_name: row.get(2)?,
+                bio: row.get(3)?,
+                utc_offset: row.get(4)?,
                 public_key: {
-                    let pk: String = row.get(6);
+                    let pk: String = row.get(6)?;
                     if pk.is_empty() { None } else { Some(pk) }
                 },
-                created_at: row.get::<_, String>(5).parse().unwrap(),
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_messages(&self, user_id: i64, other_id: i64) -> Result<Vec<Message>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT m.id, m.sender_id, m.receiver_id, u.username, m.content, m.created_at, m.read, m.encrypted
              FROM messages m
-             JOIN users u ON u.id = m.sender_id
-             WHERE (m.sender_id = $1 AND m.receiver_id = $2) OR (m.sender_id = $2 AND m.receiver_id = $1)
+             LEFT JOIN users u ON u.id = m.sender_id
+             WHERE (m.sender_id = ?1 AND m.receiver_id = ?2) OR (m.sender_id = ?2 AND m.receiver_id = ?1)
              ORDER BY m.created_at ASC",
-            &[&user_id, &other_id],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| Message {
-                id: row.get(0),
-                sender_id: row.get(1),
-                receiver_id: row.get(2),
-                sender_username: row.get(3),
-                content: row.get(4),
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-                read: row.get::<_, i32>(6) != 0,
-                encrypted: row.get::<_, i32>(7) != 0,
+        let rows = stmt.query_map(rusqlite::params![user_id, other_id], |row| {
+            Ok(Message {
+                id: row.get(0)?,
+                sender_id: row.get(1)?,
+                receiver_id: row.get(2)?,
+                sender_username: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                content: row.get(4)?,
+                created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                read: row.get::<_, i32>(6)? != 0,
+                encrypted: row.get::<_, i32>(7)? != 0,
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_unread_count(&self, user_id: i64) -> Result<i64> {
-        let mut conn = self.pool.get()?;
-        let count: i64 = conn
-            .query_one(
-                "SELECT COUNT(*) FROM messages WHERE receiver_id = $1 AND read = 0",
-                &[&user_id],
-            )?
-            .get(0);
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM messages WHERE receiver_id = ?1 AND read = 0",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )?;
         Ok(count)
     }
 
@@ -1457,35 +1631,36 @@ impl Database {
         user_id: i64,
         limit: i64,
     ) -> Result<Vec<MessagePreview>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
-            "SELECT sender_id, username, content, created_at, read FROM (
-                 SELECT DISTINCT ON (m.sender_id) m.sender_id, u.username, m.content, m.created_at, m.read
-                 FROM messages m JOIN users u ON u.id = m.sender_id
-                 WHERE m.receiver_id = $1
-                 ORDER BY m.sender_id, m.created_at DESC
-             ) latest
-             ORDER BY created_at DESC
-             LIMIT $2",
-            &[&user_id, &limit],
+let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
+            "SELECT m.sender_id, u.username, m.content, m.created_at, m.read
+             FROM messages m
+             LEFT JOIN users u ON u.id = m.sender_id
+             WHERE m.receiver_id = ?1
+               AND m.id = (
+                   SELECT m2.id FROM messages m2
+                   WHERE m2.receiver_id = ?1 AND m2.sender_id = m.sender_id
+                   ORDER BY m2.created_at DESC, m2.id DESC LIMIT 1
+               )
+             ORDER BY m.created_at DESC LIMIT ?2",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| MessagePreview {
-                sender_id: row.get(0),
-                sender_username: row.get(1),
-                content: row.get(2),
-                created_at: row.get::<_, String>(3).parse().unwrap(),
-                unread: row.get::<_, i32>(4) == 0,
+        let rows = stmt.query_map(rusqlite::params![user_id, limit], |row| {
+            Ok(MessagePreview {
+                sender_id: row.get(0)?,
+                sender_username: row.get::<_, Option<String>>(1)?.unwrap_or_default(),
+                content: row.get(2)?,
+                created_at: row.get::<_, String>(3)?.parse().unwrap(),
+                unread: row.get::<_, i32>(4)? == 0,
             })
-            .collect())
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn mark_messages_read(&self, user_id: i64, other_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE messages SET read = 1 WHERE sender_id = $2 AND receiver_id = $1 AND read = 0",
-            &[&user_id, &other_id],
+            "UPDATE messages SET read = 1 WHERE sender_id = ?2 AND receiver_id = ?1 AND read = 0",
+            rusqlite::params![user_id, other_id],
         )?;
         Ok(())
     }
@@ -1497,20 +1672,20 @@ impl Database {
         bio: &str,
         utc_offset: i32,
     ) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE users SET display_name = $1, bio = $2, utc_offset = $3 WHERE id = $4",
-            &[&display_name, &bio, &utc_offset, &user_id],
+            "UPDATE users SET display_name = ?1, bio = ?2, utc_offset = ?3 WHERE id = ?4",
+            rusqlite::params![display_name, bio, utc_offset, user_id],
         )?;
         Ok(())
     }
 
     #[allow(dead_code)]
     pub fn update_timezone(&self, user_id: i64, utc_offset: i32) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE users SET utc_offset = $1 WHERE id = $2",
-            &[&utc_offset, &user_id],
+            "UPDATE users SET utc_offset = ?1 WHERE id = ?2",
+            rusqlite::params![utc_offset, user_id],
         )?;
         Ok(())
     }
@@ -1522,11 +1697,11 @@ impl Database {
         notif_type: &str,
         related_id: Option<i64>,
     ) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let now = Utc::now().to_rfc3339();
         conn.execute(
-            "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, $3, $4, $5)",
-            &[&user_id, &from_user_id, &notif_type, &now, &related_id],
+            "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![user_id, from_user_id, notif_type, now, related_id],
         )?;
         Ok(())
     }
@@ -1537,213 +1712,302 @@ impl Database {
         offset: u64,
         limit: u64,
     ) -> Result<Vec<Notification>> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let mut stmt = conn.prepare(
             "SELECT n.id, n.user_id, n.from_user_id, u.username, n.type, n.created_at, n.read, n.related_id
              FROM notifications n
-             JOIN users u ON u.id = n.from_user_id
-             WHERE n.user_id = $1
+             LEFT JOIN users u ON u.id = n.from_user_id
+             WHERE n.user_id = ?1
              ORDER BY n.created_at DESC
-             LIMIT $2 OFFSET $3",
-            &[&user_id, &(limit as i64), &(offset as i64)],
+             LIMIT ?2 OFFSET ?3",
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| Notification {
-                id: row.get(0),
-                user_id: row.get(1),
-                from_user_id: row.get(2),
-                from_username: row.get(3),
-                notif_type: row.get(4),
-                created_at: row.get::<_, String>(5).parse().unwrap(),
-                read: row.get::<_, i32>(6) != 0,
-                related_id: row.get(7),
-            })
-            .collect())
+        let rows = stmt.query_map(
+            rusqlite::params![user_id, limit as i64, offset as i64],
+            |row| {
+                Ok(Notification {
+                    id: row.get(0)?,
+                    user_id: row.get(1)?,
+                    from_user_id: row.get(2)?,
+                    from_username: row.get::<_, Option<String>>(3)?.unwrap_or_default(),
+                    notif_type: row.get(4)?,
+                    created_at: row.get::<_, String>(5)?.parse().unwrap(),
+                    read: row.get::<_, i32>(6)? != 0,
+                    related_id: row.get(7)?,
+                })
+            },
+        )?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     pub fn get_unread_notifications_count(&self, user_id: i64) -> Result<i64> {
-        let mut conn = self.pool.get()?;
-        let count: i64 = conn
-            .query_one(
-                "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = 0",
-                &[&user_id],
-            )?
-            .get(0);
+        let conn = self.conn.lock().unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM notifications WHERE user_id = ?1 AND read = 0",
+            rusqlite::params![user_id],
+            |row| row.get(0),
+        )?;
         Ok(count)
     }
 
     pub fn mark_notifications_read(&self, user_id: i64) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         conn.execute(
-            "UPDATE notifications SET read = 1 WHERE user_id = $1 AND read = 0",
-            &[&user_id],
+            "UPDATE notifications SET read = 1 WHERE user_id = ?1 AND read = 0",
+            rusqlite::params![user_id],
         )?;
         Ok(())
     }
 
     pub fn cleanup_old_data(&self, days: i64) -> Result<(u64, u64)> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
         let msgs = conn.execute(
-            "DELETE FROM messages WHERE created_at::timestamptz < NOW() - make_interval(days => $1)",
-            &[&days],
+            "DELETE FROM messages WHERE created_at < ?1",
+            rusqlite::params![cutoff],
         )?;
         let notifs = conn.execute(
-            "DELETE FROM notifications WHERE created_at::timestamptz < NOW() - make_interval(days => $1)",
-            &[&days],
+            "DELETE FROM notifications WHERE created_at < ?1",
+            rusqlite::params![cutoff],
         )?;
         let rl = conn.execute(
-            "DELETE FROM rate_limits WHERE window_start::timestamptz < NOW() - make_interval(days => $1)",
-            &[&days],
+            "DELETE FROM rate_limits WHERE window_start < ?1",
+            rusqlite::params![cutoff],
         )?;
-        Ok((msgs + rl, notifs))
+        Ok(((msgs + rl) as u64, notifs as u64))
     }
 
     pub fn cleanup_inactive_users(&self, inactive_days: i64) -> Result<u64> {
-        let mut conn = self.pool.get()?;
-        let rows = conn.query(
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::days(inactive_days)).to_rfc3339();
+        let mut stmt = conn.prepare(
             "SELECT id FROM users
-             WHERE (login_count = 0 AND created_at::timestamptz < NOW() - make_interval(days => $1))
-                OR (login_count > 0 AND last_login_at::timestamptz < NOW() - make_interval(days => $1))",
-            &[&inactive_days],
+             WHERE (login_count = 0 AND created_at < ?1)
+                OR (login_count > 0 AND last_login_at < ?1)",
         )?;
+        let ids: Vec<i64> = stmt
+            .query_map(rusqlite::params![cutoff], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
         let mut deleted = 0u64;
-        for row in &rows {
-            let user_id: i64 = row.get(0);
+        for user_id in ids {
             conn.execute(
-                "DELETE FROM follows WHERE follower_id = $1 OR following_id = $1",
-                &[&user_id],
+                "DELETE FROM follows WHERE follower_id = ?1 OR following_id = ?1",
+                rusqlite::params![user_id],
             )?;
             conn.execute(
-                "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)",
-                &[&user_id],
-            )?;
-            conn.execute("DELETE FROM comments WHERE user_id = $1", &[&user_id])?;
-            conn.execute("DELETE FROM post_hashtags WHERE post_id IN (SELECT id FROM posts WHERE user_id = $1)", &[&user_id])?;
-            conn.execute("DELETE FROM posts WHERE user_id = $1", &[&user_id])?;
-            conn.execute(
-                "DELETE FROM messages WHERE sender_id = $1 OR receiver_id = $1",
-                &[&user_id],
+                "DELETE FROM comments WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?1)",
+                rusqlite::params![user_id],
             )?;
             conn.execute(
-                "DELETE FROM notifications WHERE user_id = $1 OR from_user_id = $1",
-                &[&user_id],
+                "DELETE FROM comments WHERE user_id = ?1",
+                rusqlite::params![user_id],
             )?;
-            conn.execute("DELETE FROM rate_limits WHERE user_id = $1", &[&user_id])?;
-            conn.execute("DELETE FROM users WHERE id = $1", &[&user_id])?;
+            conn.execute(
+                "DELETE FROM post_hashtags WHERE post_id IN (SELECT id FROM posts WHERE user_id = ?1)",
+                rusqlite::params![user_id],
+            )?;
+            conn.execute("DELETE FROM posts WHERE user_id = ?1", rusqlite::params![user_id])?;
+            conn.execute(
+                "DELETE FROM messages WHERE sender_id = ?1 OR receiver_id = ?1",
+                rusqlite::params![user_id],
+            )?;
+            conn.execute(
+                "DELETE FROM notifications WHERE user_id = ?1 OR from_user_id = ?1",
+                rusqlite::params![user_id],
+            )?;
+            conn.execute(
+                "DELETE FROM rate_limits WHERE user_id = ?1",
+                rusqlite::params![user_id],
+            )?;
+            conn.execute("DELETE FROM users WHERE id = ?1", rusqlite::params![user_id])?;
             deleted += 1;
         }
         Ok(deleted)
     }
 
     pub fn get_public_key(&self, user_id: i64) -> Result<Option<String>> {
-        let mut conn = self.pool.get()?;
-        let row = conn.query_opt("SELECT public_key FROM users WHERE id = $1", &[&user_id])?;
-        Ok(row.and_then(|r| {
-            let pk: String = r.get(0);
-            if pk.is_empty() { None } else { Some(pk) }
-        }))
+        let conn = self.conn.lock().unwrap();
+        let pk: Option<String> = conn
+            .query_row(
+                "SELECT public_key FROM users WHERE id = ?1",
+                rusqlite::params![user_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(pk.and_then(|pk| if pk.is_empty() { None } else { Some(pk) }))
+    }
+
+    /// Copia todas las tablas de otro archivo SQLite a este (para condensar).
+    /// Los ids globales se conservan tal cual, por lo que no hay colisiones
+    /// entre shards (cada shard usa un rango de ids distinto).
+    pub fn merge_from_file(&self, source_path: &str) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "ATTACH DATABASE ?1 AS src",
+            rusqlite::params![source_path],
+        )?;
+        let tables = [
+            "users",
+            "posts",
+            "follows",
+            "comments",
+            "messages",
+            "notifications",
+            "rate_limits",
+            "post_hashtags",
+            "invitations",
+        ];
+        for table in tables {
+            let sql = format!(
+                "INSERT OR IGNORE INTO main.{t} SELECT * FROM src.{t}",
+                t = table
+            );
+            conn.execute(&sql, [])?;
+        }
+        conn.execute("DETACH DATABASE src", [])?;
+        Ok(())
+    }
+
+    /// Ajusta el contador de ids tras una fusión para que los nuevos ids
+    /// no colisionen con los ya existentes.
+    pub fn finalize_merge(&self) -> Result<()> {
+        let conn = self.conn.lock().unwrap();
+        let max_id: i64 = conn.query_row(
+            "SELECT MAX(m) FROM (
+                 SELECT COALESCE(MAX(id), 0) AS m FROM users
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM posts
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM comments
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM messages
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM notifications
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let local = max_id - self.id_base;
+        if local > 0 {
+            conn.execute(
+                "UPDATE meta SET v = ?1 WHERE k = 'next_id'",
+                rusqlite::params![local],
+            )?;
+        }
+        Ok(())
     }
 
     pub fn clear_image_from_posts(&self, path: &str) -> Result<u64> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let n = conn.execute(
-            "UPDATE posts SET image_path = '' WHERE image_path = $1",
-            &[&path],
+            "UPDATE posts SET image_path = '' WHERE image_path = ?1",
+            rusqlite::params![path],
         )?;
-        Ok(n)
+        Ok(n as u64)
     }
 
     pub fn cleanup_rate_limits(&self) -> Result<u64> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
+        let cutoff = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         let deleted = conn.execute(
-            "DELETE FROM rate_limits WHERE window_start::timestamptz < NOW() - interval '1 hour'",
-            &[],
+            "DELETE FROM rate_limits WHERE window_start < ?1",
+            rusqlite::params![cutoff],
         )?;
-        Ok(deleted)
+        Ok(deleted as u64)
     }
 
     pub fn export_user_data(&self, username: &str) -> Result<String> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let username_lower = username.trim().to_lowercase();
-        let user_row = conn.query_opt(
-            "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE LOWER(username) = LOWER($1)",
-            &[&username_lower],
-        )?.ok_or_else(|| anyhow::anyhow!("Usuario '{}' no encontrado", username))?;
+        let user_row = conn
+            .query_row(
+                "SELECT id, username, display_name, bio, utc_offset, created_at, public_key FROM users WHERE LOWER(username) = LOWER(?1)",
+                rusqlite::params![username_lower],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i32>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| anyhow::anyhow!("Usuario '{}' no encontrado", username))?;
 
-        let user_id: i64 = user_row.get(0);
+        let (user_id, uname, dname, bio, utc_offset, created_at, _pk) = user_row;
         let user = serde_json::json!({
             "id": user_id,
-            "username": user_row.get::<_, String>(1),
-            "display_name": user_row.get::<_, String>(2),
-            "bio": user_row.get::<_, String>(3),
-            "utc_offset": user_row.get::<_, i32>(4),
-            "created_at": user_row.get::<_, String>(5),
+            "username": uname,
+            "display_name": dname,
+            "bio": bio,
+            "utc_offset": utc_offset,
+            "created_at": created_at,
         });
 
-        let posts_rows = conn.query(
-            "SELECT id, content, image_path, created_at FROM posts WHERE user_id = $1 ORDER BY created_at DESC",
-            &[&user_id],
+        let mut stmt = conn.prepare(
+            "SELECT id, content, image_path, created_at FROM posts WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let posts: Vec<serde_json::Value> = posts_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.get::<_, i64>(0),
-                    "content": r.get::<_, String>(1),
-                    "image_path": r.get::<_, String>(2),
-                    "created_at": r.get::<_, String>(3),
-                })
-            })
-            .collect();
+        let posts: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![user_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "content": r.get::<_, String>(1)?,
+                    "image_path": r.get::<_, String>(2)?,
+                    "created_at": r.get::<_, String>(3)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        let comments_rows = conn.query(
-            "SELECT id, post_id, content, created_at FROM comments WHERE user_id = $1 ORDER BY created_at DESC",
-            &[&user_id],
+        let mut stmt = conn.prepare(
+            "SELECT id, post_id, content, created_at FROM comments WHERE user_id = ?1 ORDER BY created_at DESC",
         )?;
-        let comments: Vec<serde_json::Value> = comments_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.get::<_, i64>(0),
-                    "post_id": r.get::<_, i64>(1),
-                    "content": r.get::<_, String>(2),
-                    "created_at": r.get::<_, String>(3),
-                })
-            })
-            .collect();
+        let comments: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![user_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "post_id": r.get::<_, i64>(1)?,
+                    "content": r.get::<_, String>(2)?,
+                    "created_at": r.get::<_, String>(3)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        let msgs_rows = conn.query(
+        let mut stmt = conn.prepare(
             "SELECT m.id, m.sender_id, m.receiver_id, m.content, m.created_at, u.username as sender_name
              FROM messages m JOIN users u ON u.id = m.sender_id
-             WHERE m.sender_id = $1 OR m.receiver_id = $1 ORDER BY m.created_at ASC",
-            &[&user_id],
+             WHERE m.sender_id = ?1 OR m.receiver_id = ?1 ORDER BY m.created_at ASC",
         )?;
-        let messages: Vec<serde_json::Value> = msgs_rows
-            .iter()
-            .map(|r| {
-                serde_json::json!({
-                    "id": r.get::<_, i64>(0),
-                    "sender_id": r.get::<_, i64>(1),
-                    "receiver_id": r.get::<_, i64>(2),
-                    "sender_username": r.get::<_, String>(5),
-                    "content": r.get::<_, String>(3),
-                    "created_at": r.get::<_, String>(4),
-                })
-            })
-            .collect();
+        let messages: Vec<serde_json::Value> = stmt
+            .query_map(rusqlite::params![user_id], |r| {
+                Ok(serde_json::json!({
+                    "id": r.get::<_, i64>(0)?,
+                    "sender_id": r.get::<_, i64>(1)?,
+                    "receiver_id": r.get::<_, i64>(2)?,
+                    "sender_username": r.get::<_, String>(5)?,
+                    "content": r.get::<_, String>(3)?,
+                    "created_at": r.get::<_, String>(4)?,
+                }))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        let followers_rows = conn.query(
-            "SELECT u.username FROM users u JOIN follows f ON f.follower_id = u.id WHERE f.following_id = $1",
-            &[&user_id],
+        let mut stmt = conn.prepare(
+            "SELECT u.username FROM users u JOIN follows f ON f.follower_id = u.id WHERE f.following_id = ?1",
         )?;
-        let followers: Vec<String> = followers_rows.iter().map(|r| r.get(0)).collect();
+        let followers: Vec<String> = stmt
+            .query_map(rusqlite::params![user_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
-        let following_rows = conn.query(
-            "SELECT u.username FROM users u JOIN follows f ON f.following_id = u.id WHERE f.follower_id = $1",
-            &[&user_id],
+        let mut stmt = conn.prepare(
+            "SELECT u.username FROM users u JOIN follows f ON f.following_id = u.id WHERE f.follower_id = ?1",
         )?;
-        let following: Vec<String> = following_rows.iter().map(|r| r.get(0)).collect();
+        let following: Vec<String> = stmt
+            .query_map(rusqlite::params![user_id], |r| r.get(0))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        drop(stmt);
 
         let export = serde_json::json!({
             "exported_at": Utc::now().to_rfc3339(),
@@ -1758,19 +2022,41 @@ impl Database {
         let json_str = serde_json::to_string_pretty(&export)?;
         let timestamp = Utc::now().format("%Y%m%d_%H%M%S");
         let filename = format!("export_{}_{}.json", username_lower, timestamp);
-        let path = format!("/data/uploads/{}", filename);
-        std::fs::create_dir_all("/data/uploads").ok();
-        std::fs::write(&path, &json_str)?;
-        Ok(filename)
+
+        // Prueba varios directorios en orden y usa el primero que sea
+        // escribible (útil si /data existe pero no es escribible).
+        let mut roots: Vec<String> = Vec::new();
+        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR") {
+            if !d.is_empty() {
+                roots.push(d);
+            }
+        }
+        roots.push("/data/uploads".to_string());
+        roots.push("./uploads".to_string());
+
+        let mut last_err: Option<std::io::Error> = None;
+        for root in &roots {
+            if std::fs::create_dir_all(root).is_err() {
+                continue;
+            }
+            let path = format!("{}/{}", root, filename);
+            match std::fs::write(&path, &json_str) {
+                Ok(()) => return Ok(filename),
+                Err(e) => last_err = Some(e),
+            }
+        }
+        Err(last_err
+            .map(anyhow::Error::from)
+            .unwrap_or_else(|| anyhow::anyhow!("No se pudo escribir el export")))
     }
 
     pub fn seed_data(&self) -> Result<()> {
-        let mut conn = self.pool.get()?;
+        let conn = self.conn.lock().unwrap();
         let now = chrono::Utc::now();
         let ago = |mins: i64| (now - chrono::Duration::minutes(mins)).to_rfc3339();
 
         // Clean existing data
-        conn.batch_execute("
+        conn.execute_batch("
             DELETE FROM notifications; DELETE FROM messages; DELETE FROM post_hashtags;
             DELETE FROM comments; DELETE FROM posts; DELETE FROM follows; DELETE FROM rate_limits; DELETE FROM users;
         ").map_err(|e| anyhow::anyhow!("Error limpiando datos: {}", e))?;
@@ -1840,12 +2126,11 @@ impl Database {
             } else {
                 ago(60 * 24 * 7 + i as i64 * 120)
             };
-            let row = conn.query_opt(
-                "INSERT INTO users (username, password_hash, display_name, created_at, last_login_at, login_count) VALUES ($1, $2, $3, $4, $4, 1) RETURNING id",
-                &[&uname.to_string(), &hash, &dname.to_string(), &created],
-            ).map_err(|e| anyhow::anyhow!("Error insertando usuario {}: {}", uname, e))?
-            .ok_or_else(|| anyhow::anyhow!("INSERT no retornó fila para usuario {}", uname))?;
-            let id: i64 = row.get(0);
+            conn.execute(
+                "INSERT INTO users (username, password_hash, display_name, created_at, last_login_at, login_count) VALUES (?1, ?2, ?3, ?4, ?4, 1)",
+                rusqlite::params![uname.to_string(), hash, dname.to_string(), created],
+            ).map_err(|e| anyhow::anyhow!("Error insertando usuario {}: {}", uname, e))?;
+            let id = conn.last_insert_rowid();
             uids.push(id);
         }
 
@@ -1853,8 +2138,8 @@ impl Database {
         for idx in [50, 51] {
             if let Some(&uid) = uids.get(idx) {
                 conn.execute(
-                    "UPDATE users SET login_count = 0, last_login_at = created_at WHERE id = $1",
-                    &[&uid],
+                    "UPDATE users SET login_count = 0, last_login_at = created_at WHERE id = ?1",
+                    rusqlite::params![uid],
                 )?;
             }
         }
@@ -2033,8 +2318,8 @@ impl Database {
         ];
         for (f, t) in &follows {
             conn.execute(
-                "INSERT INTO follows (follower_id, following_id) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                &[&uids[*f], &uids[*t]],
+                "INSERT INTO follows (follower_id, following_id) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                rusqlite::params![uids[*f], uids[*t]],
             ).ok();
         }
 
@@ -2216,18 +2501,17 @@ impl Database {
             let mins_ago = (250 - pi) as i64 * 80 + (uid_idx as i64 * 13);
             let ts = ago(mins_ago);
 
-            let row = conn.query_opt(
-                "INSERT INTO posts (user_id, content, created_at) VALUES ($1, $2, $3) RETURNING id",
-                &[&uid, &content.to_string(), &ts],
-            ).map_err(|e| anyhow::anyhow!("Error insertando post {} (user {}): {}", pi, uid, e))?
-            .ok_or_else(|| anyhow::anyhow!("INSERT post no retornó fila para post {} user {}", pi, uid))?;
-            let pid: i64 = row.get(0);
+            conn.execute(
+                "INSERT INTO posts (user_id, content, created_at) VALUES (?1, ?2, ?3)",
+                rusqlite::params![uid, content.to_string(), ts],
+            ).map_err(|e| anyhow::anyhow!("Error insertando post {} (user {}): {}", pi, uid, e))?;
+            let pid = conn.last_insert_rowid();
             pids.push(pid);
 
             for tag in *tags {
                 conn.execute(
-                    "INSERT INTO post_hashtags (post_id, tag) VALUES ($1, $2) ON CONFLICT DO NOTHING",
-                    &[&pid, &tag.to_lowercase().to_string()],
+                    "INSERT INTO post_hashtags (post_id, tag) VALUES (?1, ?2) ON CONFLICT DO NOTHING",
+                    rusqlite::params![pid, tag.to_lowercase().to_string()],
                 ).ok();
             }
 
@@ -2237,8 +2521,8 @@ impl Database {
                 if mentioned_idx != uid_idx {
                     let muid = uids[mentioned_idx];
                     conn.execute(
-                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'mention', $3, $4)",
-                        &[&muid, &uid, &ts, &pid],
+                        "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'mention', ?3, ?4)",
+                        rusqlite::params![muid, uid, ts, pid],
                     ).ok();
                 }
             }
@@ -2281,12 +2565,12 @@ impl Database {
 
             let ts = ago((160i64 - ci as i64) * 60 + (commenter_idx as i64 * 5));
 
-            let row = conn.query_one(
-                "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES ($1, $2, $3, $4, $5) RETURNING id",
-                &[&pid, &uid, &text.to_string(), &ts, &parent],
-            ).ok();
-            if let Some(r) = row {
-                comment_id = r.get(0);
+            let res = conn.execute(
+                "INSERT INTO comments (post_id, user_id, content, created_at, parent_comment_id) VALUES (?1, ?2, ?3, ?4, ?5)",
+                rusqlite::params![pid, uid, text.to_string(), ts, parent],
+            );
+            if res.is_ok() {
+                comment_id = conn.last_insert_rowid();
             } else {
                 comment_id += 1;
             }
@@ -2316,8 +2600,8 @@ impl Database {
                 let (sender, receiver) = if *from_a { (a, b) } else { (b, a) };
                 let ts = ago(60 * 24 * 14 - pair_idx as i64 * 500 - mi as i64 * 120);
                 conn.execute(
-                    "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES ($1, $2, $3, $4)",
-                    &[&sender, &receiver, &text.to_string(), &ts],
+                    "INSERT INTO messages (sender_id, receiver_id, content, created_at) VALUES (?1, ?2, ?3, ?4)",
+                    rusqlite::params![sender, receiver, text.to_string(), ts],
                 ).ok();
                 msg_count += 1;
             }
@@ -2327,9 +2611,33 @@ impl Database {
         for (f, t) in follows.iter().take(60) {
             let ts = ago(60 * 24 * 10 - *f as i64 * 30);
             conn.execute(
-                "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES ($1, $2, 'follow', $3, $4)",
-                &[&uids[*t], &uids[*f], &ts, &uids[*f]],
+                "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'follow', ?3, ?4)",
+                rusqlite::params![uids[*t], uids[*f], ts, uids[*f]],
             ).ok();
+        }
+
+        // Sincroniza el contador global de ids con el máximo de TODAS las
+        // tablas con ids (users, posts, comments, messages, notifications).
+        // `alloc_id()` usa un contador único compartido, así que debe quedar
+        // por encima de cualquier id ya insertado por AUTOINCREMENT en el seed.
+        if let Ok(max_id) = conn.query_row(
+            "SELECT MAX(m) FROM (
+                 SELECT COALESCE(MAX(id), 0) AS m FROM users
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM posts
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM comments
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM messages
+                 UNION ALL SELECT COALESCE(MAX(id), 0) FROM notifications
+             )",
+            [],
+            |row| row.get::<_, i64>(0),
+        ) {
+            let local = max_id - self.id_base;
+            if local > 0 {
+                let _ = conn.execute(
+                    "UPDATE meta SET v = ?1 WHERE k = 'next_id'",
+                    rusqlite::params![local],
+                );
+            }
         }
 
         println!(
@@ -3077,6 +3385,22 @@ pub(crate) mod mock_db {
             }
             Ok(count)
         }
+
+        fn create_invitation(&self, _valid_days: i64) -> Result<String> {
+            Ok("MOCKINVITE".to_string())
+        }
+
+        fn list_invitations(&self) -> Result<Vec<(i64, String, String, bool, Option<String>)>> {
+            Ok(Vec::new())
+        }
+
+        fn revoke_invitation(&self, _code: &str) -> Result<bool> {
+            Ok(true)
+        }
+
+        fn seed_data(&self) -> Result<()> {
+            Ok(())
+        }
     }
 
     #[cfg(test)]
@@ -3376,3 +3700,4 @@ pub(crate) mod mock_db {
         }
     }
 }
+

@@ -8,7 +8,7 @@ mod firewall;
 mod i18n;
 mod models;
 mod plugins;
-mod rpc;
+mod shard;
 mod ssh;
 mod theme;
 
@@ -21,7 +21,7 @@ struct Cli {
     #[arg(long, default_value = "2222")]
     port: u16,
 
-    #[arg(long, default_value = "postgres://social:agora@localhost:5433/social")]
+    #[arg(long, default_value = "agora.db")]
     db: String,
 
     #[arg(long, default_value = "host_key")]
@@ -58,9 +58,9 @@ struct Cli {
     #[arg(long)]
     invite_revoke: Option<String>,
 
-    /// Ejecuta el backend local JSONL para la interfaz OpenTUI.
-    #[arg(long, hide = true)]
-    rpc: bool,
+    /// Fusiona todos los shards del mesh en un único archivo principal.
+    #[arg(long)]
+    condense: bool,
 }
 
 fn setup_logging(log_file: &str, stderr: bool) {
@@ -97,14 +97,21 @@ fn setup_logging(log_file: &str, stderr: bool) {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    setup_logging(&cli.log, !cli.tui && !cli.export && !cli.rpc);
+    setup_logging(&cli.log, !cli.tui && !cli.export);
 
     let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
     let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
 
-    if cli.rpc {
-        let database = db::Database::new(&db_url)?;
-        return rpc::run(database);
+    if cli.condense {
+        let n = shard::shard_count();
+        if n <= 1 {
+            println!("No hay shards que condensar (AGORA_DB_SHARDS={}).", n);
+            return Ok(());
+        }
+        let sm = shard::ShardManager::new(&db_url, n)?;
+        let result = sm.condense()?;
+        println!("Mesh condensado en: {}", result);
+        return Ok(());
     }
 
     let admin_actions = usize::from(cli.invite_create)
@@ -114,7 +121,7 @@ fn main() -> Result<()> {
         anyhow::bail!("Usa una sola acción de invitaciones a la vez.");
     }
     if admin_actions == 1 {
-        let database = db::Database::new(&db_url)?;
+        let database = shard::open_database(&db_url)?;
         if cli.invite_create {
             let code = database.create_invitation(cli.invite_days)?;
             println!("Invitación creada (válida {} días):", cli.invite_days);
@@ -143,7 +150,7 @@ fn main() -> Result<()> {
     }
 
     if cli.export {
-        let database = db::Database::new(&db_url)?;
+        let database = shard::open_database(&db_url)?;
         let username = cli.user.as_deref().unwrap_or("");
         if username.is_empty() {
             anyhow::bail!("Debes especificar --user <username> para exportar");
@@ -155,7 +162,7 @@ fn main() -> Result<()> {
     }
 
     if cli.seed {
-        let database = db::Database::new(&db_url)?;
+        let database = shard::open_database(&db_url)?;
         database.seed_data()?;
         println!("Datos de ejemplo insertados.");
         return Ok(());
@@ -172,7 +179,7 @@ fn main() -> Result<()> {
                 "⚠  SSH_PASSWORD no configurada. Usando contraseña por defecto: \"agora\". Configurá SSH_PASSWORD para producción."
             );
         }
-        let database = Arc::new(db::Database::new(&db_url)?);
+        let database: Arc<dyn db::DatabaseOps> = Arc::from(shard::open_database(&db_url)?);
         database.cleanup_old_data(90).ok();
         spawn_cleanup_thread(database.clone());
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -191,7 +198,7 @@ fn main() -> Result<()> {
 }
 
 async fn run_server(
-    db: Arc<db::Database>,
+    db: Arc<dyn db::DatabaseOps>,
     db_url: String,
     port: u16,
     key: String,
@@ -202,7 +209,7 @@ async fn run_server(
     Ok(())
 }
 
-fn spawn_cleanup_thread(db: Arc<db::Database>) {
+fn spawn_cleanup_thread(db: Arc<dyn db::DatabaseOps>) {
     std::thread::spawn(move || {
         loop {
             std::thread::sleep(std::time::Duration::from_secs(86400));

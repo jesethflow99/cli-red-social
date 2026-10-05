@@ -3,15 +3,15 @@ set -euo pipefail
 
 if [[ $# -lt 2 || "$2" != "--yes" ]]; then
   echo "Uso: $0 <directorio-backup> --yes" >&2
-  echo "La restauración reemplaza los datos actuales de PostgreSQL." >&2
+  echo "La restauración reemplaza los datos actuales de SQLite." >&2
   exit 2
 fi
 
 backup_dir="${1%/}"
-dump_file="$backup_dir/database.dump"
+db_file="$backup_dir/agora.db"
 
-if [[ ! -f "$dump_file" || ! -f "$backup_dir/SHA256SUMS" ]]; then
-  echo "El respaldo no contiene database.dump y SHA256SUMS." >&2
+if [[ ! -f "$db_file" || ! -f "$backup_dir/SHA256SUMS" ]]; then
+  echo "El respaldo no contiene agora.db y SHA256SUMS." >&2
   exit 1
 fi
 
@@ -21,21 +21,16 @@ fi
 )
 
 echo "Deteniendo instancias de Agora durante la restauración..."
-docker compose stop agora1 agora2 agora3
+docker compose stop agora
 
 restart_agora() {
-  docker compose start agora1 agora2 agora3 >/dev/null
+  docker compose start agora >/dev/null
 }
 trap restart_agora EXIT
 
-echo "Restaurando PostgreSQL..."
-docker compose exec -T db pg_restore \
-  --username social \
-  --dbname social \
-  --clean \
-  --if-exists \
-  --no-owner \
-  --no-privileges < "$dump_file"
+echo "Restaurando base de datos SQLite..."
+rm -f data/agora.db data/agora.db-wal data/agora.db-shm
+cp "$db_file" data/agora.db
 
 if [[ -f "$backup_dir/uploads.tar.gz" ]]; then
   echo "Restaurando imágenes..."
@@ -44,6 +39,6 @@ if [[ -f "$backup_dir/uploads.tar.gz" ]]; then
 fi
 
 echo "Reiniciando Agora..."
-docker compose start agora1 agora2 agora3
+docker compose start agora
 trap - EXIT
 echo "Restauración completada."

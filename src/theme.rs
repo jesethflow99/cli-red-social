@@ -16,6 +16,7 @@ pub struct AppTheme {
     pub header_style: Style,
     pub status_bar_bg: Color,
     pub status_bar_fg: Color,
+    pub section_accents: [Color; 5],
 }
 
 impl AppTheme {
@@ -47,7 +48,15 @@ impl AppTheme {
     }
 
     pub fn highlight(&self) -> Style {
-        Style::default().bg(self.highlight_bg)
+        Style::default()
+            .fg(self.accent)
+            .add_modifier(Modifier::BOLD)
+    }
+
+    /// Color de acento por sección del sidebar (INICIO, EXPLORAR, MENSAJES,
+    /// ALERTAS, PERFIL), en el mismo orden que `Screen`-groups en app.rs.
+    pub fn section_accent(&self, index: usize) -> Color {
+        self.section_accents[index % self.section_accents.len()]
     }
 }
 
@@ -70,6 +79,13 @@ impl Default for AppTheme {
                 .add_modifier(Modifier::BOLD),
             status_bar_bg: Color::Rgb(18, 18, 24),
             status_bar_fg: Color::Gray,
+            section_accents: [
+                Color::Cyan,
+                Color::Magenta,
+                Color::Blue,
+                Color::Yellow,
+                Color::Green,
+            ],
         }
     }
 }

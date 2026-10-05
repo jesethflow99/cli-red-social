@@ -1,117 +1,23 @@
 services:
-  # ── Balanceador ──────────────────────────────────────
-  nginx:
-    image: nginx:alpine
-    container_name: agora-nginx
+  # ── AGORA (instancia única, SQLite embebido) ───────────
+  agora:
+    build: .
     restart: unless-stopped
     ports:
       - "${SSH_PORT:-2222}:2222"
     volumes:
-      - ./nginx.conf:/etc/nginx/nginx.conf:ro
-    depends_on:
-      - agora1
-      - agora2
-      - agora3
-    networks:
-      - agora_net
-
-  # ── 3 instancias Agora ──────────────────────────────
-  agora1:
-    build: .
-    restart: unless-stopped
-    expose:
-      - "2222"
-    volumes:
       - ./data:/data
-      - ./keys/agora1_host_key:/tmp/host_key:ro
-    depends_on:
-      db:
-        condition: service_healthy
+      - ./keys/agora_host_key:/tmp/host_key:ro
     environment:
       - RUST_LOG=info
       - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
+      - DATABASE_URL=${DATABASE_URL:-/data/agora.db}
       - LANG=${LANG:-es}
       - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
       - AGORA_UPLOAD_DIR=/data/uploads
-      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
-      - NODE_NO_WARNINGS=1
       - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
       - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
-    command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
-    networks:
-      - agora_net
-
-  agora2:
-    build: .
-    restart: unless-stopped
-    expose:
-      - "2222"
-    volumes:
-      - ./data:/data
-      - ./keys/agora2_host_key:/tmp/host_key:ro
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - RUST_LOG=info
-      - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
-      - LANG=${LANG:-es}
-      - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
-      - AGORA_UPLOAD_DIR=/data/uploads
-      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
-      - NODE_NO_WARNINGS=1
-      - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
-      - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
-    command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
-    networks:
-      - agora_net
-
-  agora3:
-    build: .
-    restart: unless-stopped
-    expose:
-      - "2222"
-    volumes:
-      - ./data:/data
-      - ./keys/agora3_host_key:/tmp/host_key:ro
-    depends_on:
-      db:
-        condition: service_healthy
-    environment:
-      - RUST_LOG=info
-      - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
-      - DATABASE_URL=postgres://social:${DB_PASSWORD:?Define DB_PASSWORD in .env}@db/social
-      - LANG=${LANG:-es}
-      - REGISTRATION_MODE=${REGISTRATION_MODE:-invite}
-      - AGORA_UPLOAD_DIR=/data/uploads
-      - AGORA_OPENTUI_ENTRY=/opt/agora-ui/src/index.tsx
-      - NODE_NO_WARNINGS=1
-      - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
-      - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
-    command: ["agora", "--port", "2222", "--key", "/tmp/host_key"]
-    networks:
-      - agora_net
-
-  # ── PostgreSQL ───────────────────────────────────────
-  db:
-    image: postgres:17-alpine
-    container_name: agora-db
-    restart: unless-stopped
-    ports:
-      - "127.0.0.1:5433:5432"
-    environment:
-      POSTGRES_USER: social
-      POSTGRES_PASSWORD: ${DB_PASSWORD:?Define DB_PASSWORD in .env}
-      POSTGRES_DB: social
-    volumes:
-      - pgdata:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U social"]
-      interval: 5s
-      timeout: 5s
-      retries: 5
+    command: ["agora", "--port", "2222", "--key", "/tmp/host_key", "--db", "/data/agora.db"]
     networks:
       - agora_net
 
@@ -124,9 +30,6 @@ services:
       - "9050"
     networks:
       - agora_net
-
-volumes:
-  pgdata:
 
 networks:
   agora_net:

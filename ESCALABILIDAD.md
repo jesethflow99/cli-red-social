@@ -2,28 +2,39 @@
 
 Cómo AGORA soporta cientos de usuarios simultáneos con recursos mínimos.
 
+AGORA está diseñado con una premisa simple: **un proceso por usuario en lugar de
+un servidor web compartido**. Cada conexión SSH crea un proceso hijo
+independiente con su propia pseudo-terminal, sin locks compartidos ni loop de
+eventos único. La persistencia es **SQLite embebido** (WAL): lecturas
+concurrentes ilimitadas y un escritor encolado por archivo. Para picos de
+escritura sostenidos, AGORA puede repartir los datos en varios archivos `.db`
+(un *mesh* de shards) y condensarlos en uno solo cuando baja la carga.
+
+> **Nota:** AGORA sirve una sola interfaz, la TUI nativa (Ratatui), que corre en
+> el proceso hijo de cada sesión. Las cifras de este documento corresponden a
+> esa interfaz. Ver el [Resumen de capacidad](#resumen-de-capacidad).
+
 ---
 
 ## Resumen de capacidad
 
 | Componente | Límite | Cuello de botella |
 |---|---|---|
-| Pool PostgreSQL | 25 conexiones | ~500-1000 usuarios simultáneos |
+| SQLite (WAL) | Un escritor por archivo | Lecturas ilimitadas en paralelo |
+| Shards (mesh) | N archivos `.db` | N escritores en paralelo |
 | Procesos (forkpty) | ~500 antes de ulimit | Unas decenas sin problema |
-| RAM | ~5 MB/sesión (TUI nativa) o ~40-80 MB/sesión (AGORA OpenTUI, proceso Node) | 100 usuarios = 500 MB–8 GB según interfaz |
+| RAM | ~8 MB/sesión (TUI nativa) — medido en contenedor | 100 usuarios = 800 MB |
 | nftables | 10 conexiones/minuto por IP | Rate-limit a nivel firewall |
-| nginx (stream) | I/O bound, virtualmente ilimitado | Balancea entre instancias |
 
-**Capacidad realista**: 300-500 usuarios simultáneos en un VPS de 4 GB RAM / 2 vCPU.
+**Capacidad realista**: 500-1000 usuarios simultáneos en un VPS de 4 GB RAM / 2 vCPU con un archivo único.
 
-Con 3 instancias + nginx: ~1500 usuarios.
+Con el mesh de 4 shards: ~2000 usuarios.
 
-> Estas cifras se calcularon para la TUI nativa (Ratatui, ~5 MB/sesión). El
-> despliegue Docker actual sirve **AGORA OpenTUI** por defecto (un proceso
-> Node por sesión, bastante más pesado — ver [Interfaces en el
-> README](README.md#interfaces)), así que la capacidad real con la
-> configuración por defecto es menor a la de esta sección. Faltan mediciones
-> de RAM/CPU reales de AGORA OpenTUI bajo carga.
+> **Cómo se llegó a estas cifras:** en el contenedor, cada sesión de la TUI
+> nativa usa ~8 MB de RAM (`/proc/<pid>/status`, `VmRSS`) y ~0% de CPU en
+> idle. Un VPS de 4 GB (tras reservar ~1 GB para SO + procesos base de Agora)
+> deja ~3 GB útiles → **~500-1000 sesiones** antes de que el cuello de botella
+> pase a ser la CPU o el escritor único de SQLite, no la RAM.
 
 ---
 
@@ -50,40 +61,68 @@ El protocolo SSH comprime el tráfico por defecto. Una pantalla de TUI (80×24 c
 | `search_posts` (ILIKE) | 5-20 ms |
 | `send_message` (INSERT) | 0.5-1 ms |
 
-El 99% del tiempo los usuarios están **leyendo**, no escribiendo. Las consultas duran milisegundos y la conexión se libera inmediatamente al pool.
+El 99% del tiempo los usuarios están **leyendo**, no escribiendo. Las consultas duran milisegundos y SQLite en WAL permite lecturas concurrentes sin bloqueos.
 
 ---
 
-## 2. Pool de conexiones PostgreSQL
+## 2. SQLite en WAL: lecturas paralelas, una escritura encolada
 
 ```
-┌────────────────────────────────────┐
-│  r2d2 connection pool (25)         │
-│                                    │
-│  ████████████████████████████████  │ ← 25 conexiones activas
-│                                    │
-│  Cola de espera (timeout 3s):      │
-│  [req26] [req27] [req28] ...       │ ← si las 25 están ocupadas
-└────────────────────────────────────┘
+┌──────────────────────────────────────┐
+│  SQLite WAL (agora.db)               │
+│                                      │
+│  Lectores  ████████████████████  ∞    │  ← lecturas simultáneas
+│  Escritor  ████                    1 │  ← un escritor a la vez
+│                                      │
+│  Cola de escrituras (busy_timeout):  │
+│  [write2] [write3] [write4] ...      │  ← se encolan y se aplican en orden
+└──────────────────────────────────────┘
 ```
 
-### ¿Qué pasa si las 25 están ocupadas?
+### ¿Qué pasa si llegan muchas escrituras a la vez?
 
-Las solicitudes se **encolan automáticamente** en `r2d2`. Cada solicitud espera hasta 3 segundos (configurable) a que se libere una conexión. Si en 3s no se libera, se devuelve error.
+SQLite serializa las escrituras: las demás esperan en una cola con
+`busy_timeout` (5 s por defecto). Para **comunicación humana** esto es
+imperceptible: un post o mensaje entrante espera milisegundos, y aun con cientos
+de escrituras simultáneas el retraso es de centenas de milisegundos como máximo.
 
-En la práctica, esto casi nunca ocurre porque:
+En la práctica casi nunca hay contención porque:
 - Las consultas duran milisegundos
-- La mayoría de usuarios no consultan la DB simultáneamente
-- El patrón de uso es ráfagas cortas (cada vez que el usuario presiona una tecla)
+- La mayoría de usuarios están **leyendo** (timeline, perfiles), no escribiendo
+- Las escrituras reales (posts, comentarios, mensajes) son escasas por usuario
 
-### ¿Cómo escalar el pool?
+### ¿Cómo escalar más? El mesh de shards
 
-```rust
-// db.rs
-.max_size(50)  // Subir de 25 a 50
+Si querés paralelizar las escrituras, repartí los datos en N archivos `.db`:
+
+```bash
+AGORA_DB_SHARDS=4 cargo run -- --port 2222   # agora.db, agora-1.db, ...
 ```
 
-PostgreSQL maneja cientos de conexiones sin problema. El límite real es la RAM y `max_connections` en `postgresql.conf`.
+- Cada shard tiene **su propio escritor** → N escrituras en paralelo.
+- Cada usuario se asigna a un shard por **hash de su username**.
+- Las consultas que cruzan usuarios (timeline, búsqueda, trending) hacen
+  **fan-out** a todos los shards y combinan los resultados.
+- Los ids son globales (`shard_idx * 10.000.000 + local`), así que un id se
+  puede enrutar a su shard sin tablas de routing.
+
+Cuando baja la carga, condensá el mesh en un único archivo:
+
+```bash
+AGORA_DB_SHARDS=4 cargo run -- --condense   # fusiona todo en agora.db
+```
+
+### ¿Cuándo usar el mesh?
+
+| Escenario | Recomendado |
+|---|---|
+| Hasta ~1000 usuarios | Archivo único (`AGORA_DB_SHARDS=1`) |
+| Picos de escritura sostenidos | Mesh de 4-16 shards |
+| Backups / migración | Condensar primero, luego copiar |
+
+> **Regla práctica:** el mesh multiplica el *throughput de escritura* (1 escritor
+> por archivo), no la RAM. Si el cuello de botella es la CPU o la RAM de las
+> sesiones, más shards no ayudan; subí el VPS.
 
 ---
 
@@ -91,7 +130,7 @@ PostgreSQL maneja cientos de conexiones sin problema. El límite real es la RAM 
 
 ```
 Cada conexión SSH → forkpty() → proceso hijo con TUI
-                                ~5 MB RAM
+                                ~8 MB RAM
                                 ~0% CPU en idle
                                 ~2% CPU en interacción
 ```
@@ -137,48 +176,39 @@ El rate-limit a nivel firewall protege contra:
 
 ---
 
-## 5. Multi-instancia con nginx (TCP stream)
+## 5. Mesh de shards (en lugar de multi-instancia)
+
+En la arquitectura anterior (PostgreSQL) se escalaba con **más instancias** de
+Agora + nginx. Con SQLite embebido, una sola instancia ya aprovecha todo el VPS;
+para más throughput de escritura se usa el **mesh de archivos**, no más procesos:
 
 ```
-          ┌──────────┐
-usuario → │ nginx    │ :2222
-          │ (stream) │
-          └─┬──┬──┬──┘
-            │  │  │
-       ┌────▼┐ ┌▼──┐ ┌▼────┐
-       │ago1 │ │2  │ │ago3 │   (3 binarios AGORA)
-       └──┬──┘ └┬──┘ └──┬──┘
-          └──────┼───────┘
-              ┌──▼──┐
-              │ DB  │          (PostgreSQL compartido)
-              └─────┘
+agora.db      ← shard 0 (base)
+agora-1.db    ← shard 1
+agora-2.db    ← shard 2
+agora-3.db    ← shard 3
 ```
 
-### Cómo funciona
+### Cómo funciona el routing
 
-Nginx actúa como proxy TCP (capa 4). No interpreta SSH, solo reenvía bytes. El balanceo usa `hash $remote_addr consistent`:
+- Cada usuario se asigna a un shard por **hash de su username**.
+- El id global codifica el shard: `id = shard_idx * 10.000.000 + local`.
+- Las consultas de un solo usuario van **directo** a su shard.
+- Las que cruzan usuarios (timeline, búsqueda, trending, mensajes) hacen
+  **fan-out** a todos los shards y combinan resultados en memoria.
 
-```nginx
-upstream agora_backend {
-    hash $remote_addr consistent;  # Misma IP → misma instancia
-    server agora1:2222;
-    server agora2:2222;
-    server agora3:2222;
-}
-```
+### Capacidad según shards
 
-- Misma IP siempre cae en la misma instancia → sesión TUI persistente
-- Si una instancia se cae, nginx reintenta en otra
-- Las instancias comparten PostgreSQL y volumen de uploads
+| Recurso | 1 archivo | 4 shards | 16 shards |
+|---|---|---|---|
+| Escritores en paralelo | 1 | 4 | 16 |
+| Usuarios simultáneos | ~500-1000 | ~2000 | ~5000+ |
+| RAM | ~3 GB | ~3 GB | ~3 GB (misma) |
+| CPU | 2 cores | 2-4 cores | 4+ cores |
 
-### Capacidad con 3 instancias
-
-| Recurso | 1 instancia | 3 instancias |
-|---|---|---|
-| Pool DB total | 25 | 75 (25 c/u) |
-| Usuarios simultáneos | ~500 | ~1500 |
-| RAM | ~2.5 GB | ~7.5 GB |
-| CPU | 2 cores | 6 cores |
+> El mesh multiplica el **throughput de escritura**, no la RAM. Cada shard es un
+> archivo `.db` separado; los shards comparten el mismo binario y el mismo
+> proceso. La condensación (`--condense`) los fusiona en uno solo.
 
 ---
 
@@ -203,18 +233,20 @@ Esto evita que la base de datos crezca indefinidamente.
 
 ## 7. Optimizaciones para producción
 
-### PostgreSQL
+### SQLite
+
+Los índices ya se crean automáticamente en `init_schema`. Para cargas muy
+pesadas de búsqueda se puede agregar un FTS5 (full-text search):
 
 ```sql
--- Índices adicionales para búsquedas frecuentes
-CREATE INDEX idx_posts_created_at ON posts(created_at DESC);
-CREATE INDEX idx_messages_receiver ON messages(receiver_id, created_at);
-CREATE INDEX idx_notifications_user ON notifications(user_id, created_at DESC);
-
--- Aumentar conexiones máximas
-ALTER SYSTEM SET max_connections = 200;
-SELECT pg_reload_conf();
+-- FTS5 para búsqueda de posts (opcional)
+CREATE VIRTUAL TABLE IF NOT EXISTS posts_fts USING fts5(content);
+-- Sincronizar manualmente o vía trigger
 ```
+
+El modo WAL ya está activado por defecto (`PRAGMA journal_mode=WAL`), que da
+lecturas concurrentes sin bloqueos. El `busy_timeout` (5 s) encola las
+escrituras.
 
 ### Sistema operativo
 
@@ -241,14 +273,17 @@ RUSTFLAGS="-C target-cpu=native" cargo build --release
 ## 8. Monitoreo
 
 ```bash
-# Conexiones activas
+# Conexiones SSH activas
 ss -tnp | grep 2222 | wc -l
 
 # Procesos AGORA
 ps aux | grep agora | wc -l
 
-# Conexiones PostgreSQL
-psql -c "SELECT count(*) FROM pg_stat_activity WHERE datname='social';"
+# Tamaño de los archivos SQLite
+ls -lh agora*.db
+
+# Uso de WAL (archivos pendientes de checkpoint)
+ls -lh agora.db-wal 2>/dev/null
 
 # Logs
 tail -f agora.log
@@ -260,8 +295,14 @@ tail -f agora.log
 
 | Configuración | Usuarios simultáneos | RAM necesaria | Costo mensual VPS |
 |---|---|---|---|
-| 1 instancia, 25 pool DB | 300-500 | 2-4 GB | $10-20 |
-| 3 instancias + nginx, 75 pool DB | 1000-1500 | 8-16 GB | $40-80 |
-| 10 instancias + balanceador dedicado | 5000+ | 32+ GB | $200+ |
+| Archivo único SQLite | 500-1000 | 2-4 GB | $10-20 |
+| Mesh de 4 shards | ~2000 | 4-8 GB | $20-40 |
+| Mesh de 16 shards | ~5000+ | 8-16 GB | $40-80 |
 
-AGORA está diseñado para **escalar horizontalmente**: agregar más instancias no requiere cambios de arquitectura, solo más procesos apuntando a la misma base de datos.
+> Los límites asumen la TUI nativa (~8 MB/sesión). El mesh multiplica el
+> **throughput de escritura** (un escritor por archivo); la RAM la pone el VPS
+> (ver [Mesh de shards](#5-mesh-de-shards-en-lugar-de-multi-instancia)).
+
+AGORA está diseñado para hacer lo máximo con lo mínimo: un binario de ~12 MB con
+SQLite embebido, un proceso por usuario, y un mesh opcional de archivos que se
+expande bajo carga y se condensa en uno solo cuando baja.

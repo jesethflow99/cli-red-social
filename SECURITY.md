@@ -11,15 +11,17 @@ reproducirla, impacto estimado y, si existe, una mitigación propuesta.
 - Nunca confirmes `.env`, claves privadas SSH, exportaciones, bases de datos ni
   imágenes subidas.
 - Genera las claves de host en cada despliegue con `./setup-keys.sh`.
-- Usa contraseñas distintas para SSH y PostgreSQL.
+- Usa una contraseña SSH fuerte; la base de datos es SQLite embebido (un
+  archivo local, sin credenciales propias).
 - Si una clave o contraseña llegó a Git, rotarla es obligatorio; borrarla del
   último commit no elimina las copias del historial.
 
 ## Despliegue
 
-Docker Compose exige `SSH_PASSWORD` y `DB_PASSWORD`. Usa `.env.example` como
-plantilla y limita el acceso administrativo y a PostgreSQL mediante firewall.
-Para equipos privados, usa `REGISTRATION_MODE=invite` o `closed`.
+Docker Compose exige `SSH_PASSWORD`. Usa `.env.example` como plantilla y limita
+el acceso administrativo mediante firewall. Para equipos privados, usa
+`REGISTRATION_MODE=invite` o `closed`. Respalda el archivo `agora.db` (o el mesh
+condensado) con `./scripts/backup.sh`.
 
 ## Datos retenidos accidentalmente en Git
 

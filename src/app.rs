@@ -13,13 +13,13 @@ use std::panic;
 
 use crate::db::{AuthResult, DatabaseOps};
 use crate::i18n::{self, Lang};
-use crate::models::{Comment, Message, Notification, Post, Screen, User};
+use crate::models::{Comment, Message, MessagePreview, Notification, Post, Screen, User};
 use crate::t;
 use crate::theme::AppTheme;
 
 pub fn run_tui(db_conn: &str) -> Result<()> {
-    let database = crate::db::Database::new(db_conn)?;
-    let app_db: Box<dyn DatabaseOps> = Box::new(database);
+    let database = crate::shard::open_database(db_conn)?;
+    let app_db: Box<dyn DatabaseOps> = database;
 
     let _terminal_guard = TerminalGuard::enter()?;
     let stdout = std::io::stdout();
@@ -107,6 +107,8 @@ pub struct App {
     pub unread_count: i64,
     pub notifications: Vec<Notification>,
     pub unread_notifications: i64,
+    pub message_previews: Vec<MessagePreview>,
+    pub notification_previews: Vec<Notification>,
     pub profile_display_name: String,
     pub profile_bio: String,
     pub edit_profile_focus: usize,
@@ -189,6 +191,20 @@ fn flatten_tree(nodes: &[CommentNode]) -> Vec<&CommentNode> {
     result
 }
 
+fn truncate_text(value: &str, max: usize) -> String {
+    if value.chars().count() > max {
+        format!(
+            "{}…",
+            value
+                .chars()
+                .take(max.saturating_sub(1))
+                .collect::<String>()
+        )
+    } else {
+        value.to_string()
+    }
+}
+
 const SPINNER: &[char] = &['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
 
 impl App {
@@ -244,6 +260,8 @@ impl App {
             unread_count: 0,
             notifications: vec![],
             unread_notifications: 0,
+            message_previews: vec![],
+            notification_previews: vec![],
             profile_display_name: String::new(),
             profile_bio: String::new(),
             edit_profile_focus: 0,
@@ -346,6 +364,19 @@ impl App {
                 }
             }
 
+            // Refresca los widgets de "actividad reciente" del sidebar (no
+            // bloqueante: si falla, se conserva la última lista conocida).
+            if self.frame_count % 30 == 0 {
+                if let Some(user_id) = self.current_user.as_ref().map(|u| u.id) {
+                    if let Ok(previews) = self.db.get_recent_message_previews(user_id, 4) {
+                        self.message_previews = previews;
+                    }
+                    if let Ok(recent) = self.db.get_notifications(user_id, 0, 4) {
+                        self.notification_previews = recent;
+                    }
+                }
+            }
+
             if self.needs_clear {
                 terminal.clear()?;
                 self.needs_clear = false;
@@ -422,7 +453,67 @@ impl App {
         self.debug_message = None;
     }
 
+    /// Pantallas donde el usuario está escribiendo texto libre: ahí los
+    /// dígitos 1-5 deben ir al campo de texto, no saltar de sección.
+    fn is_text_entry_screen(&self) -> bool {
+        match self.screen {
+            Screen::Login
+            | Screen::Register
+            | Screen::CreatePost
+            | Screen::EditProfile
+            | Screen::Chat(_)
+            | Screen::UserSearch
+            | Screen::PostSearch => true,
+            Screen::PostDetail(_) => self.comment_mode || self.edit_mode,
+            _ => false,
+        }
+    }
+
+    /// Navegación global del sidebar (5 secciones), reutilizando la misma
+    /// carga de datos que ya usan los atajos existentes (`m`, `p`, `Ctrl+n`,
+    /// `/`) para cada pantalla.
+    fn jump_to_section(&mut self, index: usize) -> Result<()> {
+        let own_id = self.current_user.as_ref().map(|u| u.id).unwrap_or(0);
+        match index {
+            0 => {
+                self.screen = Screen::Timeline;
+                self.refresh_timeline()?;
+            }
+            1 => {
+                self.input.clear();
+                self.post_search_results.clear();
+                self.screen = Screen::PostSearch;
+            }
+            2 => {
+                self.load_conversations()?;
+                self.screen = Screen::Messages;
+            }
+            3 => {
+                self.page = 0;
+                self.notifications = self.db.get_notifications(own_id, 0, 50)?;
+                self.unread_notifications = 0;
+                self.db.mark_notifications_read(own_id)?;
+                self.screen = Screen::Notifications;
+            }
+            4 => {
+                self.screen = Screen::Profile(own_id);
+                self.load_profile(own_id)?;
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: event::KeyEvent) -> Result<bool> {
+        if self.current_user.is_some()
+            && key.modifiers == KeyModifiers::NONE
+            && !self.is_text_entry_screen()
+        {
+            if let KeyCode::Char(c @ '1'..='5') = key.code {
+                self.jump_to_section(c.to_digit(10).unwrap() as usize - 1)?;
+                return Ok(true);
+            }
+        }
         match self.screen {
             Screen::Login => self.handle_login_key(key),
             Screen::Register => self.handle_register_key(key),
@@ -831,10 +922,16 @@ impl App {
                 self.upload_mode = true;
                 self.upload_waiting = true;
                 self.upload_new_file = None;
-                let username = &self.current_user.as_ref().unwrap().username;
+                let username = self.current_user.as_ref().unwrap().username.clone();
+                // Renueva el token SCP asociado a la IP del cliente para que el
+                // comando mostrado funcione aunque hayan pasado más de 5 min
+                // desde el login (el token expira).
+                if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
+                    crate::ssh::write_scp_user_for_token(&ip, &username);
+                }
                 eprintln!("[agora] 📥 Modo recepción: usuario={}", username);
                 eprintln!("[agora] 📥 Esperando archivo en uploads/{}...", username);
-                self.uploaded_images = crate::ssh::list_uploaded_images(username);
+                self.uploaded_images = crate::ssh::list_uploaded_images(&username);
                 self.upload_known_count = self.uploaded_images.len();
                 self.list_state.select(Some(0));
                 let cmd = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username);
@@ -1047,7 +1144,9 @@ impl App {
             });
             let start = std::time::Instant::now();
             let result = loop {
-                if start.elapsed() > std::time::Duration::from_secs(15) {
+                // El timeout del hilo de descarga (reqwest) es 15s; esperamos un
+                // poco más para no cortar antes de recibir el resultado.
+                if start.elapsed() > std::time::Duration::from_secs(20) {
                     break None;
                 }
                 if let Ok(result) = rx.try_recv() {
@@ -1198,9 +1297,8 @@ impl App {
             return None;
         }
 
-        let path = format!("/tmp/opencode_img_{}.{}", url_hash, ext);
-        std::fs::write(&path, &buf).ok()?;
-        Some(path)
+        std::fs::write(&cached_path, &buf).ok()?;
+        Some(cached_path)
     }
 
     fn print_download_instructions(path: &str) {
@@ -3025,6 +3123,164 @@ impl App {
         f.render_widget(help, chunks[3]);
     }
 
+    /// Sección del sidebar que corresponde a la pantalla actual, para
+    /// resaltarla. `None` para pantallas sin sesión (no debería pasar en el
+    /// único lugar donde se llama, ya que el sidebar solo se dibuja logueado).
+    fn active_section(&self) -> Option<usize> {
+        match self.screen {
+            Screen::Timeline
+            | Screen::PostDetail(_)
+            | Screen::CreatePost
+            | Screen::HashtagView
+            | Screen::HashtagTrending
+            | Screen::Radio => Some(0),
+            Screen::UserSearch | Screen::PostSearch => Some(1),
+            Screen::Messages | Screen::Chat(_) => Some(2),
+            Screen::Notifications => Some(3),
+            Screen::Profile(_) | Screen::EditProfile => Some(4),
+            Screen::Login | Screen::Register => None,
+        }
+    }
+
+    fn render_sidebar(&self, f: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let user = self.current_user.as_ref().unwrap();
+        let active = self.active_section();
+        const LABELS: [&str; 5] = ["INICIO", "EXPLORAR", "MENSAJES", "ALERTAS", "PERFIL"];
+        let badges: [i64; 5] = [0, 0, self.unread_count, self.unread_notifications, 0];
+
+        let mut constraints = vec![Constraint::Length(3)];
+        for _ in 0..LABELS.len() {
+            constraints.push(Constraint::Length(1));
+        }
+        constraints.push(Constraint::Min(0));
+        constraints.push(Constraint::Length(4));
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints(constraints)
+            .split(area);
+
+        let header = Paragraph::new(vec![
+            Line::from(Span::styled("\u{25c8} AGORA", t.header_style)),
+            Line::from(Span::styled("agora.social", Style::default().fg(t.muted))),
+        ]);
+        f.render_widget(header, chunks[0]);
+
+        for (i, label) in LABELS.iter().enumerate() {
+            let is_active = active == Some(i);
+            let accent = t.section_accent(i);
+            let marker = if is_active { "\u{25b8}" } else { " " };
+            let label_style = if is_active {
+                Style::default().fg(accent).add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(t.muted)
+            };
+            let mut spans = vec![Span::styled(
+                format!("{} {} {}", i + 1, marker, label),
+                label_style,
+            )];
+            if badges[i] > 0 {
+                spans.push(Span::styled(
+                    format!("  [{}]", badges[i]),
+                    Style::default().fg(t.error),
+                ));
+            }
+            let block = if is_active {
+                Block::default()
+                    .borders(Borders::LEFT)
+                    .border_style(Style::default().fg(accent))
+            } else {
+                Block::default()
+            };
+            f.render_widget(
+                Paragraph::new(Line::from(spans)).block(block),
+                chunks[i + 1],
+            );
+        }
+
+        let session = Paragraph::new(vec![
+            Line::from(Span::styled(
+                user.display_name.clone(),
+                Style::default().fg(t.text).add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                format!("@{}", user.username),
+                Style::default().fg(t.muted),
+            )),
+        ])
+        .block(t.default_block("SESIÓN"));
+        f.render_widget(session, chunks[chunks.len() - 1]);
+    }
+
+    fn render_activity_rail(&self, f: &mut Frame, area: Rect) {
+        let t = &self.theme;
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(4), Constraint::Min(4)])
+            .split(area);
+
+        let message_lines: Vec<Line> = if self.message_previews.is_empty() {
+            vec![Line::from(Span::styled(
+                "Sin mensajes todavía.",
+                Style::default().fg(t.muted),
+            ))]
+        } else {
+            self.message_previews
+                .iter()
+                .map(|item| {
+                    let marker = if item.unread { "\u{25cf}" } else { "\u{25cb}" };
+                    Line::from(vec![
+                        Span::raw(format!("{} ", marker)),
+                        Span::styled(
+                            format!("@{}", item.sender_username),
+                            Style::default().fg(t.primary).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(" {}", truncate_text(&item.content, 22))),
+                    ])
+                })
+                .collect()
+        };
+        f.render_widget(
+            Paragraph::new(message_lines)
+                .wrap(Wrap { trim: true })
+                .block(t.default_block("MENSAJES")),
+            chunks[0],
+        );
+
+        let notif_lines: Vec<Line> = if self.notification_previews.is_empty() {
+            vec![Line::from(Span::styled(
+                "Sin alertas todavía.",
+                Style::default().fg(t.muted),
+            ))]
+        } else {
+            self.notification_previews
+                .iter()
+                .map(|item| {
+                    let marker = if item.read { "\u{25cb}" } else { "\u{25cf}" };
+                    let action = if item.notif_type == "follow" {
+                        "te siguió"
+                    } else {
+                        "te mencionó"
+                    };
+                    Line::from(vec![
+                        Span::raw(format!("{} ", marker)),
+                        Span::styled(
+                            format!("@{}", item.from_username),
+                            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+                        ),
+                        Span::raw(format!(" {}", action)),
+                    ])
+                })
+                .collect()
+        };
+        f.render_widget(
+            Paragraph::new(notif_lines)
+                .wrap(Wrap { trim: true })
+                .block(t.default_block("ALERTAS")),
+            chunks[1],
+        );
+    }
+
     fn render(&self, f: &mut Frame) {
         let area = f.area();
         if self.current_user.is_some() {
@@ -3034,22 +3290,43 @@ impl App {
                 .split(area);
             let content_area = chunks[0];
             self.render_status_bar(f, chunks[1]);
+
+            let show_sidebar = content_area.width >= 72;
+            let show_rail = content_area.width >= 112;
+            let main_area = if show_sidebar {
+                let mut constraints = vec![Constraint::Length(22), Constraint::Min(1)];
+                if show_rail {
+                    constraints.push(Constraint::Length(26));
+                }
+                let cols = Layout::default()
+                    .direction(Direction::Horizontal)
+                    .constraints(constraints)
+                    .split(content_area);
+                self.render_sidebar(f, cols[0]);
+                if show_rail {
+                    self.render_activity_rail(f, cols[2]);
+                }
+                cols[1]
+            } else {
+                content_area
+            };
+
             match self.screen {
-                Screen::Login => self.render_login(f, content_area),
-                Screen::Register => self.render_register(f, content_area),
-                Screen::Timeline => self.render_timeline(f, content_area),
-                Screen::CreatePost => self.render_create_post(f, content_area),
-                Screen::PostDetail(_) => self.render_post_detail(f, content_area),
-                Screen::Profile(_) => self.render_profile(f, content_area),
-                Screen::UserSearch => self.render_search(f, content_area),
-                Screen::Messages => self.render_messages(f, content_area),
-                Screen::Chat(_) => self.render_chat(f, content_area),
-                Screen::EditProfile => self.render_edit_profile(f, content_area),
-                Screen::Notifications => self.render_notifications(f, content_area),
-                Screen::PostSearch => self.render_post_search(f, content_area),
-                Screen::HashtagView => self.render_hashtag_view(f, content_area),
-                Screen::HashtagTrending => self.render_hashtag_trending(f, content_area),
-                Screen::Radio => self.render_radio(f, content_area),
+                Screen::Login => self.render_login(f, main_area),
+                Screen::Register => self.render_register(f, main_area),
+                Screen::Timeline => self.render_timeline(f, main_area),
+                Screen::CreatePost => self.render_create_post(f, main_area),
+                Screen::PostDetail(_) => self.render_post_detail(f, main_area),
+                Screen::Profile(_) => self.render_profile(f, main_area),
+                Screen::UserSearch => self.render_search(f, main_area),
+                Screen::Messages => self.render_messages(f, main_area),
+                Screen::Chat(_) => self.render_chat(f, main_area),
+                Screen::EditProfile => self.render_edit_profile(f, main_area),
+                Screen::Notifications => self.render_notifications(f, main_area),
+                Screen::PostSearch => self.render_post_search(f, main_area),
+                Screen::HashtagView => self.render_hashtag_view(f, main_area),
+                Screen::HashtagTrending => self.render_hashtag_trending(f, main_area),
+                Screen::Radio => self.render_radio(f, main_area),
             }
         } else {
             match self.screen {

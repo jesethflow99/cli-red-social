@@ -19,7 +19,7 @@ use russh_sftp::protocol::{
     Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode, Version,
 };
 
-use crate::db::Database;
+use crate::db::DatabaseOps;
 
 pub fn upload_dir() -> &'static str {
     use std::sync::LazyLock;
@@ -587,13 +587,13 @@ fn load_or_generate_key(path: &str) -> Result<KeyPair> {
 }
 
 pub struct SshServer {
-    _db: Arc<Database>,
+    _db: Arc<dyn DatabaseOps>,
     db_conn: String,
     ssh_password: String,
 }
 
 impl SshServer {
-    pub fn new(db: Arc<Database>, db_conn: &str, ssh_password: &str) -> Self {
+    pub fn new(db: Arc<dyn DatabaseOps>, db_conn: &str, ssh_password: &str) -> Self {
         Self {
             _db: db,
             db_conn: db_conn.to_string(),
@@ -752,31 +752,11 @@ impl Handler for SshSession {
                     if !ssh_user.is_empty() {
                         unsafe { std::env::set_var("SSH_USER", &ssh_user) };
                     }
-                    let opentui_entry = std::env::var("AGORA_OPENTUI_ENTRY").ok();
-                    if let Some(entry) =
-                        opentui_entry.filter(|path| std::path::Path::new(path).is_file())
-                    {
-                        let status = std::process::Command::new("node")
-                            .args(["--experimental-ffi", "--import", "tsx", &entry])
-                            .env("AGORA_BACKEND_BIN", "/usr/local/bin/agora")
-                            .env("DATABASE_URL", &db_conn)
-                            .current_dir(
-                                std::path::Path::new(&entry)
-                                    .parent()
-                                    .and_then(std::path::Path::parent)
-                                    .unwrap_or_else(|| std::path::Path::new("/opt/agora-ui")),
-                            )
-                            .status();
-                        if let Err(error) = status {
-                            eprintln!("Error iniciando OpenTUI: {error}");
+                    let _ = std::panic::catch_unwind(|| {
+                        if let Err(e) = crate::app::run_tui(&db_conn) {
+                            eprintln!("Error iniciando TUI: {e}");
                         }
-                    } else {
-                        let _ = std::panic::catch_unwind(|| {
-                            if let Err(e) = crate::app::run_tui(&db_conn) {
-                                eprintln!("Error iniciando TUI: {e}");
-                            }
-                        });
-                    }
+                    });
                     std::process::exit(0);
                 }
                 ForkptyResult::Parent { master, child } => {

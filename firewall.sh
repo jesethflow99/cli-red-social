@@ -2,7 +2,7 @@
 set -e
 
 # ─── Config ───────────────────────────────────────────────
-SSH_PORT=2222          # Puerto de la red social
+SSH_PORT=2222          # Puerto de la red social (instancia única)
 SERVER_SSH_PORT=22     # Puerto SSH tradicional para administrar el servidor
 TABLE_NAME="agora_fw"
 # ───────────────────────────────────────────────────────────
@@ -15,6 +15,7 @@ nft list table inet "$TABLE_NAME" &>/dev/null && nft delete table inet "$TABLE_N
 nft -f - <<EOF
 table inet ${TABLE_NAME} {
     # ── Sets ──────────────────────────────────────────
+    # IPs autorizadas para SCP temporal (upload/download de imágenes)
     set scp_allowed {
         type ipv4_addr
         flags timeout
@@ -44,7 +45,7 @@ table inet ${TABLE_NAME} {
             log prefix "[FW ADMIN BLOCK] " drop
         tcp dport ${SERVER_SSH_PORT} accept
 
-        # Red social (con rate-limit)
+        # Red social (instancia única directa en ${SSH_PORT}, con rate-limit)
         tcp dport ${SSH_PORT} ct state new \
             add @ssh_ratelimit_v4 { ip saddr limit rate over 10/minute } \
             log prefix "[FW AGORA BLOCK] " drop

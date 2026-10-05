@@ -2,9 +2,15 @@
 
 Guía completa para usar la red social desde tu terminal.
 
-> Este manual documenta la **TUI nativa** (Ratatui). Si tu conexión SSH sirve
-> **AGORA OpenTUI** (la interfaz por defecto en el despliegue Docker), la
-> navegación es distinta — ver [`ui-opentui/README.md`](ui-opentui/README.md).
+AGORA es una red social privada y minimalista que se usa desde cualquier
+terminal vía SSH. Publicá posts con hashtags y menciones, seguí a otras
+personas, chateá por mensajes directos, subí imágenes y exportá tus datos — todo
+sin navegador, sin cookies y sin rastreo. Tu usuario se crea al primer registro
+y solo necesitás username y contraseña (más un código de invitación si el
+servidor lo exige).
+
+Este manual documenta la **TUI nativa** (Ratatui), la interfaz que sirve el
+servidor a cada conexión SSH.
 
 ---
 

@@ -7,13 +7,8 @@ backup_dir="${backup_root%/}/agora-${timestamp}"
 
 mkdir -p "$backup_dir"
 
-echo "Creando respaldo de PostgreSQL..."
-docker compose exec -T db pg_dump \
-  --username social \
-  --dbname social \
-  --format custom \
-  --no-owner \
-  --no-privileges > "$backup_dir/database.dump"
+echo "Copiando base de datos SQLite..."
+cp data/agora.db "$backup_dir/agora.db"
 
 if [[ -d data/uploads ]]; then
   echo "Creando respaldo de imágenes..."
@@ -22,7 +17,7 @@ fi
 
 (
   cd "$backup_dir"
-  sha256sum database.dump > SHA256SUMS
+  sha256sum agora.db > SHA256SUMS
   if [[ -f uploads.tar.gz ]]; then
     sha256sum uploads.tar.gz >> SHA256SUMS
   fi
