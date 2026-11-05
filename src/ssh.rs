@@ -37,11 +37,10 @@ fn dir_is_writable(path: &str) -> bool {
 pub fn upload_dir() -> &'static str {
     use std::sync::LazyLock;
     static DIR: LazyLock<String> = LazyLock::new(|| {
-        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR") {
-            if !d.is_empty() {
+        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR")
+            && !d.is_empty() {
                 return d;
             }
-        }
         // Solo usar /data/uploads si es realmente escribible; si /data existe
         // pero es de solo lectura (p. ej. root en el host), caer a ./uploads.
         if dir_is_writable("/data/uploads") {
@@ -349,17 +348,15 @@ pub fn list_uploaded_images(username: &str) -> Vec<(String, String)> {
     if let Ok(entries) = std::fs::read_dir(&user_dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
-                if matches!(
+            if let Some(ext) = path.extension().and_then(|e| e.to_str())
+                && matches!(
                     ext.to_lowercase().as_str(),
                     "jpg" | "jpeg" | "png" | "gif" | "webp"
-                ) {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+                )
+                    && let Some(name) = path.file_name().and_then(|n| n.to_str()) {
                         let size = path.metadata().map(|m| m.len()).unwrap_or(0);
                         images.push((name.to_string(), format!("{:.1} KB", size as f64 / 1024.0)));
                     }
-                }
-            }
         }
     }
     images.sort_by(|a, b| b.0.cmp(&a.0));
@@ -438,8 +435,8 @@ impl russh_sftp::server::Handler for SftpSession {
     }
 
     async fn close(&mut self, id: u32, handle: String) -> Result<Status, Self::Error> {
-        if let Some(open_file) = self.open_files.remove(&handle) {
-            if open_file.is_write {
+        if let Some(open_file) = self.open_files.remove(&handle)
+            && open_file.is_write {
                 let path = open_file.path.clone();
                 tokio::task::spawn_blocking(move || {
                     process_image(&path);
@@ -448,7 +445,6 @@ impl russh_sftp::server::Handler for SftpSession {
                     clear_scp_user_for_token(&self.allowed_user);
                 }
             }
-        }
         Ok(Self::status_ok(id))
     }
 

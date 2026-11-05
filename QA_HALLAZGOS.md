@@ -79,8 +79,9 @@ _(ninguno encontrado: no hubo caídas ni pérdida/corrupción de datos)_
 
 ## Informativo
 
-### [ ] F10 — Clippy: 112 warnings, 0 errores
-- No bloqueante; limpieza opcional.
+### [~] F10 — Clippy: warnings de estilo/dead-code
+- Reducidos de 112 a ~31 con `cargo clippy --fix` (colapsos de `if`, `sort_by_key`, etc.).
+- Quedan lints de estilo (`sort_by_key`) y dead-code intencional (E2E/invitaciones planeadas). 0 errores. No bloqueante.
 
 ---
 

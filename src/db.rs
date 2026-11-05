@@ -494,17 +494,15 @@ impl Database {
             .optional()?;
 
         if let Some((count, banned_until)) = existing {
-            if !banned_until.is_empty() {
-                if let Ok(ban_time) = banned_until.parse::<DateTime<Utc>>() {
-                    if now < ban_time {
+            if !banned_until.is_empty()
+                && let Ok(ban_time) = banned_until.parse::<DateTime<Utc>>()
+                    && now < ban_time {
                         let remaining = ban_time - now;
                         anyhow::bail!(
                             "Cuenta baneada temporalmente. Espera {} segundos.",
                             remaining.num_seconds()
                         );
                     }
-                }
-            }
 
             if count as usize >= max {
                 let ban_duration = if count as usize >= max * 3 {
@@ -709,7 +707,7 @@ impl Database {
     pub fn create_invitation(&self, valid_days: i64) -> Result<String> {
         use base64::Engine;
 
-        if valid_days < 1 || valid_days > 365 {
+        if !(1..=365).contains(&valid_days) {
             anyhow::bail!("La duración debe estar entre 1 y 365 días.");
         }
         let code =
@@ -899,15 +897,14 @@ impl Database {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(mentioned_id) = mentioned_id {
-                if mentioned_id != user_id {
+            if let Some(mentioned_id) = mentioned_id
+                && mentioned_id != user_id {
                     conn.execute(
                         "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'mention', ?3, ?4)",
                         rusqlite::params![mentioned_id, user_id, now, id],
                     )
                     .ok();
                 }
-            }
         }
 
         Ok(Post {
@@ -1357,15 +1354,14 @@ impl Database {
                     |row| row.get(0),
                 )
                 .optional()?;
-            if let Some(mentioned_id) = mentioned_id {
-                if mentioned_id != user_id {
+            if let Some(mentioned_id) = mentioned_id
+                && mentioned_id != user_id {
                     conn.execute(
                         "INSERT INTO notifications (user_id, from_user_id, type, created_at, related_id) VALUES (?1, ?2, 'mention', ?3, ?4)",
                         rusqlite::params![mentioned_id, user_id, now, post_id],
                     )
                     .ok();
                 }
-            }
         }
 
         Ok(Comment {
@@ -2026,11 +2022,10 @@ let conn = self.conn.lock().unwrap();
         // Prueba varios directorios en orden y usa el primero que sea
         // escribible (útil si /data existe pero no es escribible).
         let mut roots: Vec<String> = Vec::new();
-        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR") {
-            if !d.is_empty() {
+        if let Ok(d) = std::env::var("AGORA_UPLOAD_DIR")
+            && !d.is_empty() {
                 roots.push(d);
             }
-        }
         roots.push("/data/uploads".to_string());
         roots.push("./uploads".to_string());
 
@@ -3044,7 +3039,7 @@ pub(crate) mod mock_db {
                 .filter(|c| c.post_id == post_id)
                 .cloned()
                 .collect();
-            comments.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            comments.sort_by_key(|a| a.created_at);
             Ok(comments)
         }
 
@@ -3175,7 +3170,7 @@ pub(crate) mod mock_db {
                 })
                 .cloned()
                 .collect();
-            msgs.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+            msgs.sort_by_key(|a| a.created_at);
             Ok(msgs)
         }
 

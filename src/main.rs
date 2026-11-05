@@ -99,7 +99,7 @@ fn main() -> Result<()> {
 
     setup_logging(&cli.log, !cli.tui && !cli.export);
 
-    let db_url = std::env::var("DATABASE_URL").unwrap_or_else(|_| cli.db);
+    let db_url = std::env::var("DATABASE_URL").unwrap_or(cli.db);
     let ssh_password = std::env::var("SSH_PASSWORD").unwrap_or_else(|_| "agora".to_string());
 
     if cli.condense {

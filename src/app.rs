@@ -156,7 +156,7 @@ fn build_comment_tree(comments: &[Comment]) -> Vec<CommentNode> {
     }
 
     for node in &mut roots {
-        build_children(node, &comments, &comment_map, 0);
+        build_children(node, comments, &comment_map, 0);
     }
 
     roots
@@ -300,18 +300,16 @@ impl App {
             self.frame_count += 1;
 
             if self.screen == Screen::Radio && !self.radio_paused && !self.radio_hashtags.is_empty()
-            {
-                if self.frame_count - self.radio_tick_frame > 96 {
+                && self.frame_count - self.radio_tick_frame > 96 {
                     self.radio_idx = (self.radio_idx + 1) % self.radio_hashtags.len();
                     self.radio_tick_frame = self.frame_count;
                     if let Err(e) = self.advance_radio() {
                         tracing::error!("Radio advance failed: {e}");
                     }
                 }
-            }
 
-            if self.upload_mode && self.upload_waiting {
-                if self.frame_count % 10 == 0 {
+            if self.upload_mode && self.upload_waiting
+                && self.frame_count.is_multiple_of(10) {
                     let username = self.current_user.as_ref().unwrap().username.clone();
                     let current = crate::ssh::list_uploaded_images(&username);
                     if current.len() > self.upload_known_count {
@@ -333,13 +331,12 @@ impl App {
                         self.upload_known_count = current.len();
                         self.uploaded_images = current;
                         self.list_state.select(Some(0));
-                        self.set_status(format!("✅ Archivo recibido — seleccioná con Enter"));
+                        self.set_status("✅ Archivo recibido — seleccioná con Enter".to_string());
                     }
                 }
-            }
 
             // Global watcher: detecta nuevos archivos en cualquier pantalla
-            if self.current_user.is_some() && self.frame_count % 30 == 0 {
+            if self.current_user.is_some() && self.frame_count.is_multiple_of(30) {
                 let username = self.current_user.as_ref().unwrap().username.clone();
                 let current = crate::ssh::list_uploaded_images(&username);
                 if current.len() != self.upload_watch_count {
@@ -366,8 +363,8 @@ impl App {
 
             // Refresca los widgets de "actividad reciente" del sidebar (no
             // bloqueante: si falla, se conserva la última lista conocida).
-            if self.frame_count % 30 == 0 {
-                if let Some(user_id) = self.current_user.as_ref().map(|u| u.id) {
+            if self.frame_count.is_multiple_of(30)
+                && let Some(user_id) = self.current_user.as_ref().map(|u| u.id) {
                     if let Ok(previews) = self.db.get_recent_message_previews(user_id, 4) {
                         self.message_previews = previews;
                     }
@@ -375,7 +372,6 @@ impl App {
                         self.notification_previews = recent;
                     }
                 }
-            }
 
             if self.needs_clear {
                 terminal.clear()?;
@@ -407,9 +403,9 @@ impl App {
 
             let mut should_break = false;
             let event_result = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false) {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        if key.kind == KeyEventKind::Press {
+                if event::poll(std::time::Duration::from_millis(80)).unwrap_or(false)
+                    && let Ok(Event::Key(key)) = event::read()
+                        && key.kind == KeyEventKind::Press {
                             match self.handle_key(key) {
                                 Ok(false) => should_break = true,
                                 Ok(true) => {}
@@ -422,8 +418,6 @@ impl App {
                                 }
                             }
                         }
-                    }
-                }
             }));
             match event_result {
                 Ok(()) => {}
@@ -508,12 +502,10 @@ impl App {
         if self.current_user.is_some()
             && key.modifiers == KeyModifiers::NONE
             && !self.is_text_entry_screen()
-        {
-            if let KeyCode::Char(c @ '1'..='5') = key.code {
+            && let KeyCode::Char(c @ '1'..='5') = key.code {
                 self.jump_to_section(c.to_digit(10).unwrap() as usize - 1)?;
                 return Ok(true);
             }
-        }
         match self.screen {
             Screen::Login => self.handle_login_key(key),
             Screen::Register => self.handle_register_key(key),
@@ -565,9 +557,9 @@ impl App {
                                     let (secret, _) = crate::db::derive_keypair(password, username);
                                     self.e2e_secret = Some(secret);
                                     self.upload_watch_count =
-                                        crate::ssh::list_uploaded_images(&username).len();
+                                        crate::ssh::list_uploaded_images(username).len();
                                     if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
-                                        crate::ssh::write_scp_user_for_token(&ip, &username);
+                                        crate::ssh::write_scp_user_for_token(&ip, username);
                                     }
                                     self.screen = Screen::Timeline;
                                     self.page = 0;
@@ -642,9 +634,9 @@ impl App {
                                 let (secret, _) = crate::db::derive_keypair(password, username);
                                 self.e2e_secret = Some(secret);
                                 self.upload_watch_count =
-                                    crate::ssh::list_uploaded_images(&username).len();
+                                    crate::ssh::list_uploaded_images(username).len();
                                 if let Ok(ip) = std::env::var("SSH_CLIENT_IP") {
-                                    crate::ssh::write_scp_user_for_token(&ip, &username);
+                                    crate::ssh::write_scp_user_for_token(&ip, username);
                                 }
                                 self.screen = Screen::Timeline;
                                 self.page = 0;
@@ -761,8 +753,8 @@ impl App {
                 self.refresh_timeline()?;
             }
             KeyCode::Enter => {
-                if let Some(i) = self.list_state.selected() {
-                    if i < self.timeline.len() {
+                if let Some(i) = self.list_state.selected()
+                    && i < self.timeline.len() {
                         let post = &self.timeline[i];
                         let pid = post.id;
                         self.viewed_post = Some(post.clone());
@@ -772,7 +764,6 @@ impl App {
                         self.edit_mode = false;
                         self.screen = Screen::PostDetail(pid);
                     }
-                }
             }
             KeyCode::Char('i') => {
                 let img = self
@@ -784,14 +775,12 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some(post) = self.timeline.get(i) {
-                        if Self::post_has_image(post) {
+                if let Some(i) = self.list_state.selected()
+                    && let Some(post) = self.timeline.get(i)
+                        && Self::post_has_image(post) {
                             let path = post.image_path.clone().unwrap();
                             Self::show_download_instructions(&path, self);
                         }
-                    }
-                }
             }
             _ => {}
         }
@@ -808,15 +797,14 @@ impl App {
                     self.saved_post_input.clear();
                 }
                 KeyCode::Enter => {
-                    if let Some(i) = self.list_state.selected() {
-                        if let Some((name, _)) = self.uploaded_images.get(i) {
+                    if let Some(i) = self.list_state.selected()
+                        && let Some((name, _)) = self.uploaded_images.get(i) {
                             let username = &self.current_user.as_ref().unwrap().username;
                             let upload_path =
                                 format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
                             self.attached_image = Some(upload_path);
                             self.set_status(format!("Imagen adjuntada: {}", name));
                         }
-                    }
                     self.leave_upload_mode();
                     self.input.clear();
                     self.input.push_str(&self.saved_post_input);
@@ -838,7 +826,7 @@ impl App {
                 }
                 KeyCode::Char('r') => {
                     let username = &self.current_user.as_ref().unwrap().username.clone();
-                    self.uploaded_images = crate::ssh::list_uploaded_images(&username);
+                    self.uploaded_images = crate::ssh::list_uploaded_images(username);
                     self.upload_known_count = self.uploaded_images.len();
                     self.set_status(format!(
                         "Lista actualizada ({} archivos)",
@@ -847,8 +835,8 @@ impl App {
                 }
                 KeyCode::Char('d') => {
                     let username = self.current_user.as_ref().unwrap().username.clone();
-                    if let Some(i) = self.list_state.selected() {
-                        if let Some((name, _)) = self.uploaded_images.get(i) {
+                    if let Some(i) = self.list_state.selected()
+                        && let Some((name, _)) = self.uploaded_images.get(i) {
                             let path =
                                 format!("{}/{}/{}", crate::ssh::upload_dir(), username, name);
                             if std::fs::remove_file(&path).is_ok() {
@@ -870,7 +858,6 @@ impl App {
                                 self.list_state.select(Some(self.uploaded_images.len() - 1));
                             }
                         }
-                    }
                 }
                 _ => {}
             }
@@ -1008,7 +995,7 @@ impl App {
             Some((_host, rest)) => rest,
             None => return false,
         };
-        let path = path.split(|c| c == '?' || c == '#').next().unwrap_or("");
+        let path = path.split(['?', '#']).next().unwrap_or("");
         match path.rsplit_once('.') {
             Some((_, ext)) => matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp"),
             None => false,
@@ -1058,7 +1045,7 @@ impl App {
             authority.split(':').next().unwrap_or("")
         };
         // Descarta credenciales embebidas (user@host).
-        let host = host.split('@').last().unwrap_or(host);
+        let host = host.split('@').next_back().unwrap_or(host);
         if host.is_empty() {
             return false;
         }
@@ -1190,11 +1177,9 @@ impl App {
                 .stderr(std::process::Stdio::null())
                 .stdout(std::process::Stdio::inherit())
                 .status()
-            {
-                if status.success() {
+                && status.success() {
                     return true;
                 }
-            }
         }
         false
     }
@@ -1312,9 +1297,7 @@ impl App {
         }
 
         // Bottom bar
-        let bar = format!(
-            "\n─────────────────────────────────────────────────────────\n  d: descargar  |  Enter/q/Esc: volver"
-        );
+        let bar = "\n─────────────────────────────────────────────────────────\n  d: descargar  |  Enter/q/Esc: volver".to_string();
         println!("{}", bar);
         let _ = std::io::stdout().flush();
 
@@ -1325,8 +1308,8 @@ impl App {
             }
             match event::poll(std::time::Duration::from_millis(200)) {
                 Ok(true) => {
-                    if let Ok(Event::Key(key)) = event::read() {
-                        if key.kind == KeyEventKind::Press {
+                    if let Ok(Event::Key(key)) = event::read()
+                        && key.kind == KeyEventKind::Press {
                             match key.code {
                                 KeyCode::Char('d') => {
                                     Self::print_download_instructions(actual_path);
@@ -1335,7 +1318,6 @@ impl App {
                                 _ => {}
                             }
                         }
-                    }
                 }
                 Ok(false) => {}
                 Err(_) => break,
@@ -1417,11 +1399,10 @@ impl App {
             return None;
         }
 
-        if let Some(len) = response.content_length() {
-            if len > MAX_SIZE {
+        if let Some(len) = response.content_length()
+            && len > MAX_SIZE {
                 return None;
             }
-        }
 
         let mut buf = Vec::new();
         use std::io::Read;
@@ -1458,7 +1439,7 @@ impl App {
         };
 
         // Copy to uploads dir for SCP download
-        let copy_name = format!("{}", fname);
+        let copy_name = fname.to_string();
         let copy_path = format!("{}/{}", crate::ssh::upload_dir(), fname);
         let _ = std::fs::create_dir_all(crate::ssh::upload_dir());
         std::fs::write(&copy_path, &data).ok();
@@ -1480,16 +1461,14 @@ impl App {
 
     fn wait_for_exit_key() {
         loop {
-            if let Ok(true) = event::poll(std::time::Duration::from_millis(100)) {
-                if let Ok(Event::Key(key)) = event::read() {
-                    if key.kind == KeyEventKind::Press {
+            if let Ok(true) = event::poll(std::time::Duration::from_millis(100))
+                && let Ok(Event::Key(key)) = event::read()
+                    && key.kind == KeyEventKind::Press {
                         match key.code {
                             KeyCode::Enter | KeyCode::Char('q') | KeyCode::Esc => break,
                             _ => {}
                         }
                     }
-                }
-            }
         }
     }
 
@@ -1509,7 +1488,7 @@ impl App {
     }
 
     fn post_has_image(post: &Post) -> bool {
-        post.image_path.as_ref().map_or(false, |p| !p.is_empty())
+        post.image_path.as_ref().is_some_and(|p| !p.is_empty())
     }
 
     fn handle_post_detail_key(&mut self, key: event::KeyEvent) -> Result<bool> {
@@ -1569,8 +1548,8 @@ impl App {
                     self.edit_buffer.pop();
                 }
                 KeyCode::Enter => {
-                    if !self.edit_buffer.trim().is_empty() {
-                        if let Some(ref post) = self.viewed_post.clone() {
+                    if !self.edit_buffer.trim().is_empty()
+                        && let Some(ref post) = self.viewed_post.clone() {
                             self.db
                                 .update_post(post.id, user_id, self.edit_buffer.trim())?;
                             self.viewed_post = Some(Post {
@@ -1579,7 +1558,6 @@ impl App {
                             });
                             self.set_status(t!(self, post_detail_edited).to_string());
                         }
-                    }
                     self.edit_mode = false;
                 }
                 KeyCode::Esc => {
@@ -1602,14 +1580,13 @@ impl App {
                 self.refresh_timeline()?;
             }
             KeyCode::Char('y') if self.confirming_delete_post => {
-                if let Some(ref post) = self.viewed_post.clone() {
-                    if post.user_id == user_id {
+                if let Some(ref post) = self.viewed_post.clone()
+                    && post.user_id == user_id {
                         self.db.delete_post(post.id, user_id)?;
                         self.set_status(t!(self, post_detail_deleted).to_string());
                         self.screen = Screen::Timeline;
                         self.refresh_timeline()?;
                     }
-                }
                 self.confirming_delete_post = false;
             }
             KeyCode::Char('n') if self.confirming_delete_post => {
@@ -1630,20 +1607,18 @@ impl App {
                 self.comment_mode = true;
             }
             KeyCode::Char('e') => {
-                if let Some(ref post) = self.viewed_post {
-                    if post.user_id == user_id {
+                if let Some(ref post) = self.viewed_post
+                    && post.user_id == user_id {
                         self.edit_buffer = post.content.clone();
                         self.edit_mode = true;
                     }
-                }
             }
             KeyCode::Char('r') => {
-                if let Some(i) = self.comment_list_state.selected() {
-                    if let Some(&cid) = self.flat_comment_ids.get(i) {
+                if let Some(i) = self.comment_list_state.selected()
+                    && let Some(&cid) = self.flat_comment_ids.get(i) {
                         self.reply_to_comment_id = Some(cid);
                         self.comment_mode = true;
                     }
-                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.flat_comment_ids.len();
@@ -1660,10 +1635,10 @@ impl App {
                 }
             }
             KeyCode::Char('d') => {
-                if let Some(i) = self.comment_list_state.selected() {
-                    if let Some(&cid) = self.flat_comment_ids.get(i) {
-                        if let Some(ref comment) = self.post_comments.iter().find(|c| c.id == cid) {
-                            if comment.user_id == user_id {
+                if let Some(i) = self.comment_list_state.selected()
+                    && let Some(&cid) = self.flat_comment_ids.get(i)
+                        && let Some(comment) = self.post_comments.iter().find(|c| c.id == cid)
+                            && comment.user_id == user_id {
                                 self.db.delete_comment(cid, user_id)?;
                                 if let Some(ref post) = self.viewed_post {
                                     self.refresh_comments(post.id)?;
@@ -1676,17 +1651,13 @@ impl App {
                                 }
                                 self.set_status(t!(self, post_detail_comment_deleted).to_string());
                             }
-                        }
-                    }
-                }
             }
             KeyCode::Char('D') => {
-                if let Some(ref post) = self.viewed_post {
-                    if post.user_id == user_id {
+                if let Some(ref post) = self.viewed_post
+                    && post.user_id == user_id {
                         self.confirming_delete_post = true;
                         self.set_status(t!(self, post_detail_delete_confirm).to_string());
                     }
-                }
             }
             _ => {}
         }
@@ -2156,13 +2127,12 @@ impl App {
                     } else {
                         &self.profile_following.clone()
                     };
-                    if let Some(i) = self.list_state.selected() {
-                        if let Some(user) = list.get(i) {
+                    if let Some(i) = self.list_state.selected()
+                        && let Some(user) = list.get(i) {
                             self.show_follow_list = false;
                             self.screen = Screen::Profile(user.id);
                             return self.load_profile(user.id).map(|_| true);
                         }
-                    }
                 }
                 KeyCode::Esc | KeyCode::Char('b') => {
                     self.show_follow_list = false;
@@ -2231,8 +2201,8 @@ impl App {
             KeyCode::Char('f') => {
                 let viewed_id = self.viewed_user.as_ref().map(|u| u.id);
                 let viewed_username = self.viewed_user.as_ref().map(|u| u.username.clone());
-                if let Some(id) = viewed_id {
-                    if id != user_id {
+                if let Some(id) = viewed_id
+                    && id != user_id {
                         if self.is_following_viewed {
                             self.db.unfollow_user(user_id, id)?;
                             self.is_following_viewed = false;
@@ -2252,39 +2222,35 @@ impl App {
                             self.db
                                 .get_timeline(user_id, offset, self.page_size as u64 + 1)?;
                     }
-                }
             }
             KeyCode::Char('e') => {
-                if self.viewed_user.as_ref().map(|u| u.id) == Some(user_id) {
-                    if let Some(ref u) = self.viewed_user {
+                if self.viewed_user.as_ref().map(|u| u.id) == Some(user_id)
+                    && let Some(ref u) = self.viewed_user {
                         self.profile_display_name = u.display_name.clone();
                         self.profile_bio = u.bio.clone();
                         self.edit_profile_focus = 0;
                         self.screen = Screen::EditProfile;
                         self.input.clear();
                     }
-                }
             }
             KeyCode::Char('x') => {
-                if let Some(ref viewed) = self.viewed_user {
-                    if viewed.id == user_id {
+                if let Some(ref viewed) = self.viewed_user
+                    && viewed.id == user_id {
                         self.confirming_delete = true;
                         self.input.clear();
                         self.set_status(t!(self, profile_delete_confirm).to_string());
                     }
-                }
             }
             KeyCode::Char('m') => {
-                if self.viewed_user.as_ref().map(|u| u.id) != Some(user_id) {
-                    if let Some(ref viewed) = self.viewed_user {
+                if self.viewed_user.as_ref().map(|u| u.id) != Some(user_id)
+                    && let Some(ref viewed) = self.viewed_user {
                         let other_id = viewed.id;
                         self.load_chat(other_id)?;
                         self.screen = Screen::Chat(other_id);
                     }
-                }
             }
-            KeyCode::Char('E') => {
-                if self.viewed_user.as_ref().map(|u| u.id) == Some(user_id) {
+            KeyCode::Char('E')
+                if self.viewed_user.as_ref().map(|u| u.id) == Some(user_id) => {
                     let username = self.current_user.as_ref().unwrap().username.clone();
                     if let Some(ip) = crate::firewall::get_client_ip("SSH_CLIENT_IP") {
                         crate::firewall::allow_scp(&ip);
@@ -2304,7 +2270,6 @@ impl App {
                         }
                     }
                 }
-            }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.viewed_user_posts.len();
                 if len > 0 {
@@ -2320,8 +2285,8 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some(post) = self.viewed_user_posts.get(i) {
+                if let Some(i) = self.list_state.selected()
+                    && let Some(post) = self.viewed_user_posts.get(i) {
                         let pid = post.id;
                         self.viewed_post = Some(post.clone());
                         self.refresh_comments(pid)?;
@@ -2330,7 +2295,6 @@ impl App {
                         self.edit_mode = false;
                         self.screen = Screen::PostDetail(pid);
                     }
-                }
             }
             _ => {}
         }
@@ -2382,15 +2346,13 @@ impl App {
                 self.input.pop();
             }
             KeyCode::Enter => {
-                if !self.search_results.is_empty() {
-                    if let Some(i) = self.list_state.selected() {
-                        if let Some(user) = self.search_results.get(i) {
+                if !self.search_results.is_empty()
+                    && let Some(i) = self.list_state.selected()
+                        && let Some(user) = self.search_results.get(i) {
                             self.screen = Screen::Profile(user.id);
                             self.input.clear();
                             return self.load_profile(user.id).map(|_| true);
                         }
-                    }
-                }
                 let query = self.input.trim().to_string();
                 if !query.is_empty() {
                     self.page = 0;
@@ -2455,8 +2417,8 @@ impl App {
             }
             KeyCode::Enter => {
                 if self.list_state.selected().is_some() && !self.post_search_results.is_empty() {
-                    if let Some(i) = self.list_state.selected() {
-                        if let Some(post) = self.post_search_results.get(i) {
+                    if let Some(i) = self.list_state.selected()
+                        && let Some(post) = self.post_search_results.get(i) {
                             let pid = post.id;
                             self.viewed_post = Some(post.clone());
                             self.refresh_comments(pid)?;
@@ -2465,7 +2427,6 @@ impl App {
                             self.edit_mode = false;
                             self.screen = Screen::PostDetail(pid);
                         }
-                    }
                 } else {
                     self.page = 0;
                     self.do_post_search()?;
@@ -2508,8 +2469,8 @@ impl App {
                 self.screen = Screen::PostSearch;
             }
             KeyCode::Enter => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some(post) = self.hashtag_posts.get(i) {
+                if let Some(i) = self.list_state.selected()
+                    && let Some(post) = self.hashtag_posts.get(i) {
                         let pid = post.id;
                         self.viewed_post = Some(post.clone());
                         self.refresh_comments(pid)?;
@@ -2518,7 +2479,6 @@ impl App {
                         self.edit_mode = false;
                         self.screen = Screen::PostDetail(pid);
                     }
-                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.hashtag_posts.len();
@@ -2546,14 +2506,13 @@ impl App {
                 self.refresh_timeline()?;
             }
             KeyCode::Enter => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some((tag, _)) = self.trending_hashtags.get(i) {
+                if let Some(i) = self.list_state.selected()
+                    && let Some((tag, _)) = self.trending_hashtags.get(i) {
                         self.hashtag_current = tag.clone();
                         self.hashtag_posts = self.db.get_posts_by_hashtag(tag, 0, 50)?;
                         self.screen = Screen::HashtagView;
                         self.list_state.select(Some(0));
                     }
-                }
             }
             KeyCode::Up | KeyCode::Char('k') => {
                 let len = self.trending_hashtags.len();
@@ -2773,15 +2732,14 @@ impl App {
             .as_ref()
             .and_then(|p| p.public_key.clone());
         for msg in &mut self.chat_messages {
-            if msg.encrypted {
-                if let (Some(secret), Some(pk)) = (&secret, &partner_pk) {
+            if msg.encrypted
+                && let (Some(secret), Some(pk)) = (&secret, &partner_pk) {
                     if let Ok(plain) = crate::db::e2e_decrypt(secret, pk, &msg.content) {
                         msg.content = plain;
                     } else {
                         msg.content = "[🔒 mensaje cifrado — no se pudo descifrar]".into();
                     }
                 }
-            }
         }
     }
 
@@ -2815,13 +2773,12 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(i) = self.list_state.selected() {
-                    if let Some(user) = self.conversations.get(i) {
+                if let Some(i) = self.list_state.selected()
+                    && let Some(user) = self.conversations.get(i) {
                         let user_id = user.id;
                         self.load_chat(user_id)?;
                         self.screen = Screen::Chat(user_id);
                     }
-                }
             }
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.screen = Screen::Timeline;
@@ -2842,8 +2799,8 @@ impl App {
             KeyCode::Backspace => {
                 self.input.pop();
             }
-            KeyCode::Enter => {
-                if !self.input.trim().is_empty() {
+            KeyCode::Enter
+                if !self.input.trim().is_empty() => {
                     let partner_id = self.chat_partner.as_ref().map(|u| u.id).unwrap_or(0);
                     if let Err(e) =
                         self.plugins
@@ -2859,7 +2816,6 @@ impl App {
                     self.input.clear();
                     self.unread_count = self.db.get_unread_count(user_id)?;
                 }
-            }
             KeyCode::Esc => {
                 self.load_conversations()?;
                 self.screen = Screen::Messages;
@@ -2875,18 +2831,16 @@ impl App {
                 self.edit_profile_focus = (self.edit_profile_focus + 1) % 3;
             }
             KeyCode::Up => {
-                if self.edit_profile_focus == 2 {
-                    if let Some(ref mut u) = self.current_user {
+                if self.edit_profile_focus == 2
+                    && let Some(ref mut u) = self.current_user {
                         u.utc_offset = (u.utc_offset + 30).min(840);
                     }
-                }
             }
             KeyCode::Down => {
-                if self.edit_profile_focus == 2 {
-                    if let Some(ref mut u) = self.current_user {
+                if self.edit_profile_focus == 2
+                    && let Some(ref mut u) = self.current_user {
                         u.utc_offset = (u.utc_offset - 30).max(-720);
                     }
-                }
             }
             KeyCode::Char(c) => {
                 if self.edit_profile_focus == 0 {
@@ -2950,8 +2904,8 @@ impl App {
                 }
             }
             KeyCode::Enter => {
-                if let Some(i) = self.notif_list_state.selected() {
-                    if let Some(notif) = self.notifications.get(i) {
+                if let Some(i) = self.notif_list_state.selected()
+                    && let Some(notif) = self.notifications.get(i) {
                         self.unread_notifications = 0;
                         let _ = self.db.mark_notifications_read(user_id);
                         match notif.notif_type.as_str() {
@@ -2960,8 +2914,8 @@ impl App {
                                 return self.load_profile(notif.from_user_id).map(|_| true);
                             }
                             "mention" => {
-                                if let Some(post_id) = notif.related_id {
-                                    if let Ok(Some(post)) = self.db.get_post_by_id(post_id) {
+                                if let Some(post_id) = notif.related_id
+                                    && let Ok(Some(post)) = self.db.get_post_by_id(post_id) {
                                         self.viewed_post = Some(post);
                                         let _ = self.refresh_comments(post_id);
                                         self.comment_list_state = ListState::default();
@@ -2969,12 +2923,10 @@ impl App {
                                         self.comment_input.clear();
                                         self.screen = Screen::PostDetail(post_id);
                                     }
-                                }
                             }
                             _ => {}
                         }
                     }
-                }
             }
             KeyCode::Esc | KeyCode::Char('b') => {
                 self.unread_notifications = 0;
@@ -3840,7 +3792,7 @@ impl App {
                         } else {
                             "  "
                         };
-                        let is_new = self.upload_new_file.as_ref().map_or(false, |n| n == name);
+                        let is_new = self.upload_new_file.as_ref() == Some(name);
                         let name_style = if is_new {
                             Style::default()
                                 .fg(self.theme.success)

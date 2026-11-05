@@ -317,7 +317,7 @@ impl DatabaseOps for ShardManager {
 
     fn get_comments(&self, post_id: i64) -> Result<Vec<Comment>> {
         let mut all = self.fan_out(|s| s.get_comments(post_id))?;
-        all.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        all.sort_by_key(|a| a.created_at);
         all.dedup_by(|a, b| a.id == b.id);
         Ok(all)
     }
@@ -376,7 +376,7 @@ impl DatabaseOps for ShardManager {
         for shard in &self.shards {
             all.extend(shard.get_messages(user_id, other_id)?);
         }
-        all.sort_by(|a, b| a.created_at.cmp(&b.created_at));
+        all.sort_by_key(|a| a.created_at);
         all.dedup_by(|a, b| a.id == b.id);
         for m in &mut all {
             if let Some(u) = self.get_user_by_id(m.sender_id)? {
@@ -760,8 +760,6 @@ mod condense_tests {
 
 #[cfg(test)]
 mod seed_sync_tests {
-    use super::*;
-
     #[test]
     fn test_seed_then_new_ops_no_id_collision() {
         let dir = std::env::temp_dir().join("agora_seed_sync");

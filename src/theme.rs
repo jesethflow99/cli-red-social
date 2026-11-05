@@ -34,7 +34,7 @@ impl AppTheme {
     }
 
     pub fn list_item_style(&self, index: usize) -> Style {
-        if index % 2 == 0 {
+        if index.is_multiple_of(2) {
             Style::default().bg(self.zebra_even)
         } else {
             Style::default().bg(self.zebra_odd)
