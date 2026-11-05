@@ -934,7 +934,12 @@ impl App {
                 self.uploaded_images = crate::ssh::list_uploaded_images(&username);
                 self.upload_known_count = self.uploaded_images.len();
                 self.list_state.select(Some(0));
-                let cmd = format!("scp -P 2222 archivo.jpg localhost:{}/archivo.jpg", username);
+                let cmd = format!(
+                    "scp -P {} archivo.jpg {}:{}/archivo.jpg",
+                    Self::public_ssh_port(),
+                    Self::public_host(),
+                    username
+                );
                 self.set_status(format!("📥 ESPERANDO ARCHIVO — {}", cmd));
             }
             KeyCode::Char(c) => self.input.push(c),
@@ -970,6 +975,8 @@ impl App {
                     self.page = 0;
                     self.screen = Screen::Timeline;
                     self.refresh_timeline()?;
+                } else {
+                    self.set_status(t!(self, create_post_empty).to_string());
                 }
             }
             _ => {}
@@ -982,21 +989,76 @@ impl App {
         if !lower.starts_with("http://") && !lower.starts_with("https://") {
             return false;
         }
-        if !Self::is_safe_url(url) {
+        if !Self::has_image_extension(url) {
             return false;
         }
-        true
+        Self::is_safe_url(url)
+    }
+
+    /// Comprueba que el path de la URL termine en una extensión de imagen
+    /// admitida, ignorando query string y fragmento.
+    fn has_image_extension(url: &str) -> bool {
+        let lower = url.trim().to_lowercase();
+        let without_scheme = lower
+            .strip_prefix("http://")
+            .or_else(|| lower.strip_prefix("https://"))
+            .unwrap_or(&lower);
+        // Sin '/' no hay path (solo host) → no hay extensión.
+        let path = match without_scheme.split_once('/') {
+            Some((_host, rest)) => rest,
+            None => return false,
+        };
+        let path = path.split(|c| c == '?' || c == '#').next().unwrap_or("");
+        match path.rsplit_once('.') {
+            Some((_, ext)) => matches!(ext, "jpg" | "jpeg" | "png" | "gif" | "webp"),
+            None => false,
+        }
+    }
+
+    fn ip_is_public(ip: std::net::IpAddr) -> bool {
+        match ip {
+            std::net::IpAddr::V4(v4) => {
+                !v4.is_private()
+                    && !v4.is_loopback()
+                    && !v4.is_unspecified()
+                    && !v4.is_link_local()
+                    && !v4.is_broadcast()
+                    && !v4.is_documentation()
+            }
+            std::net::IpAddr::V6(v6) => {
+                if v6.is_loopback() || v6.is_unspecified() {
+                    return false;
+                }
+                if let Some(v4) = v6.to_ipv4_mapped() {
+                    return Self::ip_is_public(std::net::IpAddr::V4(v4));
+                }
+                let first = v6.segments()[0];
+                // fc00::/7 (unique local)
+                if (first & 0xfe00) == 0xfc00 {
+                    return false;
+                }
+                // fe80::/10 (link local)
+                if (first & 0xffc0) == 0xfe80 {
+                    return false;
+                }
+                true
+            }
+        }
     }
 
     fn is_safe_url(url: &str) -> bool {
-        let host = url
+        let after_scheme = url
             .trim_start_matches("http://")
-            .trim_start_matches("https://")
-            .split('/')
-            .next()
-            .and_then(|h| h.split(':').next())
-            .and_then(|h| h.split('@').last())
-            .unwrap_or("");
+            .trim_start_matches("https://");
+        let authority = after_scheme.split('/').next().unwrap_or("");
+        // Extrae el host soportando IPv6 entre corchetes ([::1]:port).
+        let host = if let Some(stripped) = authority.strip_prefix('[') {
+            stripped.split(']').next().unwrap_or("")
+        } else {
+            authority.split(':').next().unwrap_or("")
+        };
+        // Descarta credenciales embebidas (user@host).
+        let host = host.split('@').last().unwrap_or(host);
         if host.is_empty() {
             return false;
         }
@@ -1016,19 +1078,49 @@ impl App {
             }
         }
         if let Ok(ip) = host_lower.parse::<std::net::IpAddr>() {
-            match ip {
-                std::net::IpAddr::V4(v4) => {
-                    !v4.is_private() && !v4.is_loopback() && !v4.is_unspecified()
+            return Self::ip_is_public(ip);
+        }
+        // Hostname: resolver DNS y rechazar si CUALQUIER IP resuelta es
+        // privada/loopback/link-local (anti-SSRF).
+        Self::resolve_host_is_public(&host_lower)
+    }
+
+    fn resolve_host_is_public(host: &str) -> bool {
+        use std::net::ToSocketAddrs;
+        match (host, 443u16).to_socket_addrs() {
+            Ok(addrs) => {
+                let mut any = false;
+                for sa in addrs {
+                    any = true;
+                    if !Self::ip_is_public(sa.ip()) {
+                        return false;
+                    }
                 }
-                std::net::IpAddr::V6(v6) => !v6.is_loopback() && !v6.is_unspecified(),
+                any
             }
-        } else {
-            true
+            // Si no se puede resolver, se rechaza por seguridad.
+            Err(_) => false,
         }
     }
 
     fn is_url(s: &str) -> bool {
         s.starts_with("http://") || s.starts_with("https://")
+    }
+
+    /// Host público para los comandos `scp` mostrados al usuario.
+    fn public_host() -> String {
+        std::env::var("AGORA_PUBLIC_HOST")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "localhost".to_string())
+    }
+
+    /// Puerto SSH público para los comandos `scp` mostrados al usuario.
+    fn public_ssh_port() -> String {
+        std::env::var("AGORA_PUBLIC_SSH_PORT")
+            .ok()
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "2222".to_string())
     }
 
     fn format_size(bytes: u64) -> String {
@@ -1043,23 +1135,58 @@ impl App {
 
     fn view_image(path: &str) -> bool {
         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 40));
-        let img_w = 80.min(term_w.saturating_sub(2));
-        let img_h = 40.min(term_h.saturating_sub(2));
-        let x = (term_w - img_w) / 2;
-        let y = (term_h - img_h) / 2;
+        // Ajusta la imagen a la terminal con margen para evitar que chafa
+        // renderice más ancho que la pantalla (causaba líneas "desplazadas").
+        let img_w = term_w.saturating_sub(2).clamp(20, 120);
+        let img_h = term_h.saturating_sub(3).clamp(10, 60);
+        let x = term_w.saturating_sub(img_w) / 2;
+        let y = term_h.saturating_sub(img_h) / 2;
         let place = format!("{}x{}@{}x{}", img_w, img_h, x, y);
         let img_w_s = img_w.to_string();
         let img_h_s = img_h.to_string();
+        let chafa_size = format!("{}x{}", img_w, img_h);
 
-        let viewers: [(&str, &[&str]); 4] = [
-            ("kitten", &["icat", "--place", &place, path]),
-            ("chafa", &["--symbols", "block", path]),
-            ("fim", &["-a", "-q", "-W", &img_w_s, "-H", &img_h_s, path]),
-            ("viu", &["-w", &img_w_s, "-h", &img_h_s, path]),
+        let viewers: Vec<(&str, Vec<String>)> = vec![
+            (
+                "kitten",
+                vec!["icat".into(), "--place".into(), place.clone(), path.into()],
+            ),
+            (
+                "chafa",
+                vec![
+                    "--size".into(),
+                    chafa_size,
+                    "--symbols".into(),
+                    "block".into(),
+                    path.into(),
+                ],
+            ),
+            (
+                "fim",
+                vec![
+                    "-a".into(),
+                    "-q".into(),
+                    "-W".into(),
+                    img_w_s.clone(),
+                    "-H".into(),
+                    img_h_s.clone(),
+                    path.into(),
+                ],
+            ),
+            (
+                "viu",
+                vec![
+                    "-w".into(),
+                    img_w_s.clone(),
+                    "-h".into(),
+                    img_h_s.clone(),
+                    path.into(),
+                ],
+            ),
         ];
         for (cmd, args) in &viewers {
             if let Ok(status) = std::process::Command::new(cmd)
-                .args(*args)
+                .args(args)
                 .stderr(std::process::Stdio::null())
                 .stdout(std::process::Stdio::inherit())
                 .status()
@@ -1222,6 +1349,11 @@ impl App {
 
     fn sync_download(url: &str) -> Option<String> {
         const MAX_SIZE: u64 = 10 * 1024 * 1024;
+        // Revalida anti-SSRF en el momento de la descarga (el servidor es
+        // quien hace la petición, así que no basta con validar al adjuntar).
+        if !Self::is_safe_url(url) {
+            return None;
+        }
         let cache_dir = "/tmp/agora_cache";
         let _ = std::fs::create_dir_all(cache_dir);
 
@@ -1251,6 +1383,16 @@ impl App {
         let client = match reqwest::blocking::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(15))
+            // Valida cada salto de redirección con el mismo chequeo anti-SSRF.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 3 {
+                    attempt.stop()
+                } else if App::is_safe_url(attempt.url().as_str()) {
+                    attempt.follow()
+                } else {
+                    attempt.stop()
+                }
+            }))
             .build()
         {
             Ok(c) => c,
@@ -1261,6 +1403,10 @@ impl App {
             Ok(r) => r,
             Err(_) => return None,
         };
+        // Verifica también la URL final tras redirecciones.
+        if !Self::is_safe_url(response.url().as_str()) {
+            return None;
+        }
 
         let ct = response
             .headers()
@@ -1322,7 +1468,12 @@ impl App {
             fname,
             Self::format_size(data.len() as u64)
         );
-        println!("  scp -P 2222 localhost:{} .\n", copy_name);
+        println!(
+            "  scp -P {} {}:{} .\n",
+            Self::public_ssh_port(),
+            Self::public_host(),
+            copy_name
+        );
         println!("  d: descargar  |  Enter/q/Esc: volver");
         let _ = std::io::stdout().flush();
     }
@@ -2141,8 +2292,11 @@ impl App {
                     match self.db.export_user_data(&username) {
                         Ok(filename) => {
                             self.set_status(format!(
-                                "Exportado: {}. Descarga con: scp -P 2222 localhost:{} .",
-                                filename, filename
+                                "Exportado: {}. Descarga con: scp -P {} {}:{} .",
+                                filename,
+                                Self::public_ssh_port(),
+                                Self::public_host(),
+                                filename
                             ));
                         }
                         Err(e) => {
@@ -2526,23 +2680,26 @@ impl App {
                 self.theme.accent,
                 self.theme.success,
             );
-            let mut line_spans = vec![
-                Span::styled(
+            // Ojo: ratatui NO interpreta '\n' dentro de un Span/Line; hay que
+            // usar varias Lines para que el autor, el contenido y la fecha no
+            // queden pegados en una sola línea.
+            let lines = vec![
+                Line::from(Span::styled(
                     format!("@{}", post.username),
                     Style::default()
                         .fg(self.theme.accent)
                         .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw("\n\n"),
+                )),
+                Line::from(""),
+                Line::from(content_spans),
+                Line::from(""),
+                Line::from(Span::styled(
+                    format!("[{}]", ago),
+                    Style::default().fg(self.theme.muted),
+                )),
             ];
-            line_spans.extend(content_spans);
-            line_spans.push(Span::raw("\n\n"));
-            line_spans.push(Span::styled(
-                format!("[{}]", ago),
-                Style::default().fg(self.theme.muted),
-            ));
 
-            let post_par = Paragraph::new(Line::from(line_spans))
+            let post_par = Paragraph::new(lines)
                 .block(self.theme.simple_block())
                 .wrap(Wrap { trim: false });
             f.render_widget(post_par, chunks[1]);
@@ -3655,7 +3812,9 @@ impl App {
                 .map(|u| u.username.as_str())
                 .unwrap_or("usuario");
             let hint = format!(
-                "scp -P 2222 archivo.jpg localhost:{}/archivo.jpg  [↑↓: elegir  Enter: seleccionar  d: borrar  Esc: volver]",
+                "scp -P {} archivo.jpg {}:{}/archivo.jpg  [↑↓: elegir  Enter: seleccionar  d: borrar  Esc: volver]",
+                Self::public_ssh_port(),
+                Self::public_host(),
                 username
             );
             let hint_par = Paragraph::new(Line::from(Span::styled(
@@ -3965,5 +4124,41 @@ impl App {
             };
             f.render_widget(help, chunks[help_idx]);
         }
+    }
+}
+
+#[cfg(test)]
+mod url_validation_tests {
+    use super::App;
+
+    #[test]
+    fn test_image_extension() {
+        assert!(App::has_image_extension("https://x.com/a.jpg"));
+        assert!(App::has_image_extension("https://x.com/a.JPG"));
+        assert!(App::has_image_extension("https://x.com/a.png?w=1&h=2"));
+        assert!(App::has_image_extension("https://x.com/a.webp#frag"));
+        assert!(App::has_image_extension("http://x.com/dir/a.gif"));
+        assert!(!App::has_image_extension("https://x.com/a.txt"));
+        assert!(!App::has_image_extension("https://x.com/a"));
+        assert!(!App::has_image_extension("https://x.com/images?q=tbn:abc"));
+        assert!(!App::has_image_extension("https://x.com/"));
+    }
+
+    #[test]
+    fn test_safe_url_rejects_private_and_loopback() {
+        assert!(!App::is_safe_url("http://127.0.0.1/x.jpg"));
+        assert!(!App::is_safe_url("http://10.0.0.5/x.jpg"));
+        assert!(!App::is_safe_url("http://192.168.1.1/x.jpg"));
+        assert!(!App::is_safe_url("http://169.254.1.1/x.jpg"));
+        assert!(!App::is_safe_url("http://[::1]/x.jpg"));
+        assert!(!App::is_safe_url("http://0.0.0.0/x.jpg"));
+        assert!(!App::is_safe_url("http://localhost/x.jpg"));
+    }
+
+    #[test]
+    fn test_safe_url_allows_public_literal_ip() {
+        // Sin DNS: IP pública literal.
+        assert!(App::is_safe_url("http://8.8.8.8/x.jpg"));
+        assert!(App::is_safe_url("https://1.1.1.1/x.jpg"));
     }
 }

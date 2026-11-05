@@ -7,7 +7,9 @@ services:
       - "${SSH_PORT:-2222}:2222"
     volumes:
       - ./data:/data
-      - ./keys/agora_host_key:/tmp/host_key:ro
+      # Montar el DIRECTORIO (no el archivo): si el archivo no existe, Docker
+      # crearía un directorio vacío en su lugar y el server fallaría.
+      - ./keys:/keys:ro
     environment:
       - RUST_LOG=info
       - SSH_PASSWORD=${SSH_PASSWORD:?Define SSH_PASSWORD in .env}
@@ -17,7 +19,7 @@ services:
       - AGORA_UPLOAD_DIR=/data/uploads
       - AGORA_PUBLIC_HOST=${AGORA_PUBLIC_HOST:-localhost}
       - AGORA_PUBLIC_SSH_PORT=${SSH_PORT:-2222}
-    command: ["agora", "--port", "2222", "--key", "/tmp/host_key", "--db", "/data/agora.db"]
+    command: ["agora", "--port", "2222", "--key", "/keys/agora_host_key", "--db", "/data/agora.db"]
     networks:
       - agora_net
 

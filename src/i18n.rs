@@ -138,6 +138,7 @@ pub struct LangStrings {
     pub create_post_attach_prompt: &'static str,
     pub create_post_invalid_url: &'static str,
     pub create_post_enter_url: &'static str,
+    pub create_post_empty: &'static str,
     pub create_post_attach_image: &'static str,
 
     pub post_detail_comments: &'static str,
@@ -265,7 +266,7 @@ pub static ES: LangStrings = LangStrings {
     register_error_password_short: "La contraseña debe tener al menos 4 caracteres",
     register_error_name_empty: "El nombre no puede estar vacío",
     register_error_rate: "Demasiados registros. Espera un minuto.",
-    register_error_exists: "El usuario '@{}' ya existe",
+    register_error_exists: "El usuario '{}' ya existe",
 
     timeline_title: "📱 @{} — Timeline",
     timeline_help: "j/k: nav  Enter: ver  /: buscar  #: trends  n: post  s: users  p: perfil  m: msgs  Ctrl+n: notif  i: img  Ctrl+q: salir",
@@ -281,6 +282,7 @@ pub static ES: LangStrings = LangStrings {
     create_post_attach_prompt: "Pega la URL de la imagen y presiona Enter para adjuntarla",
     create_post_invalid_url: "URL no válida — solo jpg, png, gif, webp (Esc para cancelar)",
     create_post_enter_url: "Ingresa una URL o presiona Esc para cancelar",
+    create_post_empty: "El post no puede estar vacío",
     create_post_attach_image: "Ctrl+U: imagen desde URL   Esc: cancelar",
 
     post_detail_comments: " Comentarios ",
@@ -406,7 +408,7 @@ pub static EN: LangStrings = LangStrings {
     register_error_password_short: "Password must be at least 4 characters",
     register_error_name_empty: "Name cannot be empty",
     register_error_rate: "Too many registrations. Wait a minute.",
-    register_error_exists: "User '@{}' already exists",
+    register_error_exists: "User '{}' already exists",
 
     timeline_title: "📱 @{} — Timeline",
     timeline_help: "j/k: nav  Enter: view  /: search  #: trends  n: post  s: users  p: profile  m: msgs  Ctrl+n: notif  i: img  Ctrl+q: quit",
@@ -422,6 +424,7 @@ pub static EN: LangStrings = LangStrings {
     create_post_attach_prompt: "Paste the image URL and press Enter to attach it",
     create_post_invalid_url: "Invalid URL — only jpg, png, gif, webp (Esc to cancel)",
     create_post_enter_url: "Enter a URL or press Esc to cancel",
+    create_post_empty: "The post cannot be empty",
     create_post_attach_image: "Ctrl+U: image from URL   Esc: cancel",
 
     post_detail_comments: " Comments ",

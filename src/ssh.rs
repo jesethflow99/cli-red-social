@@ -21,6 +21,17 @@ use russh_sftp::protocol::{
 
 use crate::db::DatabaseOps;
 
+/// ¿Se puede crear y escribir en este directorio? (no basta con que exista)
+fn dir_is_writable(path: &str) -> bool {
+    if std::fs::create_dir_all(path).is_err() {
+        return false;
+    }
+    let probe = std::path::Path::new(path).join(".agora_write_probe");
+    let ok = std::fs::write(&probe, b"").is_ok();
+    let _ = std::fs::remove_file(&probe);
+    ok
+}
+
 pub fn upload_dir() -> &'static str {
     use std::sync::LazyLock;
     static DIR: LazyLock<String> = LazyLock::new(|| {
@@ -29,7 +40,9 @@ pub fn upload_dir() -> &'static str {
                 return d;
             }
         }
-        if std::path::Path::new("/data").exists() {
+        // Solo usar /data/uploads si es realmente escribible; si /data existe
+        // pero es de solo lectura (p. ej. root en el host), caer a ./uploads.
+        if dir_is_writable("/data/uploads") {
             "/data/uploads".into()
         } else {
             "./uploads".into()
@@ -61,13 +74,25 @@ fn read_scp_user_for_token(token: &str) -> Option<String> {
 
 pub fn write_scp_user_for_token(token: &str, username: &str) {
     let _ = std::fs::create_dir_all(SCP_LOCK_DIR);
-    let path = format!("{}/{}", SCP_LOCK_DIR, token);
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap()
         .as_secs();
     let content = format!("{}\n{}", username, now);
-    let _ = std::fs::write(&path, content);
+    // Token indexado por la clave recibida (normalmente la IP del cliente).
+    let path = format!("{}/{}", SCP_LOCK_DIR, token);
+    let _ = std::fs::write(&path, &content);
+    // Además indexamos por nombre de usuario: el comando mostrado es
+    // `scp ... localhost:<usuario>/archivo.jpg`, y así funciona sin depender
+    // de que la sesión TUI y el SCP usen la misma familia de IP (IPv4/IPv6).
+    if !username.is_empty()
+        && !username.contains('/')
+        && username != "."
+        && username != ".."
+    {
+        let user_path = format!("{}/{}", SCP_LOCK_DIR, username);
+        let _ = std::fs::write(&user_path, &content);
+    }
 }
 
 pub fn clear_scp_user_for_token(token: &str) {

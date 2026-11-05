@@ -2061,6 +2061,10 @@ let conn = self.conn.lock().unwrap();
             DELETE FROM comments; DELETE FROM posts; DELETE FROM follows; DELETE FROM rate_limits; DELETE FROM users;
         ").map_err(|e| anyhow::anyhow!("Error limpiando datos: {}", e))?;
 
+        // Reinicia los contadores AUTOINCREMENT para que re-sembrar no infle
+        // los ids (sqlite_sequence no existe en la primera siembra: se ignora).
+        let _ = conn.execute("DELETE FROM sqlite_sequence", []);
+
         // ── 52 Users ────────────────────────────────────────────────────
         let user_defs: [(&str, &str); 52] = [
             ("alice", "Alice Rodríguez"),
