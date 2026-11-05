@@ -2686,6 +2686,19 @@ impl App {
             .get_timeline(user_id, offset, self.page_size as u64 + 1)?;
         self.unread_count = self.db.get_unread_count(user_id)?;
         self.unread_notifications = self.db.get_unread_notifications_count(user_id)?;
+        // Mantiene una selección válida: tras el login estaba en None y por
+        // eso Enter/i/d no hacían nada hasta pulsar j/k (aunque la UI
+        // resaltaba el primer post).
+        if self.timeline.is_empty() {
+            self.list_state.select(None);
+        } else {
+            let sel = self
+                .list_state
+                .selected()
+                .unwrap_or(0)
+                .min(self.timeline.len().saturating_sub(1));
+            self.list_state.select(Some(sel));
+        }
         Ok(())
     }
 

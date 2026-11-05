@@ -77,6 +77,13 @@ _(ninguno encontrado: no hubo caídas ni pérdida/corrupción de datos)_
 
 ---
 
+### [x] F11 — Enter/i/d no hacían nada tras el login (selección en `None`)
+- **Pasos:** login → (sin mover con j/k) pulsar `Enter`, `i` o `d`.
+- **Esperado:** abrir el post / ver imagen / descargar del primer ítem resaltado.
+- **Actual:** no ocurría nada, aunque la UI resaltaba el primer post con `▶` (el render usaba `selected().unwrap_or(0)` pero los handlers usaban `selected()`).
+- **Fix:** `refresh_timeline()` ahora deja la selección en `Some(0)` (o la mantiene válida) cuando hay posts.
+- **Impacto colateral:** esto también impedía abrir el visor de imágenes justo después del login.
+
 ## Informativo
 
 ### [~] F10 — Clippy: warnings de estilo/dead-code
@@ -84,6 +91,10 @@ _(ninguno encontrado: no hubo caídas ni pérdida/corrupción de datos)_
 - Quedan lints de estilo (`sort_by_key`) y dead-code intencional (E2E/invitaciones planeadas). 0 errores. No bloqueante.
 
 ---
+
+## Nota — visor de imágenes
+- En Docker (sin `kitten`) el visor usa `chafa`, ahora forzado a `--format symbols` y con tamaño acotado a la terminal (sin desborde/“desplazamiento”). Verificado el render de chafa (32 líneas, ancho 64 ≤ 120) y en el contenedor (chafa 1.12.4, exit 0).
+- En un host con `kitten` instalado, el visor prefiere `kitten` (protocolo gráfico Kitty), que puede verse distinto según el terminal.
 
 ## Verificado y funcionando ✅
 
