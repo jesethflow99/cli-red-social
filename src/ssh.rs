@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::io::Write;
 use std::os::fd::AsRawFd;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::task::{Context, Poll};
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -126,6 +128,49 @@ struct SftpSession {
     allowed_user: String,
     client_ip: Option<String>,
     session_token: String,
+}
+
+/// Envuelve el stream del canal SFTP para avisar cuándo termina el subsistema.
+/// `russh_sftp::server::run()` hace `tokio::spawn` internamente y retorna de
+/// inmediato, así que no hay forma de saber cuándo terminó salvo observando el
+/// drop del stream (que ocurre cuando el loop interno termina).
+struct SftpStream<S> {
+    inner: S,
+    done: Option<tokio::sync::oneshot::Sender<()>>,
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for SftpStream<S> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for SftpStream<S> {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
+
+impl<S> Drop for SftpStream<S> {
+    fn drop(&mut self) {
+        if let Some(tx) = self.done.take() {
+            let _ = tx.send(());
+        }
+    }
 }
 
 impl SftpSession {
@@ -893,8 +938,14 @@ impl Handler for SshSession {
         Ok(())
     }
 
-    async fn channel_close(&mut self, _: ChannelId, _: &mut Session) -> Result<(), Self::Error> {
+    async fn channel_close(
+        &mut self,
+        channel: ChannelId,
+        session: &mut Session,
+    ) -> Result<(), Self::Error> {
         self.input_tx = None;
+        // Responder al CHANNEL_CLOSE del cliente (canal de shell/TUI).
+        session.close(channel);
         Ok(())
     }
 
@@ -917,7 +968,24 @@ impl Handler for SshSession {
             sftp.session_token = token;
             sftp.client_ip = ip;
             session.channel_success(channel_id);
-            russh_sftp::server::run(channel.into_stream(), sftp).await;
+            // `run()` spawnea el loop SFTP y retorna; cerramos el canal cuando
+            // el stream se libera (fin del subsistema) para que scp/sftp no
+            // queden esperando el cierre.
+            let handle = session.handle();
+            let (done_tx, done_rx) = tokio::sync::oneshot::channel();
+            let stream = SftpStream {
+                inner: channel.into_stream(),
+                done: Some(done_tx),
+            };
+            russh_sftp::server::run(stream, sftp).await;
+            tokio::spawn(async move {
+                let _ = done_rx.await;
+                // Un subsistema debe reportar exit-status 0 antes de cerrar;
+                // sin esto el cliente (scp) termina con "Exit status -1".
+                let _ = handle.exit_status_request(channel_id, 0).await;
+                let _ = handle.eof(channel_id).await;
+                let _ = handle.close(channel_id).await;
+            });
         } else {
             session.channel_failure(channel_id);
         }

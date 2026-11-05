@@ -41,7 +41,7 @@ _(ninguno encontrado: no hubo caídas ni pérdida/corrupción de datos)_
 - **Evidencia:** la fase SCP solo funcionó tras exportar `AGORA_UPLOAD_DIR`; en Docker funciona porque `/data` es escribible.
 - **Plan:** elegir `/data/uploads` solo si es **escribible** (probar escritura), si no `./uploads`. Tests.
 
-### [ ] F4 — `scp` sube el archivo pero el cliente queda colgado
+### [x] F4 — `scp` sube el archivo pero el cliente queda colgado
 - **Pasos:** `scp -P <port> foto.jpg localhost:alice/x.jpg`.
 - **Esperado:** subida y salida limpia.
 - **Actual:** el archivo **sí** se sube y procesa (512×384) pero el cliente no cierra (exit 124 por timeout).
@@ -104,5 +104,6 @@ path traversal, cross-user), Docker (salud, env, sesión).
 - **F7:** se quitó el `@` extra del mensaje de duplicado. Verificado: `El usuario 'alice' ya existe`.
 - **F8:** el seed resetea `sqlite_sequence`. Verificado: tras 2 seeds, `next_id=250`, `alice id=1`.
 - **F9:** post vacío muestra "El post no puede estar vacío". Verificado.
+- **F4:** `russh_sftp::server::run()` spawnea el loop y retorna; ahora se envuelve el stream para detectar el fin del subsistema y se envía `exit-status 0`, `eof` y `close` del canal. Verificado: `scp` sube, procesa la imagen y **sale con exit 0** en ~0.1s (antes colgaba hasta el timeout). La seguridad (traversal/cross-user) sigue rechazando.
 
 Tests: **47/47 OK**. Pendiente: F4 (confirmar con cliente SCP real) y F10 (warnings de estilo).
