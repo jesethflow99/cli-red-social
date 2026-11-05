@@ -1124,8 +1124,9 @@ impl App {
         let (term_w, term_h) = crossterm::terminal::size().unwrap_or((80, 40));
         // Ajusta la imagen a la terminal con margen para evitar que chafa
         // renderice más ancho que la pantalla (causaba líneas "desplazadas").
-        let img_w = term_w.saturating_sub(2).clamp(20, 120);
-        let img_h = term_h.saturating_sub(3).clamp(10, 60);
+        // El tope es siempre <= term_w-2, incluso en terminales pequeñas.
+        let img_w = term_w.saturating_sub(2).min(120).max(1);
+        let img_h = term_h.saturating_sub(3).min(60).max(1);
         let x = term_w.saturating_sub(img_w) / 2;
         let y = term_h.saturating_sub(img_h) / 2;
         let place = format!("{}x{}@{}x{}", img_w, img_h, x, y);
@@ -1141,6 +1142,11 @@ impl App {
             (
                 "chafa",
                 vec![
+                    // Forzar símbolos de texto: si no, chafa puede elegir el
+                    // protocolo gráfico Kitty/iTerm y verse deformado según el
+                    // terminal (era la causa de la imagen "desplazada").
+                    "--format".into(),
+                    "symbols".into(),
                     "--size".into(),
                     chafa_size,
                     "--symbols".into(),
